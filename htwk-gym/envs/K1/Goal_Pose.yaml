@@ -124,6 +124,17 @@ commands:
   goal_dtheta: [-3.14159265, 3.14159265]  # [rad]
   resampling_time_s: [4., 8.]
 
+  # "No More Marching" goal-type mixture (paper Table: stand 0.1 / straight 0.2 /
+  # lateral 0.2 / turn 0.2 / combined 0.3). enabled=false -> uniform sampling (v0).
+  # stand goals also zero the gait clock, disabling the feet_swing stepping incentive.
+  goal_categories:
+    enabled: false
+    stand: 0.1
+    straight: 0.2
+    lateral: 0.2
+    turn: 0.2
+    combined: 0.3
+
   gait_frequency: [1.8, 2.0] # min max [Hz], narrow nominal cadence (no explicit vel command to derive it from)
 
   # Style commands inherited from ParameterWalk's slots; fixed to neutral (min==max)
@@ -298,6 +309,8 @@ rewards:
     feet_offset_y: -0.        # disabled at milestone 2
     feet_swing: 3.
     # --- modular goal-reward alternatives, swap in by setting nonzero scales ---
+    constellation: 0.         # paper-faithful unified pos+heading kernel ("No More Marching" arXiv:2508.14098);
+                              # to adopt: set this ~3.5 and zero goal_position/goal_heading
     goal_progress: 0.         # potential-based, + for closing distance [m/s]; dense far-field gradient
     goal_reached: 0.          # sparse +1/step while stopped inside goal_reach_radius (true task success)
     heading_near_goal: 0.     # heading reward gated to near-goal region; alternative to global goal_heading
@@ -320,6 +333,8 @@ rewards:
   goal_reach_radius: 0.1     # [m] radius inside which goal_stop penalty activates
 
   # params for the modular alternatives (only used if their scales are nonzero)
+  constellation_weight: 0.2    # w_c from the paper (exp(-w_c * d_con))
+  constellation_radius: 1.0    # [m] constellation circle radius; r^2 sets heading-vs-position coupling
   goal_progress_clip: 1.0      # [m/s] clip for goal_progress (robustness to kicks/resets)
   stop_speed_threshold: 0.1    # [m/s] "stopped" threshold for goal_reached
   heading_gate_sigma: 0.25     # [m^2] distance-gate width for heading_near_goal

@@ -395,6 +395,23 @@ class GoalPose(BaseTask):
             self.cfg["commands"]["goal_dtheta"][0], self.cfg["commands"]["goal_dtheta"][1], (len(env_ids), 1), device=self.device
         ).squeeze(1)
 
+        # optional "No More Marching" (arXiv:2508.14098) goal-type mixture:
+        # stand / straight / lateral / turn-in-place / combined. Zeroes the unused
+        # goal components per category; uniform sampling when disabled.
+        cat_cfg = self.cfg["commands"].get("goal_categories")
+        stand = torch.zeros(len(env_ids), dtype=torch.bool, device=self.device)
+        if cat_cfg and cat_cfg.get("enabled", False):
+            probs = torch.tensor(
+                [cat_cfg["stand"], cat_cfg["straight"], cat_cfg["lateral"], cat_cfg["turn"], cat_cfg["combined"]],
+                dtype=torch.float, device=self.device,
+            )
+            cat = torch.multinomial(probs, len(env_ids), replacement=True)
+            stand = cat == 0
+            zero = torch.zeros_like(dx_local)
+            dx_local = torch.where(stand | (cat == 2) | (cat == 3), zero, dx_local)
+            dy_local = torch.where(stand | (cat == 1) | (cat == 3), zero, dy_local)
+            dtheta_local = torch.where(stand | (cat == 1) | (cat == 2), zero, dtheta_local)
+
         _, _, base_yaw = get_euler_xyz(self.base_quat[env_ids])
         base_yaw = (base_yaw + torch.pi) % (2 * torch.pi) - torch.pi
         cos_yaw = torch.cos(base_yaw)
@@ -406,6 +423,9 @@ class GoalPose(BaseTask):
         self.gait_frequency[env_ids] = torch_rand_float(
             self.cfg["commands"]["gait_frequency"][0], self.cfg["commands"]["gait_frequency"][1], (len(env_ids), 1), device=self.device
         ).squeeze(1)
+        # stand-category envs get a zero gait clock, like ParameterWalk's still envs:
+        # this disables the feet_swing stepping incentive so standing still is optimal
+        self.gait_frequency[env_ids[stand]] = 0.0
         self.commands[env_ids, 3] = self.gait_frequency[env_ids]
         self.commands[env_ids, 4] = torch_rand_float(
             self.cfg["commands"]["foot_yaw_L"][0], self.cfg["commands"]["foot_yaw_L"][1], (len(env_ids), 1), device=self.device
@@ -671,6 +691,19 @@ class GoalPose(BaseTask):
 
     # --- modular alternatives, all disabled by default (scale 0 in yaml).
     # Swap in/out per experiment by changing only reward scales; see MASTERPLAN.
+
+    def _reward_constellation(self):
+        # "No More Marching" (arXiv:2508.14098) constellation reward: N points on a
+        # circle of radius r rigidly attached to the base frame, compared with the
+        # same circle placed at the goal pose. The mean squared point distance
+        # decomposes exactly into ||Δc||^2 + 2r^2(1 - cos θ) for a circle, coupling
+        # position and heading in ONE kernel (both must be good for high reward,
+        # unlike additive goal_position + goal_heading). 2(1-cosθ) ≈ θ^2 for small
+        # errors (the paper's I_c·θ^2 form) but stays smooth at ±π.
+        w = self.cfg["rewards"]["constellation_weight"]
+        r = self.cfg["rewards"]["constellation_radius"]
+        d_con = torch.square(self.goal_dist) + 2.0 * r * r * (1.0 - torch.cos(self.heading_error))
+        return torch.exp(-w * d_con)
 
     def _reward_goal_progress(self):
         # Potential-based progress toward the goal [m/s]: positive while closing distance.

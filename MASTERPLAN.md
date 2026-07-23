@@ -248,3 +248,44 @@
 - **주의**: 지금 서버에서 도는 학습은 STOP 훅이 없는 이전 코드다. auto_stop을 쓰려면
   `git pull` 후 `--checkpoint -1`(최신 체크포인트 자동 탐색)로 재시작해야 함. 재시작 없이
   두려면: 그대로 두고 나중에 수동으로 `eval_goal_pose.py --checkpoint -1`만 돌려도 된다.
+
+### 2026-07-23 — 원 논문 확인: "No More Marching" (arXiv:2508.14098) 대조 결과
+- **확인된 사실**: §범위 고정의 목표 범위(Δx∈[-2,2], Δy∈[-1.5,1.5], Δθ∈[-π,π])와 §학습
+  아키텍쳐의 "Reward: constellation + style/regularization 상속"은 논문
+  *"No More Marching: Learning Humanoid Locomotion for Short-Range SE(2) Targets"*
+  (Dugar et al., arXiv:2508.14098)의 설정과 일치 — 마스터플랜의 원 출처로 판단.
+  htwk-gym이 Booster Gym(arXiv:2506.15132) 기반이라는 것도 htwk-gym GitHub 설명에서 공식 확인.
+- **논문의 constellation reward (정확한 정의)**: 베이스 프레임에 반지름 r=1m 원형으로 고정한
+  점들 vs 목표 자세의 같은 점들의 평균제곱거리 `d_con = ‖Δc‖² + I_c·θ²` (I_c=r²),
+  보상은 **단일 커널** `r_con = exp(-0.2·d_con)`. 총보상 = r_con + style + regularization.
+  gait clock **없음**(행진 제거가 논문의 핵심), 에피소드 8초, 목표 유형 혼합
+  (stand 0.1 / straight 0.2 / lateral 0.2 / turn 0.2 / combined 0.3), 4096 envs, curriculum 없음.
+- **우리 v0(현재 학습 중)과의 차이 = 미구현이었음을 확인**:
+  1. v0은 위치/방향을 **덧셈 분리**(goal_position + goal_heading) — 논문은 곱 결합 단일 커널.
+     덧셈은 "멀리서 방향만 맞추고 보상 파밍"이 가능, 논문 방식은 둘 다 좋아야 보상이 큼.
+  2. v0은 **gait clock + feet_swing(+3.0)이 항상 활성** (gait_frequency ∈ [1.8,2.0]로 0이 될 일
+     없음) → 목표 도착 후에도 제자리 행진이 보상됨. goal_stop(-1)과 정면 충돌하는 구조적 결함.
+  3. v0은 에피소드 30초/목표 유형 혼합 없음 — 논문은 8초/혼합 샘플링.
+- **조치 (커밋 참조)**: 전부 스위치로 추가, 기본은 v0 유지(돌던 학습과 호환):
+  - `_reward_constellation` — 논문 충실 구현. 원형 constellation의 정확한 기하로
+    `d_con = d² + 2r²(1-cosθ)` 사용 (논문의 I_c·θ²는 소각 근사; 1-cos 형태가 ±π에서 매끄러움).
+    yaml에서 `constellation: ~3.5` + `goal_position/goal_heading: 0`으로 교체 장착.
+  - `goal_categories` 샘플링 — yaml `commands.goal_categories.enabled: true`로 논문 혼합 활성화.
+    stand 목표는 gait_frequency=0으로 feet_swing 행진 유인 제거 (ParameterWalk still env 방식 재사용).
+  - gait clock 완전 제거 실험은 코드 수정 없이 `gait_frequency: [0., 0.]`로 가능 (관찰 차원 유지;
+    단 웜스타트한 ParameterWalk actor가 clock 의존이라 보행 자체가 무너질 수 있음 — 실험으로 판단).
+  - 에피소드 8초는 `episode_length_s: 8.`로 가능.
+- **권장 v1 설정** (사용자 취사선택 대기): constellation 3.5 / goal_position·goal_heading·goal_stop 0 /
+  goal_categories enabled / episode_length_s 8 / 스타일·정규화 보상은 현행 유지(논문의 r_sty+r_reg 대응).
+
+### 2026-07-23 — 전체 로드맵 현황 (최종 목표까지)
+**최종 목표**: K1이 (Δx,Δy,Δθ) 목표에 게이트(5cm/10cm/10°/낙상0) 수준으로 도달·정지하는
+정책을 export해 MuJoCo 검증(→실기 배포 준비)까지.
+1. ✅ 걷기 확보 — Booster/htwk ParameterWalk의 배포 actor를 웜스타트 시드로 사용 중
+2. 🔶 v0 학습 (지금 GPU 1에서 진행 중) — 논문과 다른 단순 덧셈 보상 + gait clock 상시 활성.
+   **역할 재정의: 게이트 통과용이 아니라 베이스라인 수치 확보용.** 곧 중단하고 평가 예정.
+3. ⬜ v0 평가 — eval_goal_pose.py로 위치/heading 오차·정지속도·낙상 실측 → v1과 비교할 기준점
+4. ⬜ v1 학습 — constellation + goal_categories로 전환(위 권장 설정), auto_stop으로 수렴 시 자동
+   정지+평가. 게이트 미달 시 리포트의 제안(스위치 조정)대로 반복
+5. ⬜ 게이트 통과 → milestone 4: export_model.py로 actor export + MuJoCo에서 sim-to-sim 검증
+6. (선택) critic 포함 풀 웜스타트, sin/cos heading, 네트워크 확장 — 필요 시에만
