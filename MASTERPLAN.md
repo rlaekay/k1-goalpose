@@ -23,6 +23,21 @@
 - Server: user-ESC4000A-E12 (git clone at /mnt/DATA/workspace/ws_eungkyu/k1-goalpose,
   htwk-gym이 그 안의 서브디렉토리 — 2026-07-23 변경 이력 참고)
 
+## 🤝 공유 서버 운영 원칙 (2026-07-23부터, 항상 적용)
+서버(`user-ESC4000A-E12`)는 여러 사람이 같이 쓰는 장비다. 아래는 매번 학습을 돌릴 때마다
+지켜야 하는 상시 규칙 — 아래 §변경 이력의 "왜 이렇게 됐는지"와 달리, 이건 **매번 반복 적용**한다.
+- **GPU**: 학습 시작 전 항상 `nvidia-smi`로 어느 GPU가 비어있는지 확인하고, 그 번호를
+  `--sim_device`/`--rl_device`에 명시적으로 지정한다. 두 GPU를 동시에 잡지 않는다.
+- **중간에 다른 프로세스가 나타나면 우리가 양보한다**: 실행 중 다른 사용자(또는 root/공용
+  서비스)의 프로세스가 같은 GPU에 새로 붙으면, 누가 "먼저"인지 `ps -p <PID> -o user,lstart,cmd`로
+  확인하고, 우리가 나중이면 우리 학습을 `kill -SIGINT <PID>`(체크포인트 로직 안 깨지는 안전 종료)로
+  멈춘 뒤 비어있는 다른 GPU로 옮긴다. (2026-07-23: root 소유 Isaac Lab 프로세스와 GPU 0에서
+  충돌 → 우리 쪽을 GPU 1로 이동해서 해결한 실제 사례 있음.)
+- **디스크**: `$HOME`(루트 파티션, 서버 전체가 공유)은 절대 안 씀. conda·pip 캐시·저장소·
+  IsaacGym·체크포인트 전부 `/mnt/DATA/workspace/ws_eungkyu/` 안에만 둔다.
+- **삭제는 항상 본인 소유 파일에 한정**: 다른 사용자의 `ws_*` 디렉토리는 목록만 확인(`du -sh`
+  등)하고 내용을 열거나 지우지 않는다.
+
 ## 🧠 학습 아키텍쳐
 - Approach: Warm-start (ParameterWalk) → End-to-end GoalPose
 - Network: MLP [512,256,128] + history
@@ -33,11 +48,11 @@
 | # | 할 일 | 조건 |
 |---|---|---|
 | -1 | ✅ 서버 환경 구축 (PyTorch/IsaacGym/deps) | 2026-07-23 완료 (아래 변경 이력) |
-| 0 | 베이스라인 (ParameterWalk 재현) | 영상 확인 |
-| 1 | 평가 하네스 | 오차 분포 숫자 |
-| 2 | ✅ GoalPose 태스크 골격 | 2026-07-23 완료: `--num_envs 4 --max_iterations 5` 크래시 없이 통과 |
-| 3 | constellation 학습 | 게이트 통과 |
-| 4 | export + MuJoCo 검증 | 배포 준비 |
+| 0 | ⬜ 베이스라인 (ParameterWalk 재현) | 영상 확인 — **미착수**, 아래 참고 |
+| 1 | ⬜ 평가 하네스 | 오차 분포 숫자 — **미착수**, milestone 3 게이트 판정에 필요 |
+| 2 | ✅ GoalPose 태스크 골격 | 2026-07-23 완료: 크래시 없음 + 512env/200iter 스케일 검증 통과 |
+| 3 | 🔶 constellation 학습 | 게이트 통과 — **진행 중** (아래 참고) |
+| 4 | ⬜ export + MuJoCo 검증 | 배포 준비 — 미착수 |
 
 ## 📝 변경 이력 (원래 계획 대비 조정)
 > 이 섹션은 위 §목표/범위/성공 기준을 바꾸지 않는다. 실행 중 발견한 현실적 제약으로
@@ -170,3 +185,24 @@
 - **한계**: critic은 진짜 웜스타트가 아니라 랜덤 초기화라, 학습 초반 value 추정이 부정확할
   수 있음 — actor만 웜스타트해도 처음부터 학습하는 것보다는 유리할 것으로 기대하지만,
   진짜 풀 체크포인트(critic 포함)를 나중에 서버 학습 로그에서 구하면 그걸로 교체 권장.
+
+### 2026-07-23 — GPU 0에서 다른 사용자와 충돌 → GPU 1로 이동, 원칙화
+- **발생**: `--num_envs 2048`로 GPU 0에서 실제 장기 학습 시작 직후, GPU 0 사용률이 96%까지
+  치솟음. 확인해보니 `root` 소유의 Isaac Lab/Sim 프로세스(`/workspace/isaaclab/...`,
+  우리보다 먼저 시작)가 같은 GPU에 붙어있었음 — 우리 세션이 설치/실행한 것과는 무관한
+  별개 작업(경로·소유자·제품 자체가 다름: Isaac Lab/Sim vs 우리의 Isaac Gym Preview4).
+- **대응**: 우리 학습 프로세스를 `kill -SIGINT`로 안전 종료 후, 완전히 비어있던 GPU 1로
+  재시작(`--sim_device cuda:1 --rl_device cuda:1`). 이후 GPU 0(root 프로세스만)/GPU 1
+  (우리 프로세스만)로 깔끔히 분리됨.
+- **원칙화**: 위 "🤝 공유 서버 운영 원칙" 섹션에 상시 규칙으로 등록 (GPU 점유는 매번 재확인,
+  충돌 시 우리가 양보).
+- **현재 상태**: GPU 1에서 `--checkpoint logs/warmstart/parameter_walk_actor_seed.pth
+  --num_envs 2048 --max_iterations 20000` 장기 학습 진행 중 (tmux 세션, 시작 직후 확인 시점).
+  milestone 3("constellation 학습 — 게이트 통과")에 해당하는 실제 학습 단계.
+- **milestone 순서 이탈 기록**: 원래 순서는 0(베이스라인 재현)→1(평가 하네스)→2→3이었으나,
+  실제로는 milestone 0/1을 건너뛰고 2→3으로 바로 진행 중. 이유: milestone 0의 목적("웜스타트용
+  ParameterWalk 정책 확보")을 직접 재학습하는 대신 기존 배포 모델(`deploy/models/parameter_walk.pt`)의
+  actor 가중치로 대체했기 때문에 별도 재현이 당장 필수는 아니었음. **단, milestone 1(평가
+  하네스)은 아직 없어서, 지금 진행 중인 milestone 3 학습이 실제로 §성공 기준 게이트(위치오차
+  5cm/10cm, heading 10°, 낙상률 0%)를 통과했는지 숫자로 확인할 방법이 없음** — 장기 학습이
+  끝나기 전에(또는 병행해서) milestone 1을 만들어야 함.
