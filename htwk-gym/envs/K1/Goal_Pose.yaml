@@ -128,7 +128,7 @@ commands:
   # lateral 0.2 / turn 0.2 / combined 0.3). enabled=false -> uniform sampling (v0).
   # stand goals also zero the gait clock, disabling the feet_swing stepping incentive.
   goal_categories:
-    enabled: false
+    enabled: true
     stand: 0.1
     straight: 0.2
     lateral: 0.2
@@ -279,9 +279,10 @@ randomization:
 rewards:
   scales:
     survival: 0.25
-    goal_position: 2.0
-    goal_heading: 1.5
-    goal_stop: -1.0
+    # v1 (2026-07-23 사용자 결정): constellation 단독 — v0의 덧셈 분리 보상은 0으로 보존
+    goal_position: 0.
+    goal_heading: 0.
+    goal_stop: 0.
     base_height: -20.
     foot_yaw_L:            -1.0
     foot_yaw_R:            -1.0
@@ -309,8 +310,7 @@ rewards:
     feet_offset_y: -0.        # disabled at milestone 2
     feet_swing: 3.
     # --- modular goal-reward alternatives, swap in by setting nonzero scales ---
-    constellation: 0.         # paper-faithful unified pos+heading kernel ("No More Marching" arXiv:2508.14098);
-                              # to adopt: set this ~3.5 and zero goal_position/goal_heading
+    constellation: 3.5        # paper-faithful unified pos+heading kernel ("No More Marching" arXiv:2508.14098)
     goal_progress: 0.         # potential-based, + for closing distance [m/s]; dense far-field gradient
     goal_reached: 0.          # sparse +1/step while stopped inside goal_reach_radius (true task success)
     heading_near_goal: 0.     # heading reward gated to near-goal region; alternative to global goal_heading

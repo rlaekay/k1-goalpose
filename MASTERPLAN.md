@@ -328,3 +328,16 @@
   추가**: MuJoCo 검증 전 (i) DR 범위가 K1 실기 스펙과 맞는지 대조, (ii) 목표 도달 정지 상태에서
   push 강건성 별도 평가(외란 ON eval), (iii) export 경로 수리(`utils/model_thomas.py` 부재로
   현재 export_model.py 깨짐 — 어차피 milestone 4에서 필수 수리).
+
+### 2026-07-23 — v1 설정 확정 (사용자 취사선택)
+- 겹치는 모듈 4개 결정에 대한 사용자 선택:
+  1. **목표 보상: constellation 단독** (3.5) — goal_position/goal_heading/goal_stop은 0으로 보존
+     (스위치만 내리면 v0 복원 가능). 보조 보상(goal_progress/goal_reached/heading_near_goal)은
+     v1 결과 보고 필요 시에만.
+  2. **목표 샘플링: 논문 혼합** — goal_categories.enabled: true (stand 10% 포함)
+  3. **gait clock: 유지 + stand 목표만 0** — 웜스타트 보행 보존 절충안
+  4. **에피소드: 30초 유지** (논문의 8초 대신 — 연속 목표 전환 단련 우선)
+- v0 평가 중간 확인: 4,669 구간 / 낙상 33회(≈0.7%, 외란 OFF) → **낙상 게이트 FAIL 확정**.
+  위치/heading 수치는 report.json (서버 logs/.../2026-07-23-18-36-53/eval/) 참조.
+- v1 웜스타트 소스: v0의 model_3400.pth 권장 (이미 K1+GoalPose에 적응된 정책 —
+  출처 불명 시드보다 확실). 시드 zero-shot 검증(리뷰 ② 판정)은 별도로 계속 유효.
