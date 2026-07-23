@@ -24,14 +24,22 @@ if __name__ == "__main__":
 
     model = ActorCritic(cfg["env"]["num_actions"], cfg["env"]["num_observations"], cfg["env"]["num_privileged_obs"])
 
-    scripted_actor = torch.jit.load(args.source, map_location="cpu")
-    # strict=True on purpose: a shape/name mismatch here means the source model's
-    # architecture doesn't match utils/model.py's ActorCritic.actor, and silently
-    # ignoring that would produce a checkpoint that looks fine but isn't warm-started.
-    model.actor.load_state_dict(scripted_actor.state_dict())
+    # source auto-detection: a torch.jit actor-only deploy export (actor warm start,
+    # critic random) OR a full training checkpoint {model: ...} (actor + critic).
+    # strict=True on purpose: a shape/name mismatch means the source architecture
+    # doesn't match utils/model.py's ActorCritic, and silently ignoring that would
+    # produce a checkpoint that looks fine but isn't warm-started.
+    try:
+        scripted_actor = torch.jit.load(args.source, map_location="cpu")
+        model.actor.load_state_dict(scripted_actor.state_dict())
+        critic_note = "randomly initialized (not present in the deploy export)"
+    except RuntimeError:
+        source_dict = torch.load(args.source, map_location="cpu", weights_only=True)
+        model.load_state_dict(source_dict["model"])
+        critic_note = "warm-started too (full training checkpoint source)"
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     torch.save({"model": model.state_dict()}, args.out)
     print(f"Seeded checkpoint written to {args.out}")
     print(f"  actor warm-started from: {args.source}")
-    print("  critic: randomly initialized (not present in the deploy export)")
+    print(f"  critic: {critic_note}")

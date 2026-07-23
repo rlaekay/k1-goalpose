@@ -297,6 +297,10 @@ rewards:
     feet_offset_x: -0.        # disabled at milestone 2 (was velocity-scaled by old vx/vy command; see MASTERPLAN log)
     feet_offset_y: -0.        # disabled at milestone 2
     feet_swing: 3.
+    # --- modular goal-reward alternatives, swap in by setting nonzero scales ---
+    goal_progress: 0.         # potential-based, + for closing distance [m/s]; dense far-field gradient
+    goal_reached: 0.          # sparse +1/step while stopped inside goal_reach_radius (true task success)
+    heading_near_goal: 0.     # heading reward gated to near-goal region; alternative to global goal_heading
   episode_length_s: 30.
   terminate_height: 0.35
   terminate_vel: 50.
@@ -315,6 +319,21 @@ rewards:
   goal_heading_sigma: 0.4    # exp(-heading_error^2/sigma), error in radians
   goal_reach_radius: 0.1     # [m] radius inside which goal_stop penalty activates
 
+  # params for the modular alternatives (only used if their scales are nonzero)
+  goal_progress_clip: 1.0      # [m/s] clip for goal_progress (robustness to kicks/resets)
+  stop_speed_threshold: 0.1    # [m/s] "stopped" threshold for goal_reached
+  heading_gate_sigma: 0.25     # [m^2] distance-gate width for heading_near_goal
+
   # feet_offset_x/y velocity-scaling reference speeds (used only if those scales are re-enabled)
   feet_offset_vel_scale_x: 0.6  # [m/s]
   feet_offset_vel_scale_y: 0.3  # [m/s]
+
+evaluation:
+  # defaults for eval_goal_pose.py (CLI flags override)
+  num_envs: 256
+  duration_s: 120.
+  gates:                     # MASTERPLAN §성공 기준
+    pos_median_m: 0.05
+    pos_p90_m: 0.10
+    heading_median_deg: 10.
+    max_falls: 0

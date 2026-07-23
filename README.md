@@ -51,11 +51,22 @@ git pull
 # 다른 서버 경로/계정을 쓰면: SERVER=user@host SERVER_REPO=/path/to/k1-goalpose ./PULL.sh
 ```
 
-## 서버에서 학습 실행
+## 서버에서 학습 실행 (전체 파이프라인)
 ```bash
-# 서버 터미널
-ssh user@user-ESC4000A-E12
+# 서버 tmux 창 1 — 학습 (GPU 번호는 nvidia-smi로 빈 쪽 확인 후 지정)
 cd /mnt/DATA/workspace/ws_eungkyu/k1-goalpose/htwk-gym
-python train.py --task=K1/GoalPose --headless
+python train.py --task=K1/Goal_Pose --headless True \
+  --checkpoint logs/warmstart/parameter_walk_actor_seed.pth \
+  --num_envs 2048 --sim_device cuda:1 --rl_device cuda:1
+
+# 서버 tmux 창 2 — 수렴 감시: 보상 정체 감지 → 안전 정지 → 자동 평가 리포트
+python tools/auto_stop.py
+
+# 평가만 따로 (최신 체크포인트 자동 탐색; report.md/json + segments.csv 생성)
+python eval_goal_pose.py --task K1/Goal_Pose --checkpoint -1 \
+  --sim_device cuda:1 --rl_device cuda:1
+
+# 보상 조합 실험: envs/K1/Goal_Pose.yaml의 rewards.scales만 수정
+#   goal_progress / goal_reached / heading_near_goal (기본 0 = 꺼짐)
 ```
 

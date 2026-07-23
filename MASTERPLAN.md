@@ -49,7 +49,7 @@
 |---|---|---|
 | -1 | ✅ 서버 환경 구축 (PyTorch/IsaacGym/deps) | 2026-07-23 완료 (아래 변경 이력) |
 | 0 | ⬜ 베이스라인 (ParameterWalk 재현) | 영상 확인 — **미착수**, 아래 참고 |
-| 1 | ⬜ 평가 하네스 | 오차 분포 숫자 — **미착수**, milestone 3 게이트 판정에 필요 |
+| 1 | ✅ 평가 하네스 | 코드 완성 2026-07-23 (`eval_goal_pose.py` + `tools/auto_stop.py`) — 실측은 학습 종료 후 |
 | 2 | ✅ GoalPose 태스크 골격 | 2026-07-23 완료: 크래시 없음 + 512env/200iter 스케일 검증 통과 |
 | 3 | 🔶 constellation 학습 | 게이트 통과 — **진행 중** (아래 참고) |
 | 4 | ⬜ export + MuJoCo 검증 | 배포 준비 — 미착수 |
@@ -206,3 +206,45 @@
   하네스)은 아직 없어서, 지금 진행 중인 milestone 3 학습이 실제로 §성공 기준 게이트(위치오차
   5cm/10cm, heading 10°, 낙상률 0%)를 통과했는지 숫자로 확인할 방법이 없음** — 장기 학습이
   끝나기 전에(또는 병행해서) milestone 1을 만들어야 함.
+
+### 2026-07-23 — 코드/보상 출처 명확화 (Q&A 기록)
+새 세션·협업자가 오해하지 않도록 출처를 명시한다:
+- **베이스 코드**: htwk-gym의 K1 ParameterWalk(속도+파라미터 명령 걷기)가 유일한 코드 출처.
+  htwk-gym 자체는 Booster Gym 계열이다(T1 = Booster T1 로봇, `deploy/README.md`가 Booster
+  Robotics SDK 설치를 안내) — 즉 Booster의 학습 프레임워크는 이미 사용 중.
+- **GoalPose 보상(goal_position/goal_heading/goal_stop 및 모듈 대안들)**: 특정 논문("GoTo" 등)에서
+  가져온 것이 **아님**. 이 세션에서 ParameterWalk의 기존 추종 보상과 같은 지수 커널 형태로 직접
+  작성. (형태 자체는 목표 지향 보행 RL의 표준 패턴이지만 어떤 논문도 참조·복제하지 않음.)
+  논문 기반 보상 세트 도입은 별도 조사 작업으로 미착수.
+- **`max_iterations: 20000`**: 설계된 실험 길이가 아니라 ParameterWalk 설정에서 물려받은 상한값.
+  실제 종료 시점은 수렴 판정(아래 auto_stop)으로 결정한다.
+
+### 2026-07-23 — milestone 1 완성: 평가 하네스 + 수렴 자동 정지 (모듈형)
+목표("게이트 통과 여부를 숫자로")를 위해 추가한 것들 — 기존 동작은 전부 보존, 전부 끼우고 뺄 수 있음:
+- **[eval_goal_pose.py](htwk-gym/eval_goal_pose.py)**: 체크포인트를 로드해 headless로 굴리면서
+  목표 구간(4~8초 타이머)마다 **교체 직전 목표 기준의 정확한 최종 위치/heading 오차·정지 속도**를
+  실측. 낙상(타임아웃 아닌 종료)을 별도 집계. 게이트(§성공 기준) PASS/FAIL 표 + 미달 시 "다음에
+  시도할 것" 제안까지 담긴 `report.md`/`report.json`/`segments.csv`를 run 디렉토리 `eval/` 아래 저장.
+  기본은 결정론적 정책(dist.loc)·외란(kick/push) OFF, `--stochastic`/`--keep_perturbations`/
+  `--no_noise`/`--record_video`(env0 mp4)로 조건 전환.
+- **[tools/auto_stop.py](htwk-gym/tools/auto_stop.py)**: 학습 옆에서(tmux 별창) TensorBoard 스칼라를
+  주기 폴링 → 최근 window 평균이 직전 window 대비 상대 개선 `rel_eps`(기본 2%) 미만이 `patience`회
+  연속이면 **run 디렉토리에 STOP 파일 생성** → 학습이 체크포인트 저장 후 스스로 종료 → 디렉토리가
+  잠잠해지면 eval을 자동 실행해 리포트 생성. (학습이 이미 죽었/끝났으면 `--stale_min` 후 바로 eval.)
+- **[utils/runner.py](htwk-gym/utils/runner.py)**: train 루프에 STOP 파일 체크 추가(매 iteration 끝).
+  파일 없으면 기존과 100% 동일 동작.
+- **[envs/K1/goal_pose.py](htwk-gym/envs/K1/goal_pose.py) 모듈 보상 3종 추가 (기본 scale 0 = 비활성)**:
+  | 보상 | 무엇 | 언제 켜나 |
+  |---|---|---|
+  | `goal_progress` | 거리 줄인 속도 [m/s], potential-based | 원거리에서 exp 보상이 평평해 유인이 약할 때 |
+  | `goal_reached` | 목표 반경 안 + 정지 시 +1/step (희소, 진짜 성공 조건) | 도착 후 "머무르기" 강화 필요할 때 |
+  | `heading_near_goal` | 목표 근처에서만 heading 요구 (거리 게이트) | 걷는 중 heading 강제가 보행을 방해할 때 (`goal_heading` 0으로 끄고 교체) |
+  스위치는 전부 [Goal_Pose.yaml](htwk-gym/envs/K1/Goal_Pose.yaml) `rewards.scales`에서만 조정 —
+  코드 수정 없이 조합 실험 가능. 평가 게이트 기준치도 yaml `evaluation:` 섹션으로 이동.
+- **[seed_warmstart_checkpoint.py](htwk-gym/seed_warmstart_checkpoint.py) 확장**: 소스가 jit actor
+  export든 풀 학습 체크포인트(critic 포함)든 자동 감지 — critic 포함 웜스타트 경로 마련.
+- **[envs/base_task.py](htwk-gym/envs/base_task.py) 버그 수정**: record_video가 K1처럼 단일 액터
+  (2-D root_states) 태스크에서 크래시하던 인덱싱을 차원 감지로 수정 → headless 영상 녹화 가능.
+- **주의**: 지금 서버에서 도는 학습은 STOP 훅이 없는 이전 코드다. auto_stop을 쓰려면
+  `git pull` 후 `--checkpoint -1`(최신 체크포인트 자동 탐색)로 재시작해야 함. 재시작 없이
+  두려면: 그대로 두고 나중에 수동으로 `eval_goal_pose.py --checkpoint -1`만 돌려도 된다.

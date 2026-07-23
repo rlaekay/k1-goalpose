@@ -250,6 +250,7 @@ class GoalPose(BaseTask):
         self.goal_rel_pos = torch.zeros(self.num_envs, 2, dtype=torch.float, device=self.device)
         self.goal_dist = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         self.heading_error = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        self.last_goal_dist = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
         # curriculum machinery kept for compatibility with utils/runner.py's logging
         # (it reads self.env.mean_lin_vel_level etc. unconditionally); unused while
@@ -460,6 +461,9 @@ class GoalPose(BaseTask):
     def step(self, actions):
         # pre physics step
         self.actions[:] = torch.clip(actions, -self.cfg["normalization"]["clip_actions"], self.cfg["normalization"]["clip_actions"])
+        # snapshot for goal_progress: goals only change after reward computation, so this
+        # distance and the post-physics one are guaranteed to be against the same goal
+        self.last_goal_dist[:] = self.goal_dist
         dof_targets = self.default_dof_pos + self.cfg["control"]["action_scale"] * self.actions
 
         # perform physics step
@@ -664,6 +668,31 @@ class GoalPose(BaseTask):
         close = (self.goal_dist < self.cfg["rewards"]["goal_reach_radius"]).float()
         vel_error = torch.sum(torch.square(self.base_lin_vel[:, :2]), dim=-1) + torch.square(self.base_ang_vel[:, 2])
         return close * vel_error
+
+    # --- modular alternatives, all disabled by default (scale 0 in yaml).
+    # Swap in/out per experiment by changing only reward scales; see MASTERPLAN.
+
+    def _reward_goal_progress(self):
+        # Potential-based progress toward the goal [m/s]: positive while closing distance.
+        # Alternative/addition to goal_position: dense gradient even far from the goal,
+        # where exp(-dist^2/sigma) is nearly flat. Clipped for robustness to kicks.
+        progress = (self.last_goal_dist - self.goal_dist) / self.dt
+        clip = self.cfg["rewards"]["goal_progress_clip"]
+        return progress.clip(min=-clip, max=clip) * (self.episode_length_buf > 1).float()
+
+    def _reward_goal_reached(self):
+        # Sparse bonus: 1 per step while stopped inside the goal radius.
+        # Directly rewards the actual task success condition (arrive AND stop).
+        stopped = torch.norm(self.root_states[:, 7:9], dim=-1) < self.cfg["rewards"]["stop_speed_threshold"]
+        return ((self.goal_dist < self.cfg["rewards"]["goal_reach_radius"]) & stopped).float()
+
+    def _reward_heading_near_goal(self):
+        # Heading tracking gated to the near-goal region. Alternative to goal_heading:
+        # lets the robot face its direction of travel while walking, only demanding the
+        # target heading once it is close to the goal position.
+        heading = torch.exp(-torch.square(self.heading_error) / self.cfg["rewards"]["goal_heading_sigma"])
+        gate = torch.exp(-torch.square(self.goal_dist) / self.cfg["rewards"]["heading_gate_sigma"])
+        return heading * gate
 
     def _reward_base_height(self):
         # Tracking of base height
