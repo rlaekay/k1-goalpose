@@ -1,6 +1,6 @@
 #!/bin/bash
 
-SERVER="user@user-ESC4000A-E12"
+SERVER="user@165.246.193.194"
 SERVER_PATH="/mnt/DATA/workspace/ws_eungkyu/htwk-gym"
 LOCAL_PATH="$(pwd)/htwk-gym"
 
