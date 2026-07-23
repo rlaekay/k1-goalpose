@@ -289,3 +289,42 @@
    정지+평가. 게이트 미달 시 리포트의 제안(스위치 조정)대로 반복
 5. ⬜ 게이트 통과 → milestone 4: export_model.py로 actor export + MuJoCo에서 sim-to-sim 검증
 6. (선택) critic 포함 풀 웜스타트, sin/cos heading, 네트워크 확장 — 필요 시에만
+
+### 2026-07-23 — 외부 리뷰 5건 판정 (코드·설정 사실 대조)
+- **① 웜스타트 입력 스케일 불일치 → 반박 (이미 해결돼 있음)**: Goal_Pose.yaml
+  `normalization.goal_pos: 0.5`, `goal_heading: 1/π`가 처음부터 들어가 있어 관찰값 기준
+  Δx ±2m→±1.0, Δy ±1.5m→±0.75, heading ±π→±1.0. 원래 슬롯의 lin_vel ±1.0(scale 1.0),
+  ang_vel_yaw ±1.6(scale 1.0)과 같은 범위다. "속도 0.5 vs 위치 2.0의 4배 차이"는 관찰
+  벡터에 존재하지 않음. 남는 것은 시간 분포 차이(구간 상수 명령 vs 연속 감소 오차)뿐이고
+  이는 슬롯 재사용 웜스타트에 내재된 것 — fine-tuning이 흡수할 몫. 조치 불필요.
+- **② parameter_walk.pt가 K1용인지 미확인 → 수용 + 원지적보다 심각**: 사실 확인 결과
+  (a) T1/K1 ParameterWalk의 네트워크 차원이 **완전히 동일**(54/14/12) → strict 로드 성공은
+  로봇 구분의 증거가 **전혀 아님**; (b) deploy 폴더는 T1 지향 정황: `deploy_parameter_walk.py`가
+  Booster SDK `B1JointCnt`(23관절) 기준이고 deploy config의 stiffness/qpos 배열도 23개(팔 포함),
+  `policy_path`는 `thomas_walk_4.pt`를 가리킴; (c) `export_model.py`는 존재하지 않는
+  `utils/model_thomas.py`를 import → 현 코드로는 export가 깨져 있어 `parameter_walk.pt`는
+  이전/다른 코드 상태에서 만들어진 산출물(출처 불명). **검증 방법(코드 추가 불필요)**:
+  시드 체크포인트를 zero-shot 평가 —
+  `python eval_goal_pose.py --task K1/Goal_Pose --checkpoint logs/warmstart/parameter_walk_actor_seed.pth --sim_device cuda:1 --rl_device cuda:1`
+  → 낙상률이 낮고 목표 방향으로 이동하면 K1 보행 정책 맞음; 즉시 넘어지면 T1산(웜스타트 무효,
+  from-scratch가 기준선). v0 평가 직후 바로 실행할 것. 부기: `__init__.py` K1→T1 shadowing
+  버그는 우리가 ParameterWalk 학습을 한 번도 안 돌렸으므로 **어떤 실행에도 영향 준 적 없음**.
+- **③ 낙상 0% 게이트의 통계적 정의 → 수용**: 게이트를 프로토콜 상대 정의로 확정 —
+  "표준 평가 프로토콜(결정론적 정책, 외란 OFF, 256 env × 120 s ≈ 4~5천 구간)에서 낙상 0회".
+  0/5000이면 rule of three로 실제 낙상률 95% 상한 ≈ 0.06%. 외란 ON(`--keep_perturbations`)
+  낙상률은 게이트가 아니라 별도 강건성 지표로 본다. (eval 기본값이 이미 이 프로토콜.)
+- **④ heading sin/cos를 v1에서 선제 전환 → 근거 기반 반박, 단일 각도 유지**:
+  참조 논문(No More Marching) 자체가 전 범위 Δθ∈[-π,π]를 **원시 각도 그대로** 관찰에 넣고
+  실기 전이까지 보고함 — 같은 태스크에서 단일 wrap 각도가 검증된 설계. ±π에서 좌/우회전이
+  동등한 모호성은 인코딩과 무관한 태스크 본질. 또한 "나중 전환 = 차원 파괴(웜스타트 손실)"
+  전제가 성립 안 함: v1에서 상시 0인 스타일 슬롯(4 또는 5)에 (cosθ−1)을, 슬롯 2에 sinθ를
+  넣으면 **54차원 유지한 채** sin/cos 전환 가능(θ=0일 때 두 값 모두 0 = 기존 중립값과 일치).
+  v1은 논문대로 단일 각도로 가고, 회전 방향 진동(dithering)이 관측되면 위 방법으로 전환.
+- **⑤ 도메인 랜덤화 문서 부재 → 문서 공백은 수용, 실체 부재는 반박**: Goal_Pose.yaml이
+  ParameterWalk의 DR 전체를 이미 상속 중 — 마찰 [0.1,2.0], restitution/compliance,
+  base 질량 ×[0.8,1.2], base CoM ±10cm, 타 링크 질량/CoM, PD 게인 ×[0.95,1.05],
+  관절 마찰 [0,2], 관측 노이즈(gravity/ang_vel/dof_pos/dof_vel), 액션 지연 0~10 sim step
+  (delay_steps), kick 4s/push 5s 주기(정지 자세에도 가해짐). **milestone 4 사전 체크리스트에
+  추가**: MuJoCo 검증 전 (i) DR 범위가 K1 실기 스펙과 맞는지 대조, (ii) 목표 도달 정지 상태에서
+  push 강건성 별도 평가(외란 ON eval), (iii) export 경로 수리(`utils/model_thomas.py` 부재로
+  현재 export_model.py 깨짐 — 어차피 milestone 4에서 필수 수리).
