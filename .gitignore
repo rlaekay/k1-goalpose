@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# htwk-gym training artifacts (SYNC.sh already excludes these from rsync;
+# also keep them out of git in case they're generated locally)
+logs/
+checkpoints/
+videos/
