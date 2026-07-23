@@ -32,10 +32,10 @@
 ## 📍 마일스톤
 | # | 할 일 | 조건 |
 |---|---|---|
-| -1 | 서버 환경 구축 (PyTorch/IsaacGym/deps) | `train.py --task=K1/ParameterWalk` 크래시 없이 1 iter |
+| -1 | ✅ 서버 환경 구축 (PyTorch/IsaacGym/deps) | 2026-07-23 완료 (아래 변경 이력) |
 | 0 | 베이스라인 (ParameterWalk 재현) | 영상 확인 |
 | 1 | 평가 하네스 | 오차 분포 숫자 |
-| 2 | GoalPose 태스크 골격 | 크래시 없음 |
+| 2 | ✅ GoalPose 태스크 골격 | 2026-07-23 완료: `--num_envs 4 --max_iterations 5` 크래시 없이 통과 |
 | 3 | constellation 학습 | 게이트 통과 |
 | 4 | export + MuJoCo 검증 | 배포 준비 |
 
@@ -103,3 +103,46 @@
   + 빈 `tasks/`)라서 새 git 워크플로우와 안 맞는다. 서버에서 새로 `git clone`해서
   `/mnt/DATA/workspace/ws_eungkyu/k1-goalpose/`로 옮기는 걸 권장(README 절차 참고).
   기존 디렉토리를 그대로 재사용하려면 먼저 정리 필요 — milestone -1에 포함.
+
+### 2026-07-23 — milestone -1 완료: 서버 환경 구축 실기(實記)
+- **서버가 다인 공유 환경**이라는 게 확인됨 (`/mnt/DATA/workspace/`에 `ws_hojun`(422G),
+  `ws_minho`(1.2T), `ws_wonhyuk`(3.3T) 등 여러 사용자 워크스페이스가 quota 없이 공존,
+  `/mnt/DATA` 자체가 7.0T 중 95% 사용 중). 이후 모든 설치를 아래 원칙으로 진행:
+  - `$HOME`(`/dev/nvme0n1p2`, `/` 마운트, 879G 중 88% 사용, 전 사용자 공유)은 건드리지 않음
+    — 여기가 차면 서버 전체(로그인/시스템 서비스)가 죽어 전원에게 피해가 감.
+  - 대신 **`/mnt/DATA/workspace/ws_eungkyu/`에만** conda(Miniconda3)·pip 캐시·저장소·IsaacGym을
+    전부 설치 (`ws_eungkyu`가 quota 없는 공용 풀에서 본인 몫으로 이미 관행적으로 쓰이던 영역).
+  - GPU도 두 장 중 `cuda:0` 한 장만 `--sim_device`/`--rl_device`로 명시 지정, 다른 사용자가
+    쓸 수도 있는 GPU 1은 건드리지 않음.
+- **실제 설치 순서** (재현 시 참고):
+  1. `/mnt/DATA/workspace/ws_eungkyu/miniconda3`에 Miniconda 설치 (`-b -p`로 무인 설치).
+     `defaults` 채널은 Anaconda 이용약관 동의가 필요해서 걸리므로,
+     `conda create -c conda-forge --override-channels python=3.8`로 conda-forge만 사용.
+     (IsaacGym Preview4의 prebuilt 바인딩이 Python 3.8까지만 있어서 3.8 고정 필요 — 시스템
+     python은 3.10이라 그대로는 못 씀.)
+  2. `pip install torch==2.0.0+cu118 torchvision==0.15.0+cu118 torchaudio==2.0.0+cu118`
+     (PyTorch 공식 cu118 인덱스). `torch.cuda.is_available() == True` 확인.
+  3. IsaacGym Preview4는 NVIDIA 개발자 계정 로그인 필요라 자동화 불가 — 로컬에서 다운로드 후
+     `scp`로 `/mnt/DATA/workspace/ws_eungkyu/`에 업로드, `tar -xvf`(압축 안 됐으면 `-z` 빼도 됨)
+     후 `isaacgym/python`에서 `pip install -e .`.
+  4. **알려진 이슈 2개**:
+     - `ImportError: libpython3.8.so.1.0: cannot open shared object file` — conda 환경의
+       lib 경로가 `LD_LIBRARY_PATH`에 없어서 발생. 해결: env 전용 활성화 훅
+       (`$CONDA_PREFIX/etc/conda/activate.d/env_vars.sh`)에
+       `export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH` 추가 (전역 `.bashrc`
+       대신 env 스코프로 — 다른 conda env에 영향 안 주려고).
+     - `AttributeError: module 'numpy' has no attribute 'float'` — IsaacGym 코드
+       (`torch_utils.py`)가 numpy 1.24에서 제거된 `np.float` 별칭을 씀. `pip install "numpy<1.24"`
+       (1.23.5로 고정)로 해결. **주의**: `pip install -r requirements.txt`를 numpy 고정 이후에
+       돌리면 다시 numpy가 최신으로 끌려 올라갈 수 있으니, requirements 설치 후엔 항상
+       `numpy` 버전을 재확인할 것.
+  5. `train.py`의 `--task` 인자는 **클래스 이름이 아니라 yaml 파일명**을 기준으로
+     `envs/{task}.yaml` 경로를 만든다 (`utils/runner.py`). GoalPose는 파일명이
+     `Goal_Pose.yaml`이므로 `--task=K1/Goal_Pose`로 호출해야 함 (`K1/GoalPose`는
+     `FileNotFoundError`). `--headless`는 `argparse type=bool`이라 `--headless True`처럼
+     값을 반드시 명시해야 함 (플래그만 주면 에러).
+  6. 검증: `python train.py --task=K1/Goal_Pose --headless True --num_envs 4 --sim_device cuda:0
+     --rl_device cuda:0 --max_iterations 5` — 5 iteration 크래시 없이 완료 (milestone 2 통과).
+- **다음(진행 중)**: `num_envs`를 늘려(256~1024) 더 오래 돌리면서 TensorBoard
+  (`logs/K1/K1/GoalPose/<timestamp>/summaries`, `use_wandb: false`라도 항상 기록됨)의
+  `reward`/`value_loss`/`kl_mean`이 발산·NaN 없이 도는지 확인 중.
