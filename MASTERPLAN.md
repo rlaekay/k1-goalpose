@@ -143,6 +143,30 @@
      값을 반드시 명시해야 함 (플래그만 주면 에러).
   6. 검증: `python train.py --task=K1/Goal_Pose --headless True --num_envs 4 --sim_device cuda:0
      --rl_device cuda:0 --max_iterations 5` — 5 iteration 크래시 없이 완료 (milestone 2 통과).
-- **다음(진행 중)**: `num_envs`를 늘려(256~1024) 더 오래 돌리면서 TensorBoard
-  (`logs/K1/K1/GoalPose/<timestamp>/summaries`, `use_wandb: false`라도 항상 기록됨)의
-  `reward`/`value_loss`/`kl_mean`이 발산·NaN 없이 도는지 확인 중.
+- **정정**: `basic.task`는 `train.py --task` 인자 값으로 그대로 덮어써지므로(런타임에
+  `K1/Goal_Pose`), 실제 로그 경로는 `logs/K1/K1/Goal_Pose/<timestamp>/summaries` (yaml
+  안에 적어둔 `task: "K1/GoalPose"` 값이 아니라 CLI에서 준 언더스코어 버전으로 남음).
+- 512 env, 200 iteration까지 확장 실행 완료 — `reward` 0.01→0.27로 꾸준히 상승,
+  `value_loss`/`actor_loss` 안정, `kl_mean`이 `desired_kl` 근처 유지, `entropy` 완만히
+  감소. 발산/NaN 없음 (milestone 2 스케일 검증 통과).
+
+### 2026-07-23 — 웜스타트 체크포인트 확보: deploy 모델은 actor만 있음
+- **발견**: `deploy/models/parameter_walk.pt`는 학습 체크포인트가 아니라
+  `export_model.py`가 `torch.jit.script(model.actor)`로 만든 **actor(정책)만 담긴
+  배포용 스크립트 모듈**. `utils/runner.py`가 `--checkpoint`로 기대하는
+  `{model, optimizer, curriculum}` state_dict 딕셔너리 포맷이 아니고, critic(가치망)
+  가중치도 없음. `torch.load(...)["model"]`로 바로 못 씀.
+- **대응**: [seed_warmstart_checkpoint.py](htwk-gym/seed_warmstart_checkpoint.py) 추가 —
+  스크립트된 actor의 state_dict를 새 `ActorCritic.actor`에 그대로 로드(레이어 이름/shape가
+  `utils/model.py`와 다르면 `strict=True`라 바로 에러로 드러남), critic은 랜덤 초기화,
+  `{"model": ...}`만 있는 체크포인트로 저장. `optimizer`/`curriculum` 키가 없어도
+  `runner.py._load()`가 이미 try/except로 넘어가게 되어 있어 문제 없음.
+  ```bash
+  python seed_warmstart_checkpoint.py --task K1/Goal_Pose \
+    --source deploy/models/parameter_walk.pt \
+    --out logs/warmstart/parameter_walk_actor_seed.pth
+  ```
+  이후 `train.py --checkpoint logs/warmstart/parameter_walk_actor_seed.pth`로 웜스타트.
+- **한계**: critic은 진짜 웜스타트가 아니라 랜덤 초기화라, 학습 초반 value 추정이 부정확할
+  수 있음 — actor만 웜스타트해도 처음부터 학습하는 것보다는 유리할 것으로 기대하지만,
+  진짜 풀 체크포인트(critic 포함)를 나중에 서버 학습 로그에서 구하면 그걸로 교체 권장.
