@@ -20,7 +20,8 @@
 - Framework: htwk-gym (Isaac Gym Preview 4)
 - Robot: K1
 - Hardware: A6000 x2
-- Server: user-ESC4000A-E12 (/mnt/DATA/workspace/ws_eungkyu/htwk-gym)
+- Server: user-ESC4000A-E12 (git clone at /mnt/DATA/workspace/ws_eungkyu/k1-goalpose,
+  htwk-gym이 그 안의 서브디렉토리 — 2026-07-23 변경 이력 참고)
 
 ## 🧠 학습 아키텍쳐
 - Approach: Warm-start (ParameterWalk) → End-to-end GoalPose
@@ -49,8 +50,7 @@
 - **변경**: GoalPose를 [envs/K1/goal_pose.py](htwk-gym/envs/K1/goal_pose.py) +
   [envs/K1/Goal_Pose.yaml](htwk-gym/envs/K1/Goal_Pose.yaml)로 구현. 클래스를
   [envs/__init__.py](htwk-gym/envs/__init__.py)에 등록.
-- README.md의 "폴더 구조" 다이어그램(`tasks/K1/GoalPose/`)은 실제 구현 위치와
-  다름 — 실제 코드는 `envs/`를 참조할 것.
+- (2026-07-23 커밋 `b15eb13`에서 README.md "폴더 구조" 다이어그램을 `envs/` 기준으로 수정 완료.)
 
 ### 2026-07-23 — K1 ParameterWalk 소스에 디버그 코드 발견 (학습 불가 상태였음)
 - **발견**: `envs/K1/parameter_walk.py`에만 있고 `envs/T1/parameter_walk.py`엔 없는 코드:
@@ -90,3 +90,16 @@
 ### 2026-07-23 — 목표 재샘플링: 4~8초 주기 (§범위 고정과 일치)
 - ParameterWalk의 `cmd_resample_time`/`resampling_time_s` 메커니즘을 그대로 재사용해
   4~8초마다 새 목표를 로봇 **현재 위치·자세 기준**으로 재샘플링. 별도 구현 불필요.
+
+### 2026-07-23 — 코드 동기화 방식: rsync(SYNC.sh) → git
+- **변경 이유**: 애초 계획은 scp/rsync로 로컬↔서버를 직접 동기화하는 것이었으나,
+  GitHub 저장소(`rlaekay/k1-goalpose`)를 만들어 쓰는 쪽으로 방향 전환.
+- **변경**: `SYNC.sh`(push+pull 겸용) 삭제. 코드는 로컬에서 `git push` → 서버에서
+  `git pull`. 체크포인트/로그/영상처럼 git에 안 맞는 큰 바이너리만 [PULL.sh](PULL.sh)
+  (구 SYNC.sh의 pull 부분만 남긴 버전)로 rsync 회수. 자세한 명령은 README.md
+  "코드 동기화 (git)" 절 참고.
+- **주의 (미착수)**: 서버의 기존 경로(`/mnt/DATA/workspace/ws_eungkyu/htwk-gym/`, 사용자가
+  공유한 진단 결과 기준)는 예전 rsync push로 만들어진 구조(`htwk-gym/htwk-gym/` 이중 중첩
+  + 빈 `tasks/`)라서 새 git 워크플로우와 안 맞는다. 서버에서 새로 `git clone`해서
+  `/mnt/DATA/workspace/ws_eungkyu/k1-goalpose/`로 옮기는 걸 권장(README 절차 참고).
+  기존 디렉토리를 그대로 재사용하려면 먼저 정리 필요 — milestone -1에 포함.
