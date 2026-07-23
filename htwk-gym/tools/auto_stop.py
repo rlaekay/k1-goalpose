@@ -71,7 +71,7 @@ def main():
 
     run_dir = args.run_dir or latest_run_dir()
     print("watching run: {}".format(run_dir))
-    with open(os.path.join(run_dir, "config.yaml"), "r") as f:
+    with open(os.path.join(run_dir, "config.yaml"), "r", encoding="utf-8") as f:
         run_cfg = yaml.load(f.read(), Loader=yaml.FullLoader)
     task = run_cfg["basic"]["task"]
     sim_device = args.sim_device or run_cfg["basic"]["sim_device"]
@@ -102,7 +102,7 @@ def main():
                 scalars[-1][0], args.metric, args.window, recent, args.window, previous,
                 improvement, threshold, plateau_streak, args.patience))
             if plateau_streak >= args.patience:
-                with open(stop_file, "w") as f:
+                with open(stop_file, "w", encoding="utf-8") as f:
                     f.write("plateau: improve {:+.4f} < {:.4f} x{}\n".format(improvement, threshold, args.patience))
                 print("plateau confirmed -> STOP file written: {}".format(stop_file))
                 stopped = True

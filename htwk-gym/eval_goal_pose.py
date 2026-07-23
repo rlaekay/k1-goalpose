@@ -217,9 +217,9 @@ def main():
         out_dir = os.path.join(run_dir, "eval", time.strftime("%Y-%m-%d-%H-%M-%S"))
     os.makedirs(out_dir, exist_ok=True)
 
-    with open(os.path.join(out_dir, "report.json"), "w") as f:
+    with open(os.path.join(out_dir, "report.json"), "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
-    with open(os.path.join(out_dir, "segments.csv"), "w", newline="") as f:
+    with open(os.path.join(out_dir, "segments.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["pos_err_m", "heading_err_deg", "final_speed_mps"])
         for row in zip(pos.tolist(), head_deg.tolist(), speed.tolist()):
@@ -272,7 +272,7 @@ def main():
     md.append("- 눈으로 확인: `python eval_goal_pose.py ... --record_video` (env 0을 mp4로 저장) 또는 로컬에서 `play.py`")
 
     report_md = "\n".join(md)
-    with open(os.path.join(out_dir, "report.md"), "w") as f:
+    with open(os.path.join(out_dir, "report.md"), "w", encoding="utf-8") as f:
         f.write(report_md + "\n")
 
     if args.record_video and hasattr(env, "camera_frames") and len(env.camera_frames) > 0:
