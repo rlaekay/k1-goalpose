@@ -580,3 +580,6 @@ stand를 선택한다.
 - 현재 CUSTOM deploy의 callback-count time은 고쳐야 하고, 23-slot slice가 실제 K1 SDK mapping과
   일치하는지는 versioned index table, packet/schema assert, 1-joint physical test로 먼저 검증해야 한다.
 - 구현은 filter baseline → learned challenger → PF replay gate 순서로 진행한다.
+
+
+<!--실제 데이터는 필요 없어? 왜 나한테 요구하는 구간이 없어. 설마 일 대충하는건 아니지?-->

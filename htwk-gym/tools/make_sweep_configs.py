@@ -48,30 +48,57 @@ ARMS = {
     # D: integrated "v2 ultimate" dress rehearsal (GPU 0, 2026-07-24 user request).
     #    Deliberately NOT one-variable: bundles every sim2real lever we believe in, to
     #    preview the final deployment candidate while arms A-C answer the controlled
-    #    single-lever questions on GPU 1.
+    #    single-lever questions on GPU 1. Revised 2026-07-24 after a second pass to
+    #    close gaps the first cut missed (see MASTERPLAN): perception latency, bias vs
+    #    jitter noise structure, physically-consistent push magnitude, official PD gains.
     "armD_v2_ultimate": {
-        # BT/perception goal jitter: goal_rel_x/y std up to 10 cm, heading std ~6 deg.
-        # (The many real jitter sources -- localization, odometry, ball detection --
-        # all collapse into noise on the relative goal, so this one knob covers them.)
-        "noise.goal_pos.range": [0.0, 0.10],
-        "noise.goal_heading.range": [0.0, 0.10],
+        # Perceived-goal model instead of flat jitter (_update_perceived_goal in
+        # goal_pose.py): per-step jitter (small, high-freq) + per-segment bias (larger,
+        # persists between re-detections -- realistic localization error structure) +
+        # staleness (refresh every 2-3 control steps, camera ~20fps per K1 manual vs
+        # 50Hz control loop, instead of every step). Combined RMS ~ the single-number
+        # 10cm/6deg originally planned, just split by frequency content.
+        "noise.goal_pos.range": [0.0, 0.04],
+        "noise.goal_heading.range": [0.0, 0.04],
+        "noise.goal_pos_bias.range": [0.0, 0.08],
+        "noise.goal_heading_bias.range": [0.0, 0.08],
+        "noise.goal_obs_hold_steps": [2, 3],
         # Arrive AND stop is the task: sparse success bonus + settle into stand pose
         # near the goal (clean RLKick handoff stance).
         "rewards.scales.goal_reached": 1.0,
         "rewards.scales.stand_posture": -2.0,
+        # More stand-category segments so stand_posture actually gets trained on
+        # (was 0.1/0.3, borrowed from combined which needs it least).
+        "commands.goal_categories.stand": 0.15,
+        "commands.goal_categories.combined": 0.25,
         # A* lookahead points can be up to ~3 m out; longer segments so far goals are
         # actually reachable before resample.
         "commands.goal_dx": [-3.0, 3.0],
         "commands.goal_dy": [-2.0, 2.0],
         "commands.resampling_time_s": [4.0, 10.0],
-        # Sustained gentle wrench (someone holding/nudging the robot by the arms)
-        # instead of only 1 s shoves.
+        # Sustained GENTLE wrench (someone holding/guiding the robot by the arms), not
+        # a 3x-stronger shove: duration up 1->3s but magnitude down from the existing
+        # sudden-kick tuning so total impulse models "held," not "hit for 3 seconds."
         "randomization.push_duration_s": 3.0,
+        "randomization.push_force.range": [0.0, 5.0],
+        "randomization.push_torque.range": [0.0, 0.7],
         # Official Booster USD sets joint armature 0.02 (we had 0) -- closer actuator
         # dynamics to the real robot.
         "asset.armature": 0.02,
+        # Official Booster T1 config (booster_gym, same dt/decimation as ours) uses
+        # Hip/Knee stiffness 200/damping 5 -- exactly 2x our K1 values (100/2). Ankle
+        # already matches (50/1) untouched. Stiffer stance may help the still-marginal
+        # stop-speed/falls gates (2026-07-24 USD/booster_gym comparison, MASTERPLAN).
+        "control.stiffness": {"Hip": 200.0, "Knee": 200.0, "Ankle": 50.0},
+        "control.damping": {"Hip": 5.0, "Knee": 5.0, "Ankle": 1.0},
     },
 }
+
+# NOT folded into armD (flagged, not silently added): upgrading heading_error to a
+# sin/cos pair (fixes the +-pi wrap discontinuity) changes num_observations 54->55,
+# which breaks warm-starting from model_20000 via strict=False (shape-mismatched keys
+# still error, only missing/unexpected keys are skipped). Needs its own arm with either
+# a from-scratch run or manual first-layer surgery -- ask before adding.
 
 
 def set_dotted(cfg, dotted, value):

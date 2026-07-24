@@ -232,6 +232,14 @@ class GoalPose(BaseTask):
         self.last_root_vel = torch.zeros_like(self.root_states[:, 7:13])
         self.last_dof_targets = torch.zeros(self.num_envs, self.num_dofs, dtype=torch.float, device=self.device)
         self.delay_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        # Perceived-goal model (sim2real): the real goal_rel_x/y/heading come from a
+        # perception/localization pipeline, not an instantaneous ground-truth read.
+        # goal_obs_bias persists per goal segment (systematic localization error between
+        # re-detections); goal_obs_hold_counter staggers refresh to emulate a camera
+        # running slower than the control loop (K1 manual: ~20fps camera vs 50Hz control).
+        self.goal_obs_bias = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device)
+        self.goal_obs_hold_counter = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.goal_obs_cached = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device)
         self.torques = torch.zeros(self.num_envs, self.num_dofs, dtype=torch.float, device=self.device)
         self.commands = torch.zeros(self.num_envs, self.cfg["commands"]["num_commands"], dtype=torch.float, device=self.device)
         self.cmd_resample_time = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
@@ -453,6 +461,14 @@ class GoalPose(BaseTask):
             device=self.device,
         )
 
+        # New goal = a new perception detection: draw a fresh systematic bias for this
+        # segment and force an immediate (unstale) perceived-goal refresh next step.
+        bias_pos_cfg = self.cfg["noise"].get("goal_pos_bias")
+        bias_head_cfg = self.cfg["noise"].get("goal_heading_bias")
+        self.goal_obs_bias[env_ids, 0:2] = apply_randomization(torch.zeros(len(env_ids), 2, device=self.device), bias_pos_cfg)
+        self.goal_obs_bias[env_ids, 2] = apply_randomization(torch.zeros(len(env_ids), device=self.device), bias_head_cfg)
+        self.goal_obs_hold_counter[env_ids] = 0
+
     def _update_goal_state(self):
         """Recompute the goal position/heading relative to the robot's current local
         frame and write it into commands[:, 0:3] (the ParameterWalk lin_vel_x/y and
@@ -627,6 +643,33 @@ class GoalPose(BaseTask):
         if self.cfg["rewards"]["only_positive_rewards"]:
             self.rew_buf[:] = torch.clip(self.rew_buf[:], min=0.0)
 
+    def _update_perceived_goal(self):
+        """Refresh the perceived (goal_rel_x, goal_rel_y, heading_error) triplet that
+        actually reaches the observation, modeling a perception pipeline instead of an
+        instant ground-truth read:
+          - staleness: refreshed only every goal_obs_hold_steps control steps (camera
+            runs slower than the 50Hz control loop -- K1 manual specs the RGB/depth
+            camera at 20fps)
+          - persistent per-segment bias (goal_obs_bias, resampled in _resample_goals):
+            systematic localization/detection error that holds between re-detections
+          - per-step jitter on top (noise.goal_pos / noise.goal_heading): high-frequency
+            measurement noise
+        Off by default (goal_obs_hold_steps [0,0], bias ranges [0,0]) so v1 behavior
+        (instant noiseless read) is unchanged unless these are turned on.
+        """
+        hold_cfg = self.cfg["noise"].get("goal_obs_hold_steps")
+        refresh = self.goal_obs_hold_counter <= 0
+        if hold_cfg and hold_cfg[1] > 0:
+            new_hold = torch.randint(hold_cfg[0], hold_cfg[1] + 1, (self.num_envs,), device=self.device)
+        else:
+            new_hold = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.goal_obs_hold_counter = torch.where(refresh, new_hold, self.goal_obs_hold_counter - 1)
+
+        fresh = self.commands[:, 0:3].clone()
+        fresh[:, 0:2] = apply_randomization(fresh[:, 0:2], self.cfg["noise"].get("goal_pos")) + self.goal_obs_bias[:, 0:2]
+        fresh[:, 2] = apply_randomization(fresh[:, 2], self.cfg["noise"].get("goal_heading")) + self.goal_obs_bias[:, 2]
+        self.goal_obs_cached = torch.where(refresh.unsqueeze(-1), fresh, self.goal_obs_cached)
+
     def _compute_observations(self):
         """Computes observations"""
         commands_scale = torch.tensor(
@@ -645,11 +688,12 @@ class GoalPose(BaseTask):
             device=self.device,
         )
         # Goal-channel observation noise (sim2real: on the real robot goal_rel_x/y and
-        # heading_error come from perception/localization/odometry and jitter heavily;
-        # the reward stays clean because it reads goal_dist/heading_error, not commands).
+        # heading_error come from perception/localization/odometry, not an instant
+        # ground-truth read; the reward stays clean because it reads goal_dist/
+        # heading_error, not commands). See _update_perceived_goal for the model.
+        self._update_perceived_goal()
         noisy_commands = self.commands[:, :10].clone()
-        noisy_commands[:, 0:2] = apply_randomization(noisy_commands[:, 0:2], self.cfg["noise"].get("goal_pos"))
-        noisy_commands[:, 2] = apply_randomization(noisy_commands[:, 2], self.cfg["noise"].get("goal_heading"))
+        noisy_commands[:, 0:3] = self.goal_obs_cached
         self.obs_buf = torch.cat(
             (
                 apply_randomization(self.projected_gravity, self.cfg["noise"].get("gravity")) * self.cfg["normalization"]["gravity"],

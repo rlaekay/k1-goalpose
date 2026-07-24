@@ -595,3 +595,36 @@ mode에서 쓸 수 있는 센서(IMU gyro/gravity + 관절 엔코더)만으로 R
 - **운영**: GPU 1 = armA/B/C 단일변수 통제실험(계속), GPU 0(24h 유휴 보장) = armD 통합
   리허설. git pull은 실행 중 프로세스에 무해(코드는 시작 시 메모리에 적재 완료, logs/와
   sweeps/는 gitignore라 pull이 안 건드림).
+
+### 2026-07-24 — armD 2차 리비전: 빠진 구조적 지렛대 보강
+1차 armD(지터 노이즈+goal_reached+stand_posture+3m목표+push3s+armature)는 "최종목적 위해
+추가 가능한 걸 다 넣은 버전"이라기엔 부족하다는 지적 받고 재검토, 3개 공백 확인:
+- **인지 지연(latency) 전무**: 컨트롤 50Hz인데 매 스텝 순간갱신 가정 — K1 매뉴얼 확인
+  카메라 20fps라 실제로는 이보다 느리게 갱신됨.
+- **노이즈가 순수 순간(iid) 뿐**: 실제 localization 오차는 "재검출마다 바뀌는 편향(bias) +
+  그 위 잔떨림(jitter)" 구조인데 편향이 없었음.
+- **push duration만 3배(강도 그대로)**: impulse가 3배 돼 "팔 잡기"가 아니라 "3초간 강타"가 됨.
+- (지난 회차에 찾아둔) official PD stiffness/damping 비율(Hip/Knee 200/5, 우리는 100/2)도
+  아직 armD에 미반영이었음 — 이번에 추가.
+
+**코드 변경** ([goal_pose.py](htwk-gym/envs/K1/goal_pose.py)):
+- `_update_perceived_goal()` 신설: per-step jitter(`noise.goal_pos/goal_heading`) +
+  goal 재샘플마다 새로 뽑는 세그먼트-지속 편향(`noise.goal_pos_bias/goal_heading_bias`,
+  `_resample_goals()`에서 리셋) + staleness(`noise.goal_obs_hold_steps`, 새 목표 시
+  즉시 refresh 강제) 세 겹 구조. 전부 base yaml에서 off([0,0])라 v1 동작 불변.
+- `_compute_observations()`가 이 캐시된 인지값을 관측에 사용(보상은 여전히 ground-truth
+  `goal_dist`/`heading_error` 읽음 — 정책 훈련 신호는 안 더러워짐).
+
+**armD 최종 구성** ([make_sweep_configs.py](htwk-gym/tools/make_sweep_configs.py)):
+- 지터 4cm/4° + 편향 8cm/8°(재검출마다 갱신) + 2~3스텝 staleness — 원래 계획한 "10cm/6°
+  총노이즈"를 주파수 성분별로 분리해 재구성(합성 RMS 비슷한 크기 유지).
+- push: duration 1→3s **+ 강도 하향**(force std 15→5N, torque std 2→0.7N·m) — "잡고 있음"에
+  물리적으로 맞는 지속경도력으로 재보정.
+- `control.stiffness/damping`: Hip/Knee를 official T1 비율(200/5)로 상향(Ankle 불변).
+- `goal_categories`: stand 0.1→0.15, combined 0.3→0.25 (합 1.0 유지) — 새 `stand_posture`
+  보상이 실제로 stand 세그먼트에서 학습될 기회를 늘림.
+- (기존 유지) goal_reached +1, stand_posture -2, 목표범위 ±3m/±2m, resample 4~10s, armature 0.02.
+- **의도적으로 armD에 안 넣은 것**: heading sin/cos 업그레이드 — `num_observations` 54→55라
+  웜스타트(`model_20000`, `strict=False`)가 shape mismatch로 깨짐(누락/여분 키만 skip되지,
+  같은 키의 shape 불일치는 strict=False로도 못 넘어감). 별도 arm(처음부터 학습 또는 1층
+  수술) 필요 — 사용자 확인 후 진행.
