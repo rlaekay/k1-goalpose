@@ -22,6 +22,7 @@
 `calibrateOdom()`으로 data pose가 간헐적으로 바뀔 수 있지만, 그 사이 dead-reckoning과 TF publish,
 planner update는 멎는다. 주행 중 끊기면 BT의 명목상 100 Hz tick이 마지막 nonzero planner velocity를 계속
 재전송할 수도 있다. 현재 코드에는 odom freshness watchdog이 없다.
+<!--왜 끊기는걸 걱정하는거지?-->
 
 채택할 구조는 다음 하나다.
 
