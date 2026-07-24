@@ -54,6 +54,62 @@ def find_latest_checkpoint(task_name):
     return None
 
 
+def _draw_disk(img, cx, cy, r, color):
+    h, w = img.shape[:2]
+    x0, x1 = max(0, int(cx - r)), min(w, int(cx + r) + 2)
+    y0, y1 = max(0, int(cy - r)), min(h, int(cy + r) + 2)
+    if x0 >= x1 or y0 >= y1:
+        return
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    mask = (xx - cx) ** 2 + (yy - cy) ** 2 <= r * r
+    img[y0:y1, x0:x1][mask] = color
+
+
+def _draw_line(img, x0, y0, x1, y1, color):
+    n = int(max(abs(x1 - x0), abs(y1 - y0)) * 2) + 1
+    h, w = img.shape[:2]
+    for t in np.linspace(0.0, 1.0, n):
+        x, y = int(x0 + (x1 - x0) * t), int(y0 + (y1 - y0) * t)
+        if 0 <= y < h and 0 <= x < w:
+            img[y, x] = color
+
+
+def draw_constellation_inset(frame, base_xy, base_yaw, goal_xy, goal_yaw, radius, size=240, span=3.0):
+    """Top-down inset (upper-left corner): green ring = goal constellation, blue
+    ring = robot's current constellation, big dot on each ring = its heading
+    point. The visual gap between corresponding ring points IS the constellation
+    error the reward penalizes; rings coinciding = pose reached."""
+    channels = frame.shape[2]
+    inset = np.zeros((size, size, channels), dtype=frame.dtype)
+    inset[..., :3] = 25
+    if channels == 4:
+        inset[..., 3] = 255
+    scale = size / (2.0 * span)
+
+    def to_px(wx, wy):
+        # robot-centered top-down view (world axes): +x up, +y left
+        return size / 2.0 - (wy - base_xy[1]) * scale, size / 2.0 - (wx - base_xy[0]) * scale
+
+    rgb = inset[..., :3]
+    bx, by = to_px(base_xy[0], base_xy[1])
+    gx, gy = to_px(goal_xy[0], goal_xy[1])
+    _draw_line(rgb, bx, by, gx, gy, (110, 110, 110))
+    for (cx_w, cy_w), yaw, color in (
+        ((goal_xy[0], goal_xy[1]), goal_yaw, (70, 220, 120)),
+        ((base_xy[0], base_xy[1]), base_yaw, (80, 160, 255)),
+    ):
+        cx, cy = to_px(cx_w, cy_w)
+        for k in range(8):
+            a = yaw + k * (2.0 * np.pi / 8.0)
+            x, y = to_px(cx_w + radius * np.cos(a), cy_w + radius * np.sin(a))
+            _draw_disk(rgb, x, y, 5 if k == 0 else 3, color)
+        hx, hy = to_px(cx_w + 0.4 * np.cos(yaw), cy_w + 0.4 * np.sin(yaw))
+        _draw_line(rgb, cx, cy, hx, hy, color)
+        _draw_disk(rgb, cx, cy, 4, color)
+    frame[8:8 + size, 8:8 + size] = inset
+    return frame
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate a GoalPose checkpoint against the MASTERPLAN gates.")
     parser.add_argument("--task", default="K1/Goal_Pose")
@@ -131,6 +187,7 @@ def main():
     falls = 0
     censored = 0
     video_written = False
+    overlay_states = []
 
     for step_i in range(total_steps):
         prev_goal_pos = env.goal_pos_world.clone()
@@ -157,9 +214,17 @@ def main():
             head_errs.extend(h.cpu().tolist())
             stop_speeds.extend(v.cpu().tolist())
 
-        if args.record_video and not video_written and (step_i + 1) * env.dt >= args.record_video_s:
-            env.cfg["viewer"]["record_video"] = False  # stop accumulating frames (memory)
-            video_written = True
+        if args.record_video and not video_written:
+            _, _, yaw_all = get_euler_xyz(env.base_quat[0:1])
+            overlay_states.append((
+                env.base_pos[0, :2].cpu().numpy().copy(),
+                float(wrap(yaw_all)[0].item()),
+                env.goal_pos_world[0].cpu().numpy().copy(),
+                float(env.goal_heading_world[0].item()),
+            ))
+            if (step_i + 1) * env.dt >= args.record_video_s:
+                env.cfg["viewer"]["record_video"] = False  # stop accumulating frames (memory)
+                video_written = True
 
         if (step_i + 1) % 500 == 0:
             print("  step {}/{} — segments so far: {}, falls: {}".format(step_i + 1, total_steps, len(pos_errs), falls))
@@ -277,11 +342,12 @@ def main():
 
     if args.record_video and hasattr(env, "camera_frames") and len(env.camera_frames) > 0:
         import imageio
+        radius = cfg["rewards"].get("constellation_radius", 1.0)
         video_path = os.path.join(out_dir, "rollout_env0.mp4")
         with imageio.get_writer(video_path, fps=int(1.0 / env.dt)) as writer:
-            for frame in env.camera_frames:
-                writer.append_data(frame)
-        print("video written: {}".format(video_path))
+            for frame, st in zip(env.camera_frames, overlay_states):
+                writer.append_data(draw_constellation_inset(frame.copy(), st[0], st[1], st[2], st[3], radius))
+        print("video written (with constellation inset): {}".format(video_path))
 
     print("")
     print(report_md)

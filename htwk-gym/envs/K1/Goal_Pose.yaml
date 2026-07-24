@@ -18,7 +18,8 @@ env:
 
 runner:
   horizon_length: 24
-  mini_epochs: 20
+  mini_epochs: 5   # was 20; rsl_rl/legged_gym standard is 5 learning epochs -- 4x less
+                   # learning-phase compute per iteration (2026-07-24, see MASTERPLAN)
   save_interval: 100
   use_wandb: false
 

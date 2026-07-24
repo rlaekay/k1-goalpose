@@ -395,3 +395,17 @@
   근거리 정밀도 강화) 검토.
 - 눈으로 확인용 영상: `logs/K1/K1/Goal_Pose/2026-07-23-21-54-01/eval/2026-07-24-15-26-52/rollout_env0.mp4`
   (scp로 로컬 확보, PULL.sh의 `videos/`가 아니라 `logs/` 안에 중첩된 경로임에 주의).
+
+### 2026-07-24 — constellation 시각화 + 학습 가속 (근거 포함)
+- **시각화**: `eval_goal_pose.py --record_video` 영상 좌상단에 top-down inset 추가 —
+  초록 링=목표 constellation, 파랑 링=현재 로봇 constellation, 각 링의 큰 점=heading 방향점.
+  두 링의 점 간격이 곧 constellation 오차(보상이 벌하는 그 양)라서 눈으로 오차를 직접 읽을 수 있음.
+- **가속 1 — mini_epochs 20→5** (Goal_Pose.yaml): rsl_rl/legged_gym의 표준 학습 epoch 수는 5
+  (Isaac Lab rsl_rl 설정 문서 기준). 우리 runner는 minibatch 분할 없이 full-batch를 20회 돌고
+  있었으므로 표준 대비 학습 단계 연산이 4배 과잉이었음 → 4배 절감. (주의: 최적화 dynamics가
+  달라지므로 이전 실행과의 iteration-수 비교는 무의미해짐 — 비교는 eval 하네스 결과로만.)
+- **가속 2 — num_envs 2048→8192 권장** (CLI `--num_envs 8192`): Isaac Gym 논문(arXiv:2108.10470)이
+  humanoid 최적 env 수를 4096~8192로 보고(16384는 이득 없음). 우리 실측 GPU 사용량이
+  2048 env에서 3.6GB/49GB·util 42~57%로 여유가 커서 샘플 처리량 ~4배 기대.
+- **가속 3 — TF32 활성화** (utils/runner.py): A6000(Ampere)에서 MLP 행렬곱 가속, 물리엔진 무관.
+- 종합 기대: 학습 벽시계 시간 수 배 단축 (20000 iter ≈ 17시간 → 수 시간대 목표).

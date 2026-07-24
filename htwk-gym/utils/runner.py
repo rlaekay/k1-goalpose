@@ -14,6 +14,11 @@ from envs import *
 # Import torch and utils after isaacgym modules are initialized
 import torch
 import torch.nn.functional as F
+
+# TF32 matmuls on Ampere+ GPUs (A6000): ~free speedup for the MLP forward/backward,
+# no effect on PhysX. Precision loss is negligible at these network sizes.
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 from utils.model import *
 from utils.buffer import ExperienceBuffer
 from utils.utils import discount_values, surrogate_loss
