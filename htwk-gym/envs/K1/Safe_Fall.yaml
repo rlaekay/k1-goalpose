@@ -1,0 +1,208 @@
+# K1 safe-fall task (v6) -- 22-DOF K1_serial.urdf, PPO via RunnerV3.
+# Pairs with envs/K1/safe_fall.py (class SafeFall). Train:
+#   python train_v3.py --task K1/Safe_Fall --headless True --sim_device cuda:0 --rl_device cuda:0
+# Arm/head PD gains are experimental, identical to Get_Up.yaml so tuning transfers.
+# Judge the policy by ep_peak_force_kN vs a zero-action baseline (stiff default PD).
+
+basic:
+  checkpoint: null
+  headless: true
+  max_iterations: 10000
+  sim_device: "cuda:0"
+  rl_device: "cuda:0"
+  seed: 42
+  description: ""
+  task: "K1/Safe_Fall"
+
+env:
+  num_envs: 4096
+  num_observations: 72   # gravity3 + angvel3 + dofpos22 + dofvel22 + act22
+  num_privileged_obs: 8  # base_mass_scaled4 + base_lin_vel3 + height1
+  num_actions: 22
+  env_spacing: 1.5
+
+runner:
+  horizon_length: 24
+  mini_epochs: 5
+  num_minibatches: 4
+  save_interval: 100
+  use_wandb: false
+
+viewer:
+  pos: [3., -3., 2.]  # [m]
+  lookat: [0., 0., 0.]  # [m]
+  record_video: false
+  record_interval: 5.  # [s]
+  record_env_idx: 0
+
+algorithm:
+  learning_rate: 5.e-6
+  gamma: 0.99
+  lam: 0.95
+  bound_coef: 1.0
+  entropy_coef: -0.01
+  desired_kl: 0.01
+
+sim:
+  dt: 0.002
+  substeps: 1
+  up_axis: "z"
+  gravity: [0.0, 0.0, -9.81]
+  physics_engine: "physx"
+  physx:
+    num_threads: 4
+    solver_type: 1
+    num_position_iterations: 4
+    num_velocity_iterations: 0
+    contact_offset: 0.02
+    rest_offset: 0.0
+    bounce_threshold_velocity: 0.2
+    max_depenetration_velocity: 100.0
+    default_buffer_size_multiplier: 5.0
+    max_gpu_contact_pairs: 8388608
+    num_subscenes: 4
+    contact_collection: 1
+
+asset:
+  file: "resources/K1/K1_serial.urdf"
+  name: "K1"
+  base_name: "Trunk"
+  disable_gravity: false
+  default_dof_drive_mode: 3
+  collapse_fixed_joints: true
+  fix_base_link: false
+  self_collisions: 0
+  replace_cylinder_with_capsule: false
+  flip_visual_attachments: false
+  density: 0.001
+  angular_damping: 0.
+  linear_damping: 0.
+  max_angular_velocity: 1000.
+  max_linear_velocity: 1000.
+  armature: 0.02
+  thickness: 0.01
+
+init_state:
+  pos: [0.0, 0.0, 0.58]   # stand upright
+  rot: [0.0, 0.0, 0.0, 1.0]
+  lin_vel: [0.0, 0.0, 0.0]
+  ang_vel: [0.0, 0.0, 0.0]
+  default_joint_angles: {"Hip_Pitch": -0.2, "Knee_Pitch": 0.4, "Ankle_Pitch": -0.25, "default": 0.}
+
+control:
+  stiffness: {"Hip": 100., "Knee": 100., "Ankle": 50., "Shoulder": 40., "Elbow": 40., "Head": 10.}
+  damping:   {"Hip": 2.,   "Knee": 2.,   "Ankle": 1.,  "Shoulder": 1.,  "Elbow": 1.,  "Head": 0.5}
+  action_scale: 1.5       # position offsets; falls are fast, no velocity integration
+  decimation: 10
+
+terrain:
+  type: "plane"
+  static_friction: 1.0
+  dynamic_friction: 1.0
+  restitution: 0.
+
+normalization:
+  ang_vel: 1.0
+  dof_pos: 1.0
+  dof_vel: 0.1
+  clip_actions: 1.
+
+noise:
+  gravity:
+    range: [0., 0.01]
+    operation: "additive"
+    distribution: "gaussian"
+  ang_vel:
+    range: [0., 0.1]
+    operation: "additive"
+    distribution: "gaussian"
+  dof_pos:
+    range: [0., 0.01]
+    operation: "additive"
+    distribution: "gaussian"
+  dof_vel:
+    range: [0., 0.1]
+    operation: "additive"
+    distribution: "gaussian"
+
+randomization:
+  init_dof_pos:
+    range: [0., 0.05]
+    operation: "additive"
+    distribution: "gaussian"
+
+  # guaranteed-fall impulse: horizontal base-velocity kick in a random direction
+  fall_push_time_s: [0.5, 1.0]   # when the push fires
+  fall_push_vel:
+    range: [1.0, 2.5]            # [m/s] speed (uniform)
+    operation: "additive"
+    distribution: "uniform"
+  fall_push_ang_vel:
+    range: [0., 1.0]            # [rad/s] std
+    operation: "additive"
+    distribution: "gaussian"
+
+  dof_stiffness:
+    range: [0.95, 1.05]
+    operation: "scaling"
+    distribution: "uniform"
+  dof_damping:
+    range: [0.95, 1.05]
+    operation: "scaling"
+    distribution: "uniform"
+  dof_friction:
+    range: [0.0, 2.0]
+    operation: "additive"
+    distribution: "uniform"
+
+  friction:
+    range: [0.3, 1.5]
+    operation: "additive"
+    distribution: "uniform"
+  compliance:
+    range: [0.5, 1.5]
+    operation: "additive"
+    distribution: "uniform"
+  restitution:
+    range: [0.0, 0.3]
+    operation: "additive"
+    distribution: "uniform"
+
+  base_com:
+    range: [-0.05, 0.05]
+    operation: "additive"
+    distribution: "uniform"
+  base_mass:
+    range: [0.9, 1.1]
+    operation: "scaling"
+    distribution: "uniform"
+  other_com:
+    range: [-0.005, 0.005]
+    operation: "additive"
+    distribution: "uniform"
+  other_mass:
+    range: [0.98, 1.02]
+    operation: "scaling"
+    distribution: "uniform"
+
+rewards:
+  scales:
+    survival: 0.25
+    impact_force: -2.0
+    head_contact: -10.0
+    arm_brace: 0.5
+    settle_still: 1.0
+    post_impact_spin: -0.05
+    torques: -1.e-4
+    dof_vel: -1.e-4
+    action_rate: -0.5
+    dof_pos_limits: -1.0
+  episode_length_s: 3.5
+  only_positive_rewards: false
+  soft_dof_pos_limit: 0.98
+
+  impact_force_threshold: 300.   # [N] contact force above this is penalized
+  upright_gravity_z: 0.85        # g_z > -0.85 => "falling / not upright"
+  down_height: 0.3               # [m] base height below this => "down"
+
+  terminate_vel: 200.            # runaway-speed guard (sum of squared root velocities)
