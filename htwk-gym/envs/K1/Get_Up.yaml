@@ -1,0 +1,223 @@
+# K1 get-up task (v4) -- 22-DOF K1_serial.urdf, CrossQ (FRASA-style recipe).
+# Pairs with envs/K1/get_up.py (class GetUp) + utils/crossq.py + utils/runner_crossq.py.
+#   python train_v4.py --task K1/Get_Up --headless True --sim_device cuda:0 --rl_device cuda:0
+# Arm/head PD gains are EXPERIMENTAL (no official values published; stiffness 40
+# saturates the 10 N*m arm effort limit beyond ~0.25 rad error -- first tuning knob).
+# Fall-detection integration (deploy side, not trained): trigger = robot's
+# rt/fall_down topic OR IMU threshold (projected_gravity_z > -0.6 for 0.3 s)
+# -> damp -> run this policy until upright-hold 2 s -> hand off to PREP/loco.
+# The random-orientation drop reset covers detection latency in sim.
+
+basic:
+  checkpoint: null
+  headless: true
+  max_iterations: 2000        # x steps_per_log(100) vector steps x 128 envs = 25.6M transitions ceiling
+  sim_device: "cuda:0"
+  rl_device: "cuda:0"
+  seed: 42
+  description: ""
+  task: "K1/Get_Up"
+
+env:
+  num_envs: 128               # off-policy: small vector count, replay does the reuse
+  num_observations: 94        # gravity3 + angvel3 + (q-def)22 + qdot22 + (q_tgt-def)22 + last_act22
+  num_privileged_obs: 8       # base_mass_scaled4 + base_lin_vel3 + height1 (critic only)
+  num_actions: 22
+  env_spacing: 2.5            # getup flails ~1m; keep neighbors clear
+
+runner:
+  save_interval: 100          # iterations (= steps_per_log vector steps each)
+  use_wandb: false
+
+crossq:
+  buffer_size: 1000000        # GPU-resident
+  batch_size: 256
+  learning_starts: 100000     # transitions before updates begin (FRASA value)
+  updates_per_step: 32        # grad updates per vector env-step (UTD 0.25 at 128 envs); tune 8..128
+  policy_delay: 3             # critic updates per actor/alpha update (CrossQ paper)
+  lr: 1.0e-3
+  adam_betas: [0.5, 0.999]    # CrossQ paper
+  gamma: 0.99
+  actor_hidden: [384, 256]    # FRASA
+  critic_hidden: [1024, 1024] # CrossQ: wider critics
+  bn_momentum: 0.01
+  bn_warmup_updates: 100000   # plain-BN stats before BatchRenorm clamping kicks in
+  target_entropy: -22.0       # = -num_actions
+  steps_per_log: 100          # vector steps per "iteration" (keeps recorder/STOP/save semantics)
+
+viewer:
+  pos: [3., -3., 2.]  # [m]
+  lookat: [0., 0., 0.]  # [m]
+  record_video: false
+  record_interval: 5.  # [s]
+  record_env_idx: 0
+
+sim:
+  dt: 0.002
+  substeps: 1
+  up_axis: "z"
+  gravity: [0.0, 0.0, -9.81]
+  physics_engine: "physx"
+  physx:
+    num_threads: 4
+    solver_type: 1
+    num_position_iterations: 4
+    num_velocity_iterations: 0
+    contact_offset: 0.02
+    rest_offset: 0.0
+    bounce_threshold_velocity: 0.2
+    max_depenetration_velocity: 100.0
+    default_buffer_size_multiplier: 5.0
+    max_gpu_contact_pairs: 8388608
+    num_subscenes: 4
+    contact_collection: 1
+
+asset:
+  file: "resources/K1/K1_serial.urdf"   # 22 revolute DOFs, arms/head actuated
+  name: "K1"
+  base_name: "Trunk"
+  disable_gravity: false
+  default_dof_drive_mode: 3
+  collapse_fixed_joints: true
+  fix_base_link: false
+  self_collisions: 0          # 0 = self-collisions ENABLED (physics resolves them; FRASA's
+                              # self-collision reward is not cheaply measurable here)
+  replace_cylinder_with_capsule: false
+  flip_visual_attachments: false
+  density: 0.001
+  angular_damping: 0.
+  linear_damping: 0.
+  max_angular_velocity: 1000.
+  max_linear_velocity: 1000.
+  armature: 0.02              # official Booster USD value
+  thickness: 0.01
+
+init_state:
+  pos: [0.0, 0.0, 0.5]        # z overridden by randomization.drop_height at reset
+  rot: [0.0, 0.0, 0.0, 1.0]
+  lin_vel: [0.0, 0.0, 0.0]
+  ang_vel: [0.0, 0.0, 0.0]
+  default_joint_angles: {"Hip_Pitch": -0.2, "Knee_Pitch": 0.4, "Ankle_Pitch": -0.25, "default": 0.}
+  # posture the reward kernel pulls toward: crouched stand (low CoM, stable).
+  # Swap for the PREP/walk stand ({-0.2, 0.4, -0.25}, height 0.52) for a direct
+  # locomotion handoff once the crouched version trains.
+  target_joint_angles: {"Hip_Pitch": -0.9, "Knee_Pitch": 1.8, "Ankle_Pitch": -0.9, "Shoulder_Pitch": 0.2, "default": 0.}
+
+control:
+  stiffness: {"Hip": 100., "Knee": 100., "Ankle": 50., "Shoulder": 40., "Elbow": 40., "Head": 10.}  # [N*m/rad]
+  damping:   {"Hip": 2.,   "Knee": 2.,   "Ankle": 1.,  "Shoulder": 1.,  "Elbow": 1.,  "Head": 0.5}  # [N*m*s/rad]
+  target_vel_scale: 4.0       # [rad/s] FRASA-style: actions are joint-velocity commands
+  soft_target_limit: 0.95     # integrated PD targets clamped to this fraction of URDF limits
+  decimation: 10
+
+terrain:
+  type: "plane"
+  static_friction: 1.0
+  dynamic_friction: 1.0
+  restitution: 0.
+
+normalization:
+  ang_vel: 1.0
+  dof_pos: 1.0
+  dof_vel: 0.1
+  clip_actions: 1.
+
+noise:
+  gravity:
+    range: [0., 0.01]
+    operation: "additive"
+    distribution: "gaussian"
+  ang_vel:
+    range: [0., 0.1]
+    operation: "additive"
+    distribution: "gaussian"
+  dof_pos:
+    range: [0., 0.01]
+    operation: "additive"
+    distribution: "gaussian"
+  dof_vel:
+    range: [0., 0.1]
+    operation: "additive"
+    distribution: "gaussian"
+
+randomization:
+  # drop-and-settle reset (FRASA): random pose, random orientation, released
+  # above the ground, settled before the policy takes over
+  init_pose_mode: "uniform"   # "uniform" (within soft limits) | "default_noise"
+  init_dof_pos:               # used by default_noise mode
+    range: [0., 0.05]
+    operation: "additive"
+    distribution: "gaussian"
+  drop_height: 0.5            # [m]
+  settle_steps: [25, 50]      # control steps (0.5-1.0 s) of policy-ignored settling
+
+  dof_stiffness:
+    range: [0.95, 1.05]
+    operation: "scaling"
+    distribution: "uniform"
+  dof_damping:
+    range: [0.95, 1.05]
+    operation: "scaling"
+    distribution: "uniform"
+  dof_friction:
+    range: [0.0, 2.0]
+    operation: "additive"
+    distribution: "uniform"
+
+  friction:                   # applied to ALL body shapes (whole body touches ground)
+    range: [0.3, 1.5]
+    operation: "additive"
+    distribution: "uniform"
+  compliance:
+    range: [0.5, 1.5]
+    operation: "additive"
+    distribution: "uniform"
+  restitution:
+    range: [0.0, 0.3]
+    operation: "additive"
+    distribution: "uniform"
+
+  base_com:
+    range: [-0.05, 0.05]
+    operation: "additive"
+    distribution: "uniform"
+  base_mass:
+    range: [0.9, 1.1]
+    operation: "scaling"
+    distribution: "uniform"
+  other_com:
+    range: [-0.005, 0.005]
+    operation: "additive"
+    distribution: "uniform"
+  other_mass:
+    range: [0.98, 1.02]
+    operation: "scaling"
+    distribution: "uniform"
+
+rewards:
+  scales:
+    posture_kernel: 2.0       # FRASA main kernel toward the target stand
+    upright_hold: 1.0
+    action_smooth: 0.2
+    head_contact: -1.0
+    torques: -2.e-4
+    dof_vel: -2.e-4
+    dof_pos_limits: -1.0
+  episode_length_s: 10.
+  only_positive_rewards: false
+  soft_dof_pos_limit: 0.98
+
+  # posture kernel shape
+  posture_joint_sigma: 4.0    # [rad^2] joint-space width
+  posture_gravity_sigma: 0.5  # projected-gravity width
+  posture_height_target: 0.38 # [m] crouched-stand base height
+  posture_height_sigma: 0.04  # [m^2]
+
+  # uprightness / success
+  upright_gravity_z: 0.85     # g_z < -0.85 counts as vertical
+  upright_height: 0.33        # [m]
+  hold_success_s: 3.0         # held upright this long = success (episode ends as timeout)
+
+  # termination (NO height term -- lying down is the task)
+  terminate_ang_vel: 15.      # [rad/s]
+  terminate_vel: 100.         # sum of squared root velocities

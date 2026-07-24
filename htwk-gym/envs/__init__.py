@@ -5,3 +5,4 @@ from envs.T1.parameter_walk import ParameterWalk
 from envs.K1.goal_pose import GoalPose
 from envs.K1.goal_pose_v3 import GoalPoseV3
 from envs.K1.kick import Kick
+from envs.K1.get_up import GetUp
