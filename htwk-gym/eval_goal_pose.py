@@ -6,6 +6,7 @@ actual task metrics the reward curve cannot show:
   - final heading error per goal segment
   - final base speed (did it stop?)
   - falls (non-timeout terminations)
+  - setup/rollout wall-clock time and vectorized simulation throughput
 then judges them against the MASTERPLAN gates and writes report.md / report.json
 / segments.csv into <run_dir>/eval/<timestamp>/.
 
@@ -40,6 +41,20 @@ from utils.runner import get_task_class
 
 def wrap(x):
     return (x + torch.pi) % (2 * torch.pi) - torch.pi
+
+
+def synchronize_cuda_devices(*devices):
+    """Synchronize every distinct CUDA device used by sim or policy."""
+    synchronized = set()
+    for value in devices:
+        device = torch.device(value)
+        if device.type != "cuda":
+            continue
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        if index in synchronized:
+            continue
+        torch.cuda.synchronize(index)
+        synchronized.add(index)
 
 
 def find_latest_checkpoint(task_name):
@@ -111,8 +126,10 @@ def draw_constellation_inset(frame, base_xy, base_yaw, goal_xy, goal_yaw, radius
 
 
 def main():
+    eval_started = time.perf_counter()
     parser = argparse.ArgumentParser(description="Evaluate a GoalPose checkpoint against the MASTERPLAN gates.")
     parser.add_argument("--task", default="K1/Goal_Pose")
+    parser.add_argument("--config", help="evaluation yaml (default: envs/<task>.yaml); use a run's config.yaml for native-dynamics preview")
     parser.add_argument("--checkpoint", default="-1", help=".pth path, or -1 for the latest under logs/")
     parser.add_argument("--num_envs", type=int, help="override evaluation.num_envs from the yaml")
     parser.add_argument("--duration_s", type=float, help="override evaluation.duration_s from the yaml")
@@ -124,10 +141,12 @@ def main():
     parser.add_argument("--no_noise", action="store_true", help="disable observation noise")
     parser.add_argument("--record_video", action="store_true", help="also record an mp4 of env 0 (first --record_video_s seconds)")
     parser.add_argument("--record_video_s", type=float, default=8.0)
+    parser.add_argument("--exploratory", action="store_true", help="label this run as a non-authoritative preview rather than an official gate evaluation")
     parser.add_argument("--out", help="output dir (default: <run_dir>/eval/<timestamp>)")
     args = parser.parse_args()
 
-    with open(os.path.join("envs", "{}.yaml".format(args.task)), "r", encoding="utf-8") as f:
+    config_path = args.config or os.path.join("envs", "{}.yaml".format(args.task))
+    with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.load(f.read(), Loader=yaml.FullLoader)
     eval_cfg = cfg.get("evaluation", {})
     gates = eval_cfg.get("gates", {})
@@ -189,6 +208,12 @@ def main():
     video_written = False
     overlay_states = []
 
+    # CUDA work is asynchronous. Synchronize only at the timing boundaries so
+    # rollout_wall_s measures completed simulation/inference work without adding
+    # a device-wide barrier to every control step.
+    synchronize_cuda_devices(cfg["basic"]["sim_device"], device)
+    rollout_started = time.perf_counter()
+
     for step_i in range(total_steps):
         prev_goal_pos = env.goal_pos_world.clone()
         prev_goal_heading = env.goal_heading_world.clone()
@@ -227,7 +252,15 @@ def main():
                 video_written = True
 
         if (step_i + 1) % 500 == 0:
-            print("  step {}/{} — segments so far: {}, falls: {}".format(step_i + 1, total_steps, len(pos_errs), falls))
+            elapsed = time.perf_counter() - rollout_started
+            steps_per_s = (step_i + 1) / max(elapsed, 1.0e-9)
+            eta_s = (total_steps - step_i - 1) / max(steps_per_s, 1.0e-9)
+            print("  step {}/{} — segments: {}, falls: {}, wall {:.1f}s, ETA {:.1f}s".format(
+                step_i + 1, total_steps, len(pos_errs), falls, elapsed, eta_s))
+
+    synchronize_cuda_devices(cfg["basic"]["sim_device"], device)
+    rollout_wall_s = time.perf_counter() - rollout_started
+    setup_wall_s = rollout_started - eval_started
 
     pos = np.array(pos_errs)
     head_deg = np.degrees(np.array(head_errs))
@@ -243,6 +276,7 @@ def main():
 
     results = {
         "checkpoint": checkpoint,
+        "config": config_path,
         "task": args.task,
         "date": time.strftime("%Y-%m-%d %H:%M:%S"),
         "num_envs": num_envs,
@@ -250,6 +284,7 @@ def main():
         "deterministic": not args.stochastic,
         "perturbations": bool(args.keep_perturbations),
         "obs_noise": not args.no_noise,
+        "authoritative_gate_evaluation": not args.exploratory,
         "segments_completed": n,
         "segments_censored_by_episode_end": censored,
         "falls": falls,
@@ -267,6 +302,16 @@ def main():
         },
         "success_rate_strict": success_strict,
         "success_rate_loose": success_loose,
+        "timing": {
+            "setup_wall_s": setup_wall_s,
+            "rollout_wall_s": rollout_wall_s,
+            "simulated_time_per_env_s": total_steps * env.dt,
+            "aggregate_env_simulated_time_s": total_steps * env.dt * num_envs,
+            "single_env_realtime_factor": (total_steps * env.dt) / max(rollout_wall_s, 1.0e-9),
+            "aggregate_env_seconds_per_wall_second": (total_steps * env.dt * num_envs) / max(rollout_wall_s, 1.0e-9),
+            "vectorized_control_iterations_per_wall_second": total_steps / max(rollout_wall_s, 1.0e-9),
+            "aggregate_env_transitions_per_wall_second": (total_steps * num_envs) / max(rollout_wall_s, 1.0e-9),
+        },
         "gates": {
             "pos_median": {"limit": gate_pos_median, "value": float(np.median(pos)), "pass": bool(np.median(pos) <= gate_pos_median)},
             "pos_p90": {"limit": gate_pos_p90, "value": float(np.percentile(pos, 90)), "pass": bool(np.percentile(pos, 90) <= gate_pos_p90)},
@@ -294,14 +339,22 @@ def main():
     md.append("# GoalPose 평가 리포트 — {}".format(results["date"]))
     md.append("")
     md.append("- checkpoint: `{}`".format(checkpoint))
+    md.append("- config: `{}`".format(config_path))
     md.append("- 조건: {} envs × {:.0f}s, {} 정책, 외란 {}, 관측노이즈 {}".format(
         num_envs, duration_s,
         "결정론적" if results["deterministic"] else "확률적",
         "ON" if results["perturbations"] else "OFF",
         "ON" if results["obs_noise"] else "OFF"))
+    md.append("- 벽시계: setup {:.1f}s + rollout {:.1f}s; env당 {:.1f}× real-time, 총 {:.0f} env·s/wall-s".format(
+        results["timing"]["setup_wall_s"], results["timing"]["rollout_wall_s"],
+        results["timing"]["single_env_realtime_factor"],
+        results["timing"]["aggregate_env_seconds_per_wall_second"]))
     md.append("- 완료 구간 {}개 / 낙상 {}회 / 에피소드경계 절단 {}개".format(n, falls, censored))
     md.append("")
-    md.append("## 게이트 판정 (MASTERPLAN §성공 기준)")
+    if args.exploratory:
+        md.append("## 게이트 참고치 (탐색용 preview — 공식 판정 아님)")
+    else:
+        md.append("## 게이트 판정 (MASTERPLAN §성공 기준)")
     md.append("")
     md.append("| 게이트 | 기준 | 측정값 | 판정 |")
     md.append("|---|---|---|---|")
@@ -314,7 +367,11 @@ def main():
     md.append("| 낙상 | ≤ {} | {} | {} |".format(
         gate_max_falls, falls, "✅ PASS" if results["gates"]["falls"]["pass"] else "❌ FAIL"))
     md.append("")
-    md.append("**종합: {}**".format("✅ 전체 게이트 통과" if results["all_gates_pass"] else "❌ 미통과 게이트 있음"))
+    if args.exploratory:
+        md.append("**탐색 결과: {} (표본/조건이 표준 프로토콜이 아니므로 공식 판정 아님)**".format(
+            "모든 수치 기준 충족" if results["all_gates_pass"] else "미충족 수치 있음"))
+    else:
+        md.append("**종합: {}**".format("✅ 전체 게이트 통과" if results["all_gates_pass"] else "❌ 미통과 게이트 있음"))
     md.append("")
     md.append("## 부가 지표")
     md.append("")

@@ -176,6 +176,18 @@ normalization:
   clip_actions: 1.
 
 noise:
+  # BT/perception goal jitter DR (sim2real): on the real robot goal_rel_x/y and
+  # heading_error come from vision/localization/odometry and jitter heavily. These
+  # noise the OBSERVATION only (rewards read ground-truth goal_dist/heading_error).
+  # range = [mean, std] gaussian. [0,0] = off (v1 behavior); v2 arms turn this up.
+  goal_pos:
+    range: [0., 0.]
+    operation: "additive"
+    distribution: "gaussian"
+  goal_heading:
+    range: [0., 0.]
+    operation: "additive"
+    distribution: "gaussian"
   gravity:
     range: [0., 0.01]
     operation: "additive"
@@ -317,6 +329,7 @@ rewards:
     goal_progress: 0.         # potential-based, + for closing distance [m/s]; dense far-field gradient
     goal_reached: 0.          # sparse +1/step while stopped inside goal_reach_radius (true task success)
     heading_near_goal: 0.     # heading reward gated to near-goal region; alternative to global goal_heading
+    stand_posture: 0.         # (negative) near-goal penalty for deviating from default standing pose -- clean RLKick handoff stance
   episode_length_s: 30.
   terminate_height: 0.35
   terminate_vel: 50.
@@ -341,6 +354,7 @@ rewards:
   goal_progress_clip: 1.0      # [m/s] clip for goal_progress (robustness to kicks/resets)
   stop_speed_threshold: 0.1    # [m/s] "stopped" threshold for goal_reached
   heading_gate_sigma: 0.25     # [m^2] distance-gate width for heading_near_goal
+  stand_posture_radius: 0.3    # [m] inside this goal distance, stand_posture penalty activates
 
   # feet_offset_x/y velocity-scaling reference speeds (used only if those scales are re-enabled)
   feet_offset_vel_scale_x: 0.6  # [m/s]

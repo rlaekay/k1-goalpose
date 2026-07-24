@@ -66,7 +66,19 @@ python tools/auto_stop.py
 python eval_goal_pose.py --task K1/Goal_Pose --checkpoint -1 \
   --sim_device cuda:1 --rl_device cuda:1
 
+# 병렬 sweep 3개의 중간 상태를 GPU 0에서 한 번에 확인
+# (arm별 최신 안정 checkpoint → 빠른 수치 평가 + 12초 영상 + 비교표)
+python tools/preview_sweep.py --device cuda:0
+
+# 학습 진행률/TensorBoard reward/checkpoint만 즉시 확인
+python tools/preview_sweep.py --status_only
+
+# 최종 판정용 전체 프로토콜(256 env x 120 simulated seconds, 영상 제외)
+python tools/preview_sweep.py --device cuda:0 --full --no_video
+
+# armC의 native 200Hz 실행속도 확인(camera overhead 제외; 정책 품질 공정비교와는 별도)
+python tools/preview_sweep.py --device cuda:0 --native --no_video
+
 # 보상 조합 실험: envs/K1/Goal_Pose.yaml의 rewards.scales만 수정
 #   goal_progress / goal_reached / heading_near_goal (기본 0 = 꺼짐)
 ```
-

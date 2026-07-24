@@ -45,6 +45,32 @@ ARMS = {
         "sim.dt": 0.005,
         "control.decimation": 4,
     },
+    # D: integrated "v2 ultimate" dress rehearsal (GPU 0, 2026-07-24 user request).
+    #    Deliberately NOT one-variable: bundles every sim2real lever we believe in, to
+    #    preview the final deployment candidate while arms A-C answer the controlled
+    #    single-lever questions on GPU 1.
+    "armD_v2_ultimate": {
+        # BT/perception goal jitter: goal_rel_x/y std up to 10 cm, heading std ~6 deg.
+        # (The many real jitter sources -- localization, odometry, ball detection --
+        # all collapse into noise on the relative goal, so this one knob covers them.)
+        "noise.goal_pos.range": [0.0, 0.10],
+        "noise.goal_heading.range": [0.0, 0.10],
+        # Arrive AND stop is the task: sparse success bonus + settle into stand pose
+        # near the goal (clean RLKick handoff stance).
+        "rewards.scales.goal_reached": 1.0,
+        "rewards.scales.stand_posture": -2.0,
+        # A* lookahead points can be up to ~3 m out; longer segments so far goals are
+        # actually reachable before resample.
+        "commands.goal_dx": [-3.0, 3.0],
+        "commands.goal_dy": [-2.0, 2.0],
+        "commands.resampling_time_s": [4.0, 10.0],
+        # Sustained gentle wrench (someone holding/nudging the robot by the arms)
+        # instead of only 1 s shoves.
+        "randomization.push_duration_s": 3.0,
+        # Official Booster USD sets joint armature 0.02 (we had 0) -- closer actuator
+        # dynamics to the real robot.
+        "asset.armature": 0.02,
+    },
 }
 
 
@@ -65,14 +91,21 @@ def main():
     ap.add_argument("--max_iterations", type=int, default=20000)
     ap.add_argument("--device", default="cuda:1")
     ap.add_argument("--out_dir", default="sweeps")
+    ap.add_argument("--only", help="generate just this arm (e.g. armD_v2_ultimate); leaves the other arms' yaml files untouched")
     args = ap.parse_args()
+
+    arms = ARMS
+    if args.only:
+        if args.only not in ARMS:
+            raise SystemExit("unknown arm {!r}; choices: {}".format(args.only, ", ".join(ARMS)))
+        arms = {args.only: ARMS[args.only]}
 
     with open(BASE, "r", encoding="utf-8") as f:
         base = yaml.load(f.read(), Loader=yaml.FullLoader)
     os.makedirs(args.out_dir, exist_ok=True)
 
     print("# paste each block into its own tmux window (same GPU {}):\n".format(args.device))
-    for arm, patch in ARMS.items():
+    for arm, patch in arms.items():
         cfg = copy.deepcopy(base)
         cfg["basic"]["description"] = arm
         for dotted, value in patch.items():

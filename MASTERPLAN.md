@@ -27,7 +27,9 @@
 서버(`user-ESC4000A-E12`)는 여러 사람이 같이 쓰는 장비다. 아래는 매번 학습을 돌릴 때마다
 지켜야 하는 상시 규칙 — 아래 §변경 이력의 "왜 이렇게 됐는지"와 달리, 이건 **매번 반복 적용**한다.
 - **GPU**: 학습 시작 전 항상 `nvidia-smi`로 어느 GPU가 비어있는지 확인하고, 그 번호를
-  `--sim_device`/`--rl_device`에 명시적으로 지정한다. 두 GPU를 동시에 잡지 않는다.
+  `--sim_device`/`--rl_device`에 명시적으로 지정한다. 기본은 두 GPU를 동시에 잡지 않는다.
+  단, 사용자가 그날의 점유 상황을 확인해 명시적으로 허용한 경우에만 빈 GPU를 평가/독립 실험에
+  추가 사용한다(2026-07-24에는 GPU 0 사용 허용; 아래 기록 참고).
 - **중간에 다른 프로세스가 나타나면 우리가 양보한다**: 실행 중 다른 사용자(또는 root/공용
   서비스)의 프로세스가 같은 GPU에 새로 붙으면, 누가 "먼저"인지 `ps -p <PID> -o user,lstart,cmd`로
   확인하고, 우리가 나중이면 우리 학습을 `kill -SIGINT <PID>`(체크포인트 로직 안 깨지는 안전 종료)로
@@ -40,7 +42,7 @@
 
 ## 🧠 학습 아키텍쳐
 - Approach: Warm-start (ParameterWalk) → End-to-end GoalPose
-- Network: MLP [512,256,128] + history
+- Network: actor MLP [256,128,128], feed-forward(no history); critic MLP [256,256,128]
 - Action: 관절 위치 목표
 - Reward: constellation + style/regularization 상속
 
@@ -49,10 +51,11 @@
 |---|---|---|
 | -1 | ✅ 서버 환경 구축 (PyTorch/IsaacGym/deps) | 2026-07-23 완료 (아래 변경 이력) |
 | 0 | ⬜ 베이스라인 (ParameterWalk 재현) | 영상 확인 — **미착수**, 아래 참고 |
-| 1 | ✅ 평가 하네스 | 코드 완성 2026-07-23 (`eval_goal_pose.py` + `tools/auto_stop.py`) — 실측은 학습 종료 후 |
+| 1 | ✅ 평가 하네스 | 코드+v0/v1 실측 완료; wall-clock/3-arm preview 지원 |
 | 2 | ✅ GoalPose 태스크 골격 | 2026-07-23 완료: 크래시 없음 + 512env/200iter 스케일 검증 통과 |
-| 3 | 🔶 constellation 학습 | 게이트 통과 — **진행 중** (아래 참고) |
+| 3 | 🔶 constellation 학습 | v1@20000 후 3-arm sweep 진행 중; 게이트 미통과 |
 | 4 | ⬜ export + MuJoCo 검증 | 배포 준비 — 미착수 |
+| 5 | ⬜ 상태추정 + BT/RLkick 통합 | Δpose estimator, goal conditioner, 실기 handoff 검증 |
 
 ## 📝 변경 이력 (원래 계획 대비 조정)
 > 이 섹션은 위 §목표/범위/성공 기준을 바꾸지 않는다. 실행 중 발견한 현실적 제약으로
@@ -452,3 +455,143 @@
   고정 iter 예산(기본 20000)으로 공정 비교 후 eval 하네스로 3갈래 판정.
 - **참고**: MPS로 커널 실제 겹침까지 가면 util 더 오르지만 compute mode 변경은 타 사용자
   프로세스를 깨므로 금지 — per-user MPS(DEFAULT 모드)만 선택지, 지금은 미적용(멀티프로세스만으로 충분).
+
+### 2026-07-24 — 실기 통합 결정: lookahead/정지/BT 흔들림/사람 지지
+
+#### 1. 2–3 m A* lookahead와 odom
+
+- **고정 local waypoint를 한 번만 주는 경우**: 짧은 거리여도 partial observability가 남는다.
+  현재 actor는 feed-forward MLP라 명시적 history가 없고 simulator GT reward는 배포 시 남은 거리를
+  관측하게 해주지 않는다. 직전 action/몸 상태로 open-loop timing을 암묵적으로 외워 nominal sim에서
+  성공할 수는 있지만 slip/push/사람 지지 때 누적오차를 위치 feedback으로 교정하지 못한다.
+- **상위 localization/perception이 현재 robot-frame lookahead를 streaming으로 계속 주는 경우**:
+  low-level policy 내부의 별도 적분은 생략 가능하다. 그러나 현재 축구 stack은 PF motion update,
+  `robotPoseToField`, A*/local planner, TF에도 같은 egomotion을 쓰므로 **시스템 odom delta는 생략할 수
+  없다.** 직접 상대 목표 sensor로 global localization/field 전술 전체를 대체하는 다른 stack일 때만
+  예외다.
+- 현재 actor는 이미 projected gravity와 gyro를 받는다. raw acceleration 한 프레임을 더 넣어도
+  translation을 알 수 없고, 적분 memory/contact constraint가 없어 해결이 안 된다.
+- 현재 범위는 `dx±2 m`, `dy±1.5 m`라 정면 3 m lookahead는 OOD(normalized x=1.5)다. 우선 BT가
+  학습 사각형 안의 path point로 project/clip하고, 3 m가 실제로 필요하면 별도 분포로 재학습한다.
+- 채택 구조: `low_state → contact-aided estimator → timestamped body-frame SE(2) delta+covariance →
+  PF/continuous odom → A*/GoalPose target`의 공용 파이프라인이다. policy 안에 global pose를 넣을
+  필요는 없지만, PF가 만든 map pose와 estimator의 local delta는 둘 다 유지한다. 필터 baseline과
+  AutoOdom형 supervised estimator는 걷기 PPO와 병렬 개발한다([STATE_ESTIMATION.md](STATE_ESTIMATION.md)).
+- history/RNN policy의 implicit odometry도 유효한 ablation이지만 현재 PF stack의 production 경로는
+  별도 Δpose estimator가 선행 조건이다. policy 입력 방식의 우선순위만 streaming relative goal →
+  delta로 보간한 relative goal → recurrent/open-loop policy 순서다.
+
+#### sim2real branch 재감사 결과 (PF까지 포함)
+
+- `../[07]sim2real`의 `sim2real` branch commit `9ffeb143`을 직접 추적했다. `brain.cpp`의
+  `odometerCallback()`은 SDK 누적 odom을 차분/scale/clamp한 뒤 main PF predict, continuous field pose,
+  TF/`localized_pose`, relocalization PF, orientation sentinel, local planner compute를 한꺼번에 실행한다.
+- CUSTOM에서 `odometer_state`가 멈추면 landmark correction 시 data pose가 간헐적으로 바뀔 수는 있어도
+  그 사이 PF propagation, TF, planner update가 멎는다. 별도 명목상 100 Hz `Brain::tick()`은 cached planner
+  velocity를 계속 보낼 수 있으므로 odom/pose freshness watchdog과 stale-command STOP이 P0다.
+- 새 estimator는 기존 `Odometer{x,y,theta}`를 흉내 내는 것보다 old-body-frame
+  `(Δx,Δy,Δyaw,stamp,seq,epoch,Q,status)`를 source-neutral consumer에 주는 구조로 만든다. 기존 SDK
+  보정값(forward 1.30, backward 1.31, lateral 1.17, yaw 1.5)은 SDK adapter에만 두고 새 estimator에는
+  중복 적용하지 않는다.
+- delta의 x/y는 SE(2) `Log`가 아니라 relative transform의 실제 old-body translation으로 고정하고 PF도
+  Pose2D composition을 쓴다. Q는 pose clone/preintegration cross-covariance로 만들고 mocap으로
+  scale/floor를 calibration한다. delayed vision의 production 경로는 PF rewind/correct/delta replay다.
+  capture→now marker transform은 odom Q까지 measurement covariance에 반영해 보수적으로 inflate하는
+  prototype 근사로만 두고 consistency를 replay에서 확인한다.
+- 현 ROS `LowState`/`Odometer`에는 source timestamp가 없고, CUSTOM deploy의 timer는 callback 횟수×2 ms다.
+  estimator는 detection과 같은 ROS clock receipt stamp를 쓰거나 명시적인 clock mapping+gap detection을
+  사용해야 한다. worker는 PF를 직접 건드리지 않고 Brain single-writer callback에 delta를 넘긴다.
+- 현재 `deploy/`는 `B1JointCnt` 23-slot/`[11:]` layout이고 K1 resource는 22 actuator/leg XML indices
+  10..21이다. SDK가 placeholder slot을 유지하면 맞을 수도 있어 one-index bug로 단정하지 않는다.
+  실제 K1 packet은 이름 없는 배열이므로 robot/SDK-version별 index table, packet schema,
+  serial/parallel ankle 의미, `T_BI`를 boot-time assert+1-joint physical test로 먼저 승인한다.
+
+#### 2. 제자리 정지와 walk→stand 자세
+
+- stand category는 4–8초 resample 때 에피소드 중간에도 나와 **갑작스러운 walk→stand command**는
+  일부 학습한다. 그러나 비영점 목표에 접근하며 자연스럽게 감속해 stand와 같은 자세로 들어가는
+  arrival transition은 보장하지 않는다. `gait_frequency=0`일 때 phase도 임의 값에 멈추므로
+  phase별 종단 자세가 갈릴 수 있다.
+- 3-arm 결과를 먼저 판정한 뒤 다음 실험에서 `arrival_hold`를 추가한다. 진입/해제 threshold를
+  다르게 둔 SE(2) hysteresis, double-support/canonical phase에서 clock 정지, gait frequency
+  ramp-down, stand와 동일한 neutral joint/base/양발 보상을 walk 도착 후에도 적용한다.
+- 평가는 순간 final speed뿐 아니라 1 s 연속 hold 성공률, hold 중 최대 위치 이탈, speed p90,
+  stand 시작 vs walk→stand 종단 joint RMS, 발 step/slip을 기록한다.
+- armB의 `goal_reached` radius는 10 cm인데 독립 median gate는 5 cm다. 5–10 cm에서 보상 파밍할
+  수 있으므로 armB 결과 해석 시 주의하고, 후속 구현은 heading/yaw speed/dwell을 조건에 추가한다.
+
+#### 3. 사람이 팔을 잡아주는 상황
+
+- 현재 trunk Gaussian push는 사람 손 지지와 다르다. K1 locomotion URDF는 팔이 fixed/collapsed라
+  우선 trunk에 equivalent wrench를 가하는 virtual hand-anchor spring-damper로 근사한다.
+- 좌/우/양팔, lever arm, anchor, stiffness/damping, force cap, 유지시간, ramp/갑작스러운 release를
+  env별 랜덤화한다. 대부분은 no-support로 두어 손에 의존하는 정책이 되지 않게 한다.
+- no-support / support-on / release 후 1–2 s의 세 프로토콜을 분리 평가한다.
+
+#### 4. domain randomization 운영법
+
+- 현재 물성/PD/지연/noise/kick/push DR은 이미 넓게 존재한다. 다음 일은 항목 추가보다 **실기 로그로
+  범위를 calibration**하는 것이다: nominal과 5–95 percentile을 train 분포로, 범위 밖은 OOD
+  stress eval로 분리한다.
+- 후속 구현에서 물성/구동계와 bias는 episode별, white noise는 step별, drift는 시간상관(AR/OU)으로
+  모델링한다. 현재 mass/CoM/PD/contact property는 env 생성 시 1회 샘플이므로 episode별 재설정
+  코드를 추가해야 한다.
+  좌우 PD/encoder offset, 배터리 torque scale처럼 실제로 상관된 항목은 묶어 샘플링한다.
+- 현재 모든 env가 같은 시점에 kick/push를 받는 구조는 phase/interval/duration을 env별로 바꾼다.
+  no-DR / calibrated-DR / OOD-stress 평가를 고정해 “DR이 많음”과 “실기를 잘 덮음”을 구분한다.
+
+#### 5. BT goal jitter와 RLkick handoff
+
+- 학습에서는 reward용 `goal_true`와 actor 입력용 `goal_observed`를 분리한다. bias/random walk,
+  sample-and-hold, latency, dropout, outlier/spurious planner jitter는 `goal_observed`에만 넣는다.
+  실제 공 이동·유효한 replanning은 `goal_true`/`goal_observed`를 함께 바꾸되, 센서 noise 때문에
+  reward target 자체를 흔드는 것은 금지한다.
+- 실기에서는 raw robot-local goal을 곧바로 low-pass하지 않는다. map/odom-frame path arc-length에
+  innovation/confidence gate, rate limit, deadband, last-valid hold, monotonic-index hysteresis를
+  적용하고 최신 pose로 local 변환한다. yaw는 wrap-safe circular filter를 쓴다.
+- GoalPose→RLkick은 RLkick의 실측 capture set(예: 거리/각도/ball confidence)을 N frame 연속
+  만족할 때 진입하고, 더 큰 exit threshold와 minimum dwell/cooldown을 둔다. 진입 후 approach
+  pose는 freeze/강한 smoothing하고 공 상대 최종 보정은 RLkick이 담당한다. 독립 GoalPose 5 cm
+  benchmark와 축구 stack의 handoff 성공률은 서로 다른 게이트로 유지한다.
+
+#### 6. GPU 0의 오늘 사용 순서와 중간 확인
+
+- 2026-07-24 사용자 허용에 따라 GPU 1의 세 학습은 건드리지 않고, GPU 0에서는 먼저 세 arm의
+  최신 **안정된** checkpoint를 순차 평가한다. 새 4번째 학습을 먼저 띄우면 어느 arm이 유망한지
+  모른 채 계산을 쓰므로 preview 결과 뒤에 다음 lever를 정한다.
+- 원클릭 도구: `python tools/preview_sweep.py --device cuda:0`. 기본은 64 env × 30 simulated s와
+  arm별 12 s 영상(추세 확인용), `--full --no_video`는 256 env × 120 s 표준 프로토콜이다.
+  `--status_only`는 TensorBoard 마지막 iteration/reward와 checkpoint만 출력한다.
+- `eval_goal_pose.py`는 setup/rollout wall-clock, ETA, env당 real-time factor와 aggregate
+  env·s/wall-s를 report.json/report.md에 기록한다. `--config <run>/config.yaml`로 armC의 native
+  200 Hz behavior도 볼 수 있지만, 기본 sweep 비교는 공통 500 Hz dynamics를 써야 공정하다.
+  armC **속도** 비교는 camera 비용을 빼기 위해 별도로 `--native --no_video`를 쓴다.
+- 다음 GPU 0 우선순위: preview 승자 확인 → (a) arrival_hold 후속 arm 또는 (b) 세 policy의
+  rollout을 모아 Δpose estimator 학습 데이터 생성. 정보 없이 “goal/odom 제거 MLP” arm을 돌리는
+  것은 nominal 가능성을 부정하진 않지만 sim2real 신뢰성이 낮아 production 우선순위에서 제외하고,
+  필요하면 마지막에 작은 ablation으로만 확인한다.
+
+### 2026-07-24 — sim2real 요구 반영 + armD_v2_ultimate (GPU 0, 24h 창구)
+역할 분담 확정: **오도메트리(레그+IMU 추정기)는 Codex 담당**(STATE_ESTIMATION.md가 Codex의
+시스템 설계로 재작성됨 — PF/planner까지 포함한 전체 egomotion 계약). **이쪽(Claude)은 CUSTOM
+mode에서 쓸 수 있는 센서(IMU gyro/gravity + 관절 엔코더)만으로 RLKick 직전 pose에 최적
+도달하는 정책 학습**에 집중.
+- **"odom 없이 도달" 질문 판정**: 현 네트워크는 history 없는 순수 MLP라 자기 이동량을 내부
+  적분할 기억이 없음 → 목표를 한 번만 주고 끊는 완전 open-loop는 원리적으로 불가.
+  단, 실전에서는 지각(공 관측·localization)이 상대 목표를 계속 재측정해 주므로 폐루프는
+  유지됨 — 따라서 정답은 "상대 목표 관측에 강한 노이즈를 걸어 학습"(사용자 가설과 일치).
+  IMU 가속도를 관측에 추가하는 것은 적분(=기억) 없이는 위치 정보가 안 되므로 도움 안 됨 —
+  그 적분을 제대로 하는 것이 Codex의 estimator.
+- **코드 변경** (base 동작은 완전 동일 유지, 전부 스위치):
+  - `goal_pose.py` 관측에 `noise.goal_pos`/`noise.goal_heading` 적용(관측만 오염, 보상은
+    ground-truth 유지). base yaml은 range [0,0] = OFF.
+  - `_reward_stand_posture` 신설: 목표 반경 0.3m 안에서 기본 기립 자세와의 관절 편차 벌점
+    → 감속·정지 자세가 PREP 기립과 비슷해져 RLKick 인계가 깨끗해짐. base scale 0 = OFF.
+  - `make_sweep_configs.py`에 `--only` 필터 + **armD_v2_ultimate** 추가(의도적으로 다변수 통합):
+    goal 지터 std 10cm/6°, goal_reached +1, stand_posture -2, 목표범위 ±3m/±2m,
+    resample 4~10s(더 긴 보행), push_duration 3s(팔 잡힘류 지속 외란), armature 0.02(공식 USD값).
+- **eval wall-clock**: Codex가 이미 eval_goal_pose.py에 setup/rollout wall-clock + 처리량
+  출력을 반영함(+ --config/--exploratory 옵션) — 추가 작업 불필요.
+- **운영**: GPU 1 = armA/B/C 단일변수 통제실험(계속), GPU 0(24h 유휴 보장) = armD 통합
+  리허설. git pull은 실행 중 프로세스에 무해(코드는 시작 시 메모리에 적재 완료, logs/와
+  sweeps/는 gitignore라 pull이 안 건드림).

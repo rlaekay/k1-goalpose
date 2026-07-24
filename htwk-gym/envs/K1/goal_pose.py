@@ -644,11 +644,17 @@ class GoalPose(BaseTask):
             ],
             device=self.device,
         )
+        # Goal-channel observation noise (sim2real: on the real robot goal_rel_x/y and
+        # heading_error come from perception/localization/odometry and jitter heavily;
+        # the reward stays clean because it reads goal_dist/heading_error, not commands).
+        noisy_commands = self.commands[:, :10].clone()
+        noisy_commands[:, 0:2] = apply_randomization(noisy_commands[:, 0:2], self.cfg["noise"].get("goal_pos"))
+        noisy_commands[:, 2] = apply_randomization(noisy_commands[:, 2], self.cfg["noise"].get("goal_heading"))
         self.obs_buf = torch.cat(
             (
                 apply_randomization(self.projected_gravity, self.cfg["noise"].get("gravity")) * self.cfg["normalization"]["gravity"],
                 apply_randomization(self.base_ang_vel, self.cfg["noise"].get("ang_vel")) * self.cfg["normalization"]["ang_vel"],
-                self.commands[:, :10] * commands_scale,
+                noisy_commands * commands_scale,
                 (torch.cos(2 * torch.pi * self.gait_process)).unsqueeze(-1),
                 (torch.sin(2 * torch.pi * self.gait_process)).unsqueeze(-1),
                 apply_randomization(self.dof_pos - self.default_dof_pos, self.cfg["noise"].get("dof_pos")) * self.cfg["normalization"]["dof_pos"],
@@ -725,6 +731,13 @@ class GoalPose(BaseTask):
         heading = torch.exp(-torch.square(self.heading_error) / self.cfg["rewards"]["goal_heading_sigma"])
         gate = torch.exp(-torch.square(self.goal_dist) / self.cfg["rewards"]["heading_gate_sigma"])
         return heading * gate
+
+    def _reward_stand_posture(self):
+        # Near the goal, settle into the default standing posture rather than a
+        # mid-stride crouch: the deceleration/arrival pose should look like PREP-mode
+        # standing so the RLKick handoff starts from a clean, repeatable stance.
+        close = (self.goal_dist < self.cfg["rewards"]["stand_posture_radius"]).float()
+        return close * torch.sum(torch.square(self.dof_pos - self.default_dof_pos), dim=-1)
 
     def _reward_base_height(self):
         # Tracking of base height
