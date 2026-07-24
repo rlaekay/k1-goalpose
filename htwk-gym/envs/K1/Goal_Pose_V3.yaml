@@ -1,0 +1,494 @@
+# GoalPose v3 challenger config -- generated from Goal_Pose.yaml (2026-07-24) + overrides.
+# Pairs with envs/K1/goal_pose_v3.py (GoalPoseV3) and utils/runner_v3.py (train_v3.py).
+# On top of the armD_v2_ultimate sim2real bundle this adds, each independently switchable:
+#   - success-adaptive goal curriculum  -> commands.goal_curriculum (enabled: true)
+#   - Rudin-style timed task reward     -> rewards.final_window_s   (0 = off; try 2.0)
+#   - L/R mirror-symmetry loss          -> algorithm.symmetry_coef  (0 = off; 0.5 default)
+#   - minibatched PPO                   -> runner.num_minibatches   (rsl_rl convention)
+# Base Goal_Pose.yaml and arms A-D are untouched; this file is regenerable, edit freely.
+basic:
+  checkpoint: null
+  headless: true
+  max_iterations: 20000
+  sim_device: cuda:0
+  rl_device: cuda:0
+  seed: 42
+  description: ''
+  debug_feet_offset: false
+  task: K1/Goal_Pose_V3
+env:
+  num_envs: 8192
+  num_observations: 54
+  num_privileged_obs: 14
+  num_actions: 12
+  env_spacing: 1.0
+runner:
+  horizon_length: 24
+  mini_epochs: 5
+  save_interval: 100
+  use_wandb: false
+  num_minibatches: 4
+viewer:
+  pos:
+  - 3.0
+  - -3.0
+  - 2.0
+  lookat:
+  - 0.0
+  - 0.0
+  - 0.0
+  record_video: false
+  record_interval: 5.0
+  record_env_idx: 0
+algorithm:
+  learning_rate: 5.0e-06
+  gamma: 0.995
+  lam: 0.95
+  bound_coef: 1.0
+  entropy_coef: -0.01
+  symmetric_coef: 10.0
+  desired_kl: 0.01
+  symmetry_coef: 0.5
+sim:
+  dt: 0.002
+  substeps: 1
+  up_axis: z
+  gravity:
+  - 0.0
+  - 0.0
+  - -9.81
+  physics_engine: physx
+  physx:
+    num_threads: 4
+    solver_type: 1
+    num_position_iterations: 4
+    num_velocity_iterations: 0
+    contact_offset: 0.02
+    rest_offset: 0.0
+    bounce_threshold_velocity: 0.2
+    max_depenetration_velocity: 100.0
+    default_buffer_size_multiplier: 5.0
+    max_gpu_contact_pairs: 8388608
+    num_subscenes: 4
+    contact_collection: 1
+asset:
+  file: resources/K1/K1_locomotion.urdf
+  name: K1
+  base_name: Trunk
+  foot_names:
+  - left_foot_link
+  - right_foot_link
+  disable_gravity: false
+  default_dof_drive_mode: 3
+  collapse_fixed_joints: true
+  fix_base_link: false
+  self_collisions: 0
+  replace_cylinder_with_capsule: false
+  flip_visual_attachments: false
+  density: 0.001
+  angular_damping: 0.0
+  linear_damping: 0.0
+  max_angular_velocity: 1000.0
+  max_linear_velocity: 1000.0
+  armature: 0.02
+  thickness: 0.01
+  feet_edge_pos:
+  - - 0.1215
+    - 0.05
+    - -0.03
+  - - 0.1215
+    - -0.05
+    - -0.03
+  - - -0.1015
+    - 0.05
+    - -0.03
+  - - -0.1015
+    - -0.05
+    - -0.03
+init_state:
+  pos:
+  - 0.0
+  - 0.0
+  - 0.58
+  rot:
+  - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+  lin_vel:
+  - 0.0
+  - 0.0
+  - 0.0
+  ang_vel:
+  - 0.0
+  - 0.0
+  - 0.0
+  default_joint_angles:
+    Hip_Pitch: -0.2
+    Knee_Pitch: 0.4
+    Ankle_Pitch: -0.25
+    default: 0.0
+control:
+  stiffness:
+    Hip: 200.0
+    Knee: 200.0
+    Ankle: 50.0
+  damping:
+    Hip: 5.0
+    Knee: 5.0
+    Ankle: 1.0
+  action_scale: 1.0
+  decimation: 10
+terrain:
+  type: plane
+  static_friction: 1.0
+  dynamic_friction: 1.0
+  restitution: 0.0
+  terrain_length: 10.0
+  terrain_width: 10.0
+  border_size: 5.0
+  num_terrains: 8
+  terrain_proportions:
+  - 0.0
+  - 0.0
+  - 0.5
+  - 0.5
+  slope: 0.1
+  random_height: 0.1
+  discrete_height: 0.02
+  horizontal_scale: 0.1
+  vertical_scale: 0.005
+  slope_threshold: 2.0
+commands:
+  num_commands: 10
+  command_order:
+  - goal_rel_x
+  - goal_rel_y
+  - heading_error
+  - gait_frequency
+  - foot_yaw_L
+  - foot_yaw_R
+  - body_pitch_target
+  - body_roll_target
+  - feet_offset_x_target
+  - feet_offset_y_target
+  goal_dx:
+  - -3.0
+  - 3.0
+  goal_dy:
+  - -2.0
+  - 2.0
+  goal_dtheta:
+  - -3.14159265
+  - 3.14159265
+  resampling_time_s:
+  - 4.0
+  - 10.0
+  goal_categories:
+    enabled: true
+    stand: 0.15
+    straight: 0.2
+    lateral: 0.2
+    turn: 0.2
+    combined: 0.25
+  gait_frequency:
+  - 1.8
+  - 2.0
+  foot_yaw_L:
+  - 0.0
+  - 0.0
+  foot_yaw_R:
+  - 0.0
+  - 0.0
+  body_pitch_target:
+  - 0.0
+  - 0.0
+  body_roll_target:
+  - 0.0
+  - 0.0
+  feet_offset_x_target:
+  - 0.0
+  - 0.0
+  feet_offset_y_target:
+  - 0.0
+  - 0.0
+  curriculum: false
+  lin_vel_levels: 10
+  ang_vel_levels: 10
+  goal_curriculum:
+    enabled: true
+    init_level: 0.35
+    min_level: 0.2
+    step: 0.05
+    up_threshold: 0.7
+    down_threshold: 0.4
+    success_pos_m: 0.25
+    success_heading_rad: 0.35
+    ema: 0.98
+    adjust_every_steps: 500
+normalization:
+  gravity: 1.0
+  lin_vel: 1.0
+  ang_vel: 1.0
+  goal_pos: 0.5
+  goal_heading: 0.31831
+  gait_frequency: 1.0
+  foot_yaw: 1.0
+  body_pitch_target: 1.0
+  body_roll_target: 1.0
+  feet_offset_x_target: 1.0
+  feet_offset_y_target: 1.0
+  dof_pos: 1.0
+  dof_vel: 0.1
+  filter_weight: 0.1
+  push_force: 0.1
+  push_torque: 0.5
+  clip_actions: 1.0
+noise:
+  goal_pos:
+    range:
+    - 0.0
+    - 0.04
+    operation: additive
+    distribution: gaussian
+  goal_heading:
+    range:
+    - 0.0
+    - 0.04
+    operation: additive
+    distribution: gaussian
+  goal_pos_bias:
+    range:
+    - 0.0
+    - 0.08
+    operation: additive
+    distribution: gaussian
+  goal_heading_bias:
+    range:
+    - 0.0
+    - 0.08
+    operation: additive
+    distribution: gaussian
+  goal_obs_hold_steps:
+  - 2
+  - 3
+  gravity:
+    range:
+    - 0.0
+    - 0.01
+    operation: additive
+    distribution: gaussian
+  lin_vel:
+    range:
+    - 0.0
+    - 0.05
+    operation: additive
+    distribution: gaussian
+  ang_vel:
+    range:
+    - 0.0
+    - 0.1
+    operation: additive
+    distribution: gaussian
+  dof_pos:
+    range:
+    - 0.0
+    - 0.01
+    operation: additive
+    distribution: gaussian
+  dof_vel:
+    range:
+    - 0.0
+    - 0.1
+    operation: additive
+    distribution: gaussian
+  height:
+    range:
+    - 0.0
+    - 0.02
+    operation: additive
+    distribution: gaussian
+randomization:
+  init_dof_pos:
+    range:
+    - 0.0
+    - 0.05
+    operation: additive
+    distribution: gaussian
+  init_base_pos_xy:
+    range:
+    - -1.0
+    - 1.0
+    operation: additive
+    distribution: uniform
+  init_base_lin_vel_xy:
+    range:
+    - 0.0
+    - 0.1
+    operation: additive
+    distribution: gaussian
+  kick_interval_s: 4.0
+  kick_lin_vel:
+    range:
+    - 0.0
+    - 0.15
+    operation: additive
+    distribution: gaussian
+  kick_ang_vel:
+    range:
+    - 0.0
+    - 0.04
+    operation: additive
+    distribution: gaussian
+  push_interval_s: 5.0
+  push_duration_s: 3.0
+  push_force:
+    range:
+    - 0.0
+    - 5.0
+    operation: additive
+    distribution: gaussian
+  push_torque:
+    range:
+    - 0.0
+    - 0.7
+    operation: additive
+    distribution: gaussian
+  dof_stiffness:
+    range:
+    - 0.95
+    - 1.05
+    operation: scaling
+    distribution: uniform
+  dof_damping:
+    range:
+    - 0.95
+    - 1.05
+    operation: scaling
+    distribution: uniform
+  dof_friction:
+    range:
+    - 0.0
+    - 2.0
+    operation: additive
+    distribution: uniform
+  friction:
+    range:
+    - 0.1
+    - 2.0
+    operation: additive
+    distribution: uniform
+  compliance:
+    range:
+    - 0.5
+    - 1.5
+    operation: additive
+    distribution: uniform
+  restitution:
+    range:
+    - 0.1
+    - 0.9
+    operation: additive
+    distribution: uniform
+  base_com:
+    range:
+    - -0.1
+    - 0.1
+    operation: additive
+    distribution: uniform
+  base_mass:
+    range:
+    - 0.8
+    - 1.2
+    operation: scaling
+    distribution: uniform
+  other_com:
+    range:
+    - -0.005
+    - 0.005
+    operation: additive
+    distribution: uniform
+  other_mass:
+    range:
+    - 0.98
+    - 1.02
+    operation: scaling
+    distribution: uniform
+rewards:
+  scales:
+    survival: 0.25
+    goal_position: 0.0
+    goal_heading: 0.0
+    goal_stop: 0.0
+    base_height: -20.0
+    foot_yaw_L: -1.0
+    foot_yaw_R: -1.0
+    orientation: -20.0
+    torques: -0.0003
+    torque_tiredness: -0.01
+    power: -0.003
+    lin_vel_z: -2.0
+    ang_vel_xy: -0.2
+    dof_vel: -0.0002
+    dof_acc: -2.0e-07
+    root_acc: -0.0001
+    action_rate: -1.5
+    dof_pos_limits: -1.0
+    dof_vel_limits: -0.0
+    torque_limits: -0.0
+    collision: -1.0
+    feet_slip: -0.1
+    feet_vel_z: -0.0
+    feet_yaw_diff: -0.5
+    feet_yaw_mean: -0.5
+    feet_roll: -0.2
+    feet_pitch: -0.1
+    feet_offset_x: -0.0
+    feet_offset_y: -0.0
+    feet_swing: 3.0
+    constellation: 3.5
+    goal_progress: 0.0
+    goal_reached: 1.0
+    heading_near_goal: 0.0
+    stand_posture: -2.0
+  episode_length_s: 30.0
+  terminate_height: 0.35
+  terminate_vel: 50.0
+  terminate_contacts_on: []
+  penalize_contacts_on:
+  - Trunk
+  - H1
+  - H2
+  - AL
+  - AR
+  - Waist
+  - Hip
+  - Shank
+  - Ankle
+  only_positive_rewards: true
+  base_height_target: 0.52
+  soft_dof_pos_limit: 1.0
+  soft_dof_vel_limit: 1.0
+  soft_torque_limit: 1.0
+  swing_period: 0.2
+  feet_distance_ref: 0.18
+  goal_position_sigma: 1.0
+  goal_heading_sigma: 0.4
+  goal_reach_radius: 0.1
+  constellation_weight: 0.2
+  constellation_radius: 1.0
+  goal_progress_clip: 1.0
+  stop_speed_threshold: 0.1
+  heading_gate_sigma: 0.25
+  stand_posture_radius: 0.3
+  feet_offset_vel_scale_x: 0.6
+  feet_offset_vel_scale_y: 0.3
+  final_window_s: 0.0
+evaluation:
+  num_envs: 256
+  duration_s: 120.0
+  gates:
+    pos_median_m: 0.05
+    pos_p90_m: 0.1
+    heading_median_deg: 10.0
+    max_falls: 0

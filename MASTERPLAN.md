@@ -628,3 +628,53 @@ mode에서 쓸 수 있는 센서(IMU gyro/gravity + 관절 엔코더)만으로 R
   웜스타트(`model_20000`, `strict=False`)가 shape mismatch로 깨짐(누락/여분 키만 skip되지,
   같은 키의 shape 불일치는 strict=False로도 못 넘어감). 별도 arm(처음부터 학습 또는 1층
   수술) 필요 — 사용자 확인 후 진행.
+
+#### Codex/odom 코멘트 — BT 통합 경계
+
+- **책임 경계**: locomotion(Claude)은 actor가 noisy/stale relative goal에도 버티도록 학습한다.
+  odom(Codex)은 `low_state` 기반 `delta+Q+health`를 만들고 PF/BT가 쓸 현재 field pose와
+  robot-frame goal을 갱신한다. 서로의 코드를 임의 수정하지 않는다.
+- **주의: goal staleness 모델**: 현재 armD 설명의 `goal_obs_hold_steps`는 actor 입력인 body-frame
+  `goal_rel_x/y/heading`을 2~3 control step 동안 그대로 hold하는 형태다. 실제 BT에서는 camera/vision
+  measurement가 20 Hz로 stale하더라도, timestamp가 붙은 측정을 odom delta로 현재 시각까지 전파한 뒤
+  actor에 넣는 것이 odom 계약이다. 따라서 이 hold 모델은 production latency 모델이라기보다
+  "target-currentization 실패/지연"에 대한 stress randomization으로 해석해야 한다. production 정확도를
+  맞추려면 `goal_true`와 `measurement_at_capture`를 분리하고, capture→now를 estimator delta로 보간한
+  `goal_observed_now`를 actor에 넣는 별도 train/eval arm이 필요하다.
+- **BT wrapper 계약**: target invalid나 odom `INVALID`일 때 x/y/yaw만 0으로 넣으면 안 된다. actor 입력의
+  `gait_frequency`도 0으로 내려 neutral stand를 유도하고, persistent invalid는 상위 safety로 넘긴다.
+  `DEGRADED`는 lookahead/속도 제한으로 처리한다.
+- **학습 range 계약**: armD의 ±3 m/±2 m는 armD 전용 분포다. BT는 실행 중인 policy의 train envelope를
+  알아야 하며, v1/armA/B/C 계열에는 기존 ±2 m/±1.5 m 안으로 lookahead를 project/clip해야 한다.
+- **odom 데이터 요구**: estimator 학습/검증에는 locomotion policy를 건드릴 필요는 없지만, 실행 로그에
+  `low_state` 원본, SDK/robot-version joint index mapping, previous action, gait phase, command,
+  target stamp/source age, estimator health를 같은 clock domain으로 남겨야 한다. 이 로그 계약 없이는
+  learned delta/contact challenger와 PF replay gate를 재현할 수 없다.
+
+### 2026-07-24 — v3 challenger 학습 스택 (신규 파일, 기존 코드 동결 유지)
+- **VRAM 질문 재검증**: 프로세스당 4558MiB@4096env = 이전 실측 모델(고정 2.66GB + env당
+  0.456MB)과 정확히 일치 — 메모리는 정상이고 제약 자원이 아님. GPU1 util 99% = 3프로세스
+  병렬화 성공(포화). GPU0 56% = 프로세스 1개(armD)뿐이라 남는 것 → v3를 GPU0에 병행 투입.
+- **자료조사 결론 (핵심 3건, 채택)**:
+  1. Rudin et al. IROS2022 (arXiv:2209.12827) — 위치목표 과제는 "주어진 시간 안에 도달"로 두고
+     **과제 보상을 세그먼트 마지막 구간에만** 줘야 경로/속도/걸음을 정책이 자유롭게 고르고
+     초과달성(전속 질주) 유인이 사라짐. "시간 의존 보상이 결정적"이라고 명시.
+  2. Abdolhosseini et al. 2019 — 좌우 대칭 보조손실 L_sym=MSE(π(Ms), Mπ(s))로 걸음 대칭성/
+     품질 개선. 단 휴머노이드에서 역효과 사례도 보고돼 있어 **스위치+보수적 계수(0.5)**로.
+     (기존 yaml의 `symmetric_coef: 10`은 코드 어디서도 안 쓰는 죽은 설정이었음 — 오해 방지
+     위해 v3는 새 키 `symmetry_coef` 사용.)
+  3. 성공률 적응형 커리큘럼(automatic curriculum 계열 표준) — 목표 범위를 세그먼트 성공률
+     EMA로 확대/축소. ±3m 전 범위를 처음부터 주지 않고 35%에서 시작해 성공하면 확장.
+- **신규 파일** (기존 goal_pose.py/runner.py/train.py/스윕 arm 전부 무변경):
+  - `envs/K1/goal_pose_v3.py` — GoalPoseV3(GoalPose 상속): 커리큘럼, timed reward 게이트
+    (`final_window_s`, 기본 0=off), 좌우 미러 맵(URDF 리밋으로 부호 관례 검증).
+  - `utils/runner_v3.py` — RunnerV3(Runner 상속): 표준 미니배치 PPO(5epoch×4minibatch,
+    기존 full-batch×5 대비 스텝당 연산 1/4), 대칭 손실, 커리큘럼 레벨 로깅. STOP/저장
+    포맷 동일 → auto_stop/eval 그대로 호환.
+  - `envs/K1/Goal_Pose_V3.yaml` — base에서 생성: armD sim2real 번들 전체 + 8192env +
+    goal ±3m/±2m + 커리큘럼 + symmetry 0.5 + minibatch 4. `train_v3.py` 진입점.
+- **기각한 것과 이유**: 관측 정규화(웜스타트 파괴+배포 시 통계 동기화 부담), LSTM/history
+  (네트워크 교체=웜스타트 전면 무효, v3 결과 부족할 때 최후 카드), AMP(모션캡처 데이터
+  필요, 과제 범위 밖).
+- **실행**: GPU0에서 armD와 병행. `python train_v3.py --task=K1/Goal_Pose_V3 --headless True
+  --checkpoint <model_20000> --sim_device cuda:0 --rl_device cuda:0 --max_iterations 20000`
