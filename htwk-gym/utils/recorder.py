@@ -11,6 +11,12 @@ class Recorder:
     def __init__(self, cfg):
         self.cfg = cfg
         name = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
+        # tag the run dir with the description so parallel sweep arms (same task,
+        # different config via --config) land in distinct, self-labeling dirs
+        desc = self.cfg["basic"].get("description", "")
+        if desc:
+            safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in desc)[:40]
+            name = "{}_{}".format(name, safe)
         # Create logs in robot-type/task-name hierarchy
         task_name = self.cfg["basic"]["task"]
         

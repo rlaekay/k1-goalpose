@@ -427,3 +427,28 @@
   알려진 한계라 완전 해소는 어려움. 가장 효과적인 완화책은 **num_envs를 계속 늘리는 것**
   (호출 횟수는 env 수와 무관하게 고정이라, env가 많을수록 커널당 연산량이 늘어 launch 지연
   비중이 상대적으로 줄어듦) — VRAM 여유(6.4/49GB) 감안 시 16384까지 시도 여지 있음.
+
+### 2026-07-24 — GPU 효율: 단일코어 병목 → 병렬 스윕 (사용자 결정: GPU1만, 2~3개 + 200Hz 갈래)
+- **핵심 인식**: 병목이 물리 스텝마다의 Python 호출(단일 CPU 코어)이라 한 프로세스가 GPU
+  하나조차 못 채움(8192env에서 util 67%, VRAM 6.4/49GB). → 독립 프로세스를 더 띄우면 각자
+  별도 코어/GIL을 쓰고 커널이 시분할돼 **총 처리량이 프로세스 수에 비례**. 근거:
+  [NVIDIA MPS 분석](https://www.abhik.ai/concepts/gpu-computing/cuda-mps) — 개별 프로세스가
+  GPU를 덜 쓸 때 멀티프로세스로 2~5배 처리량 보고.
+- **사용자 결정**: (1) GPU 1 한 장에만 프로세스 2~3개(공유서버 "두 GPU 동시점유 금지" 규칙 유지,
+  GPU 0 안 건드림), (2) 200Hz 물리를 스윕 한 갈래로 처음부터 테스트.
+- **구현**:
+  - `utils/runner.py`: `--config <yaml>` 추가 — 클래스는 `--task`(K1/Goal_Pose→GoalPose)로
+    고르되 설정은 이 경로에서 로드. 같은 task를 서로 다른 설정으로 병렬 실행 가능.
+  - `utils/recorder.py`: `basic.description`을 run 디렉토리 이름에 태깅 → 병렬 갈래가
+    자기-라벨링된 별도 폴더에 안착(타임스탬프_armX).
+  - `tools/make_sweep_configs.py`: base Goal_Pose.yaml + 갈래별 1-변수 override로 sweeps/*.yaml
+    생성 + 갈래별 실행 명령 출력(DRY, 서버 pyyaml 사용). sweeps/는 .gitignore.
+- **스윕 3갈래 (전부 model_20000에서 이어받아 1변수씩만 변경 → eval 델타 귀속 가능)**:
+  - armA_continue: base 그대로 ("더 학습하면 된다" 가설의 기준선)
+  - armB_goal_reached: `rewards.scales.goal_reached=1.0` (정지+위치 정밀도 직접 공략)
+  - armC_200hz: `sim.dt=0.005, control.decimation=4` — 제어주파수는 50Hz 유지(dt×dec=0.02s)라
+    정책 액션 의미 불변, 물리 서브스텝만 500→200Hz(2.5배 저렴). 물리 가속 가설 검증.
+- **모니터링**: 각 갈래를 별도 tmux 창에서 → 서버 붐비면 갈래 하나만 개별 kill(양보 용이).
+  고정 iter 예산(기본 20000)으로 공정 비교 후 eval 하네스로 3갈래 판정.
+- **참고**: MPS로 커널 실제 겹침까지 가면 util 더 오르지만 compute mode 변경은 타 사용자
+  프로세스를 깨므로 금지 — per-user MPS(DEFAULT 모드)만 선택지, 지금은 미적용(멀티프로세스만으로 충분).

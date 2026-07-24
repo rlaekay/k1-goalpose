@@ -116,7 +116,8 @@ class Runner:
 
     def _get_args(self):
         parser = argparse.ArgumentParser()
-        parser.add_argument("--task", required=True, type=str, help="Name of the task to run.")
+        parser.add_argument("--task", required=True, type=str, help="Name of the task to run (selects the env class).")
+        parser.add_argument("--config", type=str, help="Path to a yaml config to load instead of envs/<task>.yaml. The env class is still chosen by --task; use this to run parallel sweep arms of the same task with different configs.")
         parser.add_argument("--checkpoint", type=str, help="Path of the model checkpoint to load. Overrides config file if provided.")
         parser.add_argument("--num_envs", type=int, help="Number of environments to create. Overrides config file if provided.")
         parser.add_argument("--headless", type=bool, help="Run headless without creating a viewer window. Overrides config file if provided.")
@@ -128,12 +129,14 @@ class Runner:
 
     # Override config file with args if needed
     def _update_cfg_from_args(self):
-        cfg_file = os.path.join("envs", "{}.yaml".format(self.args.task))
+        cfg_file = self.args.config or os.path.join("envs", "{}.yaml".format(self.args.task))
         with open(cfg_file, "r", encoding="utf-8") as f:
             self.cfg = yaml.load(f.read(), Loader=yaml.FullLoader)
         for arg in vars(self.args):
             if getattr(self.args, arg) is not None:
-                if arg == "num_envs":
+                if arg == "config":
+                    continue  # not a cfg field; only selects which yaml to load
+                elif arg == "num_envs":
                     self.cfg["env"][arg] = getattr(self.args, arg)
                 else:
                     self.cfg["basic"][arg] = getattr(self.args, arg)

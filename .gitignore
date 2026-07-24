@@ -222,3 +222,4 @@ __marimo__/
 logs/
 checkpoints/
 videos/
+sweeps/   # generated parallel-sweep configs (tools/make_sweep_configs.py)
