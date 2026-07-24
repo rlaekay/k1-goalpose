@@ -409,3 +409,21 @@
   2048 env에서 3.6GB/49GB·util 42~57%로 여유가 커서 샘플 처리량 ~4배 기대.
 - **가속 3 — TF32 활성화** (utils/runner.py): A6000(Ampere)에서 MLP 행렬곱 가속, 물리엔진 무관.
 - 종합 기대: 학습 벽시계 시간 수 배 단축 (20000 iter ≈ 17시간 → 수 시간대 목표).
+
+### 2026-07-24 — GPU util 67% 원인 조사 + 최적화 (8192 env 실행 기준)
+- **조사 계기**: 8192 env에서 VRAM 6.4GB(계산상 정상, 여유 큼)인데 GPU-Util은 67%에 그침.
+  [IsaacLab GitHub #3043](https://github.com/isaac-sim/IsaacLab/issues/3043)에서 동일 증상
+  (GPU util 60~80%, 코어 1개만 100%) 다수 로봇 태스크에서 보고됨 — Isaac Gym류 프레임워크의
+  구조적 특성(decimation 루프의 Python API 호출이 CPU 단일 코어를 병목시킴)으로 확인.
+- **발견 (코드 근거)**: [envs/K1/goal_pose.py](htwk-gym/envs/K1/goal_pose.py) `step()`의
+  decimation 루프(10회/스텝) 안에서 매번 `refresh_dof_force_tensor()`를 호출했는데,
+  `dof_force` 텐서는 `acquire_dof_force_tensor()`조차 호출된 적 없어 **wrap된 버퍼가 존재하지
+  않음** — 즉 완전히 죽은 코드였음(GPU→CPU sync만 매 서브스텝마다 10번 낭비).
+- **조치**: 루프 안 `refresh_dof_force_tensor()` 제거. `sim.physx.num_velocity_iterations`
+  1→0 (TGS 솔버는 position iteration만 필요, velocity iteration은 오히려 강성/수렴성 저하 —
+  [Isaac Gym tuning 문서](https://docs.robotsfan.com/isaacgym/programming/tuning.html) 권장).
+- **구조적 결론**: 남은 병목(67% util)은 근본적으로 decimation=10 루프의 Python 호출
+  오버헤드(GPU 커널 launch 지연이 매 서브스텝마다 CPU 단일 코어에 걸림) — Isaac Gym 계열의
+  알려진 한계라 완전 해소는 어려움. 가장 효과적인 완화책은 **num_envs를 계속 늘리는 것**
+  (호출 횟수는 env 수와 무관하게 고정이라, env가 많을수록 커널당 연산량이 늘어 launch 지연
+  비중이 상대적으로 줄어듦) — VRAM 여유(6.4/49GB) 감안 시 16384까지 시도 여지 있음.

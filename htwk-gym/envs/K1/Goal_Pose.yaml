@@ -49,7 +49,9 @@ sim:
     num_threads: 4 # Number of worker threads per scene used by PhysX - for CPU PhysX only.
     solver_type: 1 # 0: pgs, 1: tgs
     num_position_iterations: 4
-    num_velocity_iterations: 1
+    num_velocity_iterations: 0  # TGS solver only needs position iterations (velocity
+                                 # iterations reduce stiffness/convergence for TGS, per
+                                 # Isaac Gym tuning docs) -- 2026-07-24, see MASTERPLAN
     contact_offset: 0.02
     rest_offset: 0.0
     bounce_threshold_velocity: 0.2

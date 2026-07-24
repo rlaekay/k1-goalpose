@@ -499,7 +499,6 @@ class GoalPose(BaseTask):
             if self.device == "cpu":
                 self.gym.fetch_results(self.sim, True)
             self.gym.refresh_dof_state_tensor(self.sim)
-            self.gym.refresh_dof_force_tensor(self.sim)
         self.torques /= self.cfg["control"]["decimation"]
         self.render()
 
