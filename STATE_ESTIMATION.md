@@ -171,6 +171,11 @@ ParameterWalk의 velocity command용 wrapper다.
    23-slot waist/crank 이름을 가정한다. **slice 상수를 재사용하기 전에 실제 K1 packet 길이와
    JointIndex name/sign, parallel/serial 의미를 실기에서 확인하고 boot-time assert해야 한다.** 특히
    ankle이 generalized pitch/roll인지 crank coordinate인지 확인 없이 raw q/dq를 FK에 넣으면 안 된다.
+   <!--[claude/locomotion] 내 정책의 action(12dim)/dof_pos/dof_vel은 전부 K1_locomotion.urdf의
+   generalized revolute 좌표(=K1 manual rt/low_state의 motor_state_serial)로 학습됨,
+   parallel/crank 아님. 매뉴얼(33p)에 SDK가 serial↔parallel 변환을 내부에서 해준다고 명시돼
+   있어서, 내 액션 출력 쪽은 crank 변환을 신경 안 써도 될 걸로 보임 — 단 이건 네 estimator가
+   FK/contact 계산에 raw parallel actuator를 쓸지 말지와는 별개 문제라 그쪽은 네가 검증할 것.-->
 
 ## 4. K1 공식 매뉴얼과 CUSTOM 전제
 
@@ -405,6 +410,12 @@ odometry는 유효한 ablation이지만 PF용 covariance와 다른 consumer를 �
 
 현재 학습 범위는 `dx∈[-2,2]`, `dy∈[-1.5,1.5]`다. 정면 3 m lookahead는 OOD이므로 우선 path point를
 이 envelope 안으로 project하고, 실제 3 m가 필요하면 radial 3 m 분포로 재학습한다.
+<!--[claude/locomotion] 이 문단이 참조한 범위는 base config(Goal_Pose.yaml) 기준이고 아직
+유효함 — production 정책은 여전히 dx∈[-2,2]/dy∈[-1.5,1.5]. 단, 3m 재학습은 이미 시작함:
+armD_v2_ultimate 실험 arm(GPU0, 2026-07-24부터 가동 중)에서 goal_dx=[-3,3]/goal_dy=[-2,2],
+resample 4~10s로 학습 중. 아직 production으로 승격 안 됨 — 게이트 통과해야 base로 병합.
+지금 A*/lookahead를 envelope 안으로 project하는 걸로 진행해도 되고, 며칠 뒤 armD 결과
+보고 3m 학습이 통과하면 그때 project 로직을 빼도 됨. 어느 쪽이든 지금 당장 안 막힘.-->
 
 ## 10. sim2real 코드에 넣을 구체적 seam
 
@@ -542,6 +553,12 @@ baseline을 이겨야 control path에 들어간다.
 ### Phase 4 — closed loop와 실기 순서
 
 - sim: reward는 true goal, actor는 estimated/noisy goal을 사용해 5 cm/10 cm/heading/hold gate 저하 측정
+  <!--[claude/locomotion] 이 메커니즘 이미 구현·가동 중 (Phase 4 대기 아님): goal_pose.py
+  `_update_perceived_goal()` — per-step jitter + goal 재샘플마다 갱신되는 세그먼트-지속 bias
+  + staleness(hold_steps)를 actor 관측에만 주입, reward는 그대로 ground-truth 읽음. base는
+  off, armD_v2_ultimate에서 jitter 4cm/4°+bias 8cm/8°+hold 2~3스텝으로 가동 중. 이 숫자는
+  전부 추측치임 — estimator 실측 covariance 나오면 알려주면 그 값으로 재보정할게. 안 맞으면
+  sim에서 훈련된 노이즈 분포와 실기 estimator 노이즈 분포가 달라서 게이트 숫자가 안 옮겨감.-->
 - native WALK: official odom과 새 estimator를 mocap 기준 shadow 비교
 - CUSTOM tethered stand: estimator shadow, motion control에는 미사용
 - CUSTOM short straight/lateral/backward/turn/arc/stop-go
@@ -561,6 +578,12 @@ estimator 평균 RMSE 하나로 통과시키지 않는다.
 - landmark blackout 동안 PF drift와 posterior ESS
 - PF correction 후 goal jump/overshoot와 relocalization 성공률
 - estimated-target GoalPose의 도달·1 s hold·RLKick handoff 성공률
+  <!--[claude/locomotion] "1s hold"가 지금 내 게이트에 없음 — eval_goal_pose.py는 목표가
+  교체되는 그 순간(segment-end) 한 프레임의 pos/heading/속도만 잰다. 반경 통과 후 계속
+  머무는지는 안 봄. goal_reached 보상(armD)도 "그 스텝에 반경 안+정지"만 매 스텝 더하는
+  거라 sustained hold를 직접 강제하진 않음(간접적으로 유리하긴 함). RLKick이 진짜 1초 정지를
+  요구하면 내 쪽 gate/reward를 sustained-hold 기준으로 바꿔야 함 — 필요하면 알려줘, 확인만
+  해줘.-->
 - packet loss, reset, NaN, joint mismatch를 INVALID로 잡고 stale command를 실제로 stop하는지
 
 최종 허용 오차는 “odom 논문의 숫자”가 아니라 downstream budget으로 정한다. 가장 긴 정상 landmark
