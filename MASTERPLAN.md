@@ -678,3 +678,93 @@ mode에서 쓸 수 있는 센서(IMU gyro/gravity + 관절 엔코더)만으로 R
   필요, 과제 범위 밖).
 - **실행**: GPU0에서 armD와 병행. `python train_v3.py --task=K1/Goal_Pose_V3 --headless True
   --checkpoint <model_20000> --sim_device cuda:0 --rl_device cuda:0 --max_iterations 20000`
+
+#### Codex comment — 관절 보호, 에너지, 하드웨어 보호의 학습/배포 원칙
+
+- **현재 상태 판정**: [goal_pose.py](htwk-gym/envs/K1/goal_pose.py)의 `torques`,
+  `torque_tiredness`, positive mechanical `power`, `dof_vel`, `dof_acc`, `action_rate`,
+  `dof_pos_limits`는 이미 보상에 들어가 있다. 다만 `dof_vel_limits`와 `torque_limits`의
+  scale은 `-0.`로 꺼져 있고 `soft_dof_pos_limit: 1.0`이라 관절 위치 보호가 사실상 URDF
+  한계 초과에서만 작동한다. 전류, 전압, 배터리 SOC, 모터/드라이브 온도와 contact impulse를
+  반영한 항은 아직 없다. 현재 `power`는 `tau * dq > 0`인 양의 기계적 power만 보므로 배터리
+  소비 에너지의 대체물로 해석하면 안 된다.
+- **관절 보호는 reward 하나로 해결하지 않는다**: 배포 시에는 q/dq/tau/current/voltage/
+  temperature limit, 비정상 contact, fall/통신 fault를 감시하는 hard runtime guard가 최우선이다.
+  guard는 action/torque를 즉시 제한하고 필요하면 stand 또는 disable로 전환해야 하며, reward는
+  그 guard에 걸리기 전에 정책이 여유를 갖도록 유도하는 soft constraint일 뿐이다.
+- **학습 구조에 대한 의견**: 이미 걷는 policy에 강한 Lagrangian 항을 갑자기 섞으면 보행이
+  무너질 수 있다. 먼저 안정적인 locomotion checkpoint를 보존하고, continuous margin penalty
+  (예: q/dq/tau가 limit의 0.8~0.9를 넘을수록 증가), action rate/acceleration/jerk, 발의
+  충격량을 추가한 뒤 작은 learning rate와 multiplier warm-up으로 constrained fine-tuning한다.
+  에너지는 단순히 `-power`를 키우는 것보다 task success를 유지하면서 `Wh/m` 또는 episode
+  energy budget을 넘지 않게 하는 cost/constraint로 다루는 편이 해석 가능하다.
+- **에너지 모델**: 시뮬레이터에서는 최소한 `abs(tau * dq)`를 baseline으로 기록하고, 실제
+  전류/전압을 확보하면 motor/drive efficiency, idle current, regenerative current, battery
+  voltage drop을 포함한 electrical power 모델로 교체한다. 실제 배터리 보호를 목표로 한다면
+  simulated power와 배터리 SOC를 직접 동일시하지 말고, real bus `V * I`를 ground truth로
+  삼아 식별 오차를 domain randomization해야 한다.
+- **Real 검증 gate**: 같은 보행 거리/목표/속도/외란에서 success rate, fall/stand recovery,
+  `Wh/m`, peak 및 RMS current, q/dq/tau limit 접근률과 saturation 시간, foot impact/slip,
+  온도 상승률을 함께 기록한다. 정책 A/B를 경로와 순서까지 섞은 반복 실험으로 비교하고,
+  sim metric과 real metric의 순위가 유지되는지 확인한 후에만 reward 항을 채택한다. 시작 gate는
+  task success와 안정성이 기준 policy 대비 2~5% 이상 떨어지지 않고, 동일한 성공 조건에서
+  `Wh/m` 또는 peak current가 의미 있게 감소하는지로 둔다. 수치는 절대 안전 기준이 아니라
+  프로젝트 내부의 후보 policy 선별 기준이며, 실제 K1 hardware limit/thermal spec이 최종 기준이다.
+- **권장 순서**: (1) real low-level log에 bus voltage/current, joint q/dq/tau, temperature,
+  contact와 safety trip reason을 같은 timestamp로 남긴다. (2) soft limit penalty와 impact
+  metric을 margin 기반으로 켜되 nominal gait 보존 여부를 확인한다. (3) 안정 checkpoint에서
+  Lagrangian fine-tuning과 penalty sweep을 각각 돌려 Pareto frontier를 만든다. (4) real
+  AB/BA 시험에서 에너지와 보호 지표를 검증한 뒤에만 최종 policy를 배포한다. 보호 항을
+  추가하는 것 자체보다, 측정 가능한 real cost와 hard guard의 계약을 먼저 고정하는 것이 우선이다.
+
+### 2026-07-25 — v4/v5/v6: 기상·킥·낙법 학습 스택 (신규 파일, 기존 코드 동결)
+CUSTOM mode 단일 운용 완성을 위해 보행(v1~v3) 외 모션을 자체 학습. 계획 문서:
+`~/.claude/plans/v4-5-6-curious-shell.md`. 조사·설계는 논문 정독 후 진행(아래 근거).
+
+**버전 매핑 / 알고리즘 / 자산**
+| 버전 | 모션 | 자산 | 액션 | 알고리즘 | 트레이너 |
+|---|---|---|---|---|---|
+| v4 | 기상(GetUp) + 낙상감지 통합 | K1_serial.urdf (22관절) | 관절속도적분 | **CrossQ 신규구현** | train_v4.py |
+| v5 | 킥(Kick) | K1_locomotion.urdf (12관절) | 위치오프셋 | PPO(RunnerV3) | train_v3.py |
+| v6 | 낙법(SafeFall) | K1_serial.urdf (22관절) | 위치오프셋 | PPO(RunnerV3) | train_v3.py |
+
+**근거 논문 (best-form 조사, 최소수정 아님)**
+- FRASA (arXiv:2410.08655, RoboCup Sigmaban): CrossQ, 자세커널 보상, 랜덤낙하+정착 리셋,
+  관절속도 액션, 13-37분 학습 → v4 뼈대.
+- HumanUP (arXiv:2502.12152, G1): 2단계 커리큘럼(발견→배포저속화), 대규모 PPO → v4 폴백.
+- Self-Protective Falling (arXiv:2512.01336): 머리보호+충격분산 → v6 보상.
+- DeepMind OP3 soccer (Science Robotics): 기상+킥+보행 통합정책, 스크립트 대비 기상 63%↓ → 장기방향.
+- 저장소 내 T1 kicking.py: 공=제2액터, 킥 보상 스위트 → v5 포팅 원본(버그 5건 수정).
+
+**구현 비용 (실측 아닌 조사 추정)**: v5 ~0.5일 구현+6-20h 학습 / v4 ~1-1.5일(CrossQ 스택 리스크)+
+시도당 1-4h / v6 ~0.5일+4-12h. 빌드순서 v5→v4→v6 (v6이 v4의 22관절 env 의존).
+
+**핵심 구현 결정**
+- CrossQ = 타깃넷 없는 SAC. (s,a)+(s',a') **단일 배치 forward**가 타깃넷 대체 핵심.
+  BatchRenorm1d 자체구현(torch 2.0 미제공), critic 비대칭(privileged obs 유지).
+- off-policy 정합성: env.step이 리셋 후 관측 리턴 → done 행의 s'를 리셋 전 스냅샷해
+  extras["terminal_obs"]로 전달. settling 스텝은 버퍼 미삽입.
+- 22관절 신규 PD게인 **추정치**(Shoulder/Elbow 40/1, Head 10/0.5) — 공식 미공개, 실기 튜닝 필요.
+  게인 매처가 미정의 관절에서 ValueError → 필수 정의.
+- v4 목표자세 = 웅크린 기립(Hip -0.9/Knee 1.8/Ankle -0.9). yaml target_joint_angles로 PREP
+  기립 전환 가능(보행 인계용).
+- v6 충격 캡처: decimation 루프 내부 contact force refresh + 스텝별 피크(20ms 사이 스파이크 보존).
+
+**CUSTOM mode 미지원 의심 목록 (매뉴얼 40p 전수) + 구현계획**
+| 기능 | 지원 | 계획 |
+|---|---|---|
+| rt/odometer_state (gait odom) | ✗ | Codex estimator (STATE_ESTIMATION.md) |
+| WALK 보행/Move RPC | ✗ | GoalPose v1~v3 |
+| 내장 GetUp (GetUpWithMode: DAMP/PREP 전용) | ✗ | **v4** |
+| 낙상 자동보호(PROTECT 자동개입 여부) | △ 실기검증 | v6 + deploy 리밋클램프(PROTECT 오발동 방지) |
+| Soccer 킥(VisualKick 등) | ✗ | **v5** + BT 비전 |
+| RotateHead RPC | ✗ 추정 | BT 머리명령을 deploy LowCmd head 2관절에 병합 |
+| rt/fall_down (IMU 낙상감지) | ○ 추정, 실기검증 | 작동시 v4 트리거; 불가시 IMU 임계값(g_z>-0.6, 0.3s) deploy ~20줄 |
+| MoveHandEndEffector/댄스/WBC | ✗ | 불필요(축구 범위 밖) |
+| LoadCustomTrainedTraj | ○ | 참고: DDS 직접제어 대안 배포루트 |
+
+**검증 상태**: 로컬 py_compile 전체 통과, 태스크명 해석(K1/Kick·Get_Up·Safe_Fall) 확인,
+yaml 차원·보상함수 배선·CrossQ 키·obs 산술 전부 검증. 실 sim 스모크는 서버(GPU)에서:
+`python train_vX.py --task K1/<Task> --headless True --num_envs 4 --max_iterations 3 --sim_device cuda:0 --rl_device cuda:0`.
+1차 판정지표(텐서보드, 별도 eval 불필요): v4 getup_success·upright_hold, v5 kick_success·fell,
+v6 ep_peak_force_kN(제로액션 기준선 대비). 필요시 eval 스크립트 3종(~150줄) 추후.
