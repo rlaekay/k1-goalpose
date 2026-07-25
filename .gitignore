@@ -224,3 +224,4 @@ checkpoints/
 videos/
 sweeps/   # generated parallel-sweep configs (tools/make_sweep_configs.py)
 k1/       # vendor assets (official USD, instruction manual PDF) -- large binaries, keep local only
+shared_eval_videos/  # tools/train_and_eval.sh output -- pull via scp/rsync, never via git
