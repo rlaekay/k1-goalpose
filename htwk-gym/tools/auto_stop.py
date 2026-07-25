@@ -9,9 +9,12 @@ Flow (MASTERPLAN milestone 3 support):
      exits gracefully (no SIGKILL, nothing lost)
   4. wait until the run dir goes quiet (training process exited, GPU freed)
   5. run eval_goal_pose.py on the final checkpoint and leave report.md/json there
+     (with --select_best, search the run for its best checkpoint instead: the last
+     one is not always the best)
 
 Run it in a second tmux window next to the training:
     python tools/auto_stop.py --sim_device cuda:1 --rl_device cuda:1
+    python tools/auto_stop.py --select_best --record_video --sim_device cuda:1 --rl_device cuda:1
 """
 
 import os
@@ -65,6 +68,12 @@ def main():
     parser.add_argument("--stale_min", type=float, default=30.0, help="no new data for this many minutes -> assume training already ended, go straight to eval")
     parser.add_argument("--quiet_s", type=float, default=60.0, help="run dir must be untouched this long before eval starts")
     parser.add_argument("--skip_eval", action="store_true")
+    parser.add_argument("--select_best", action="store_true",
+                        help="search the run for its best checkpoint (tools/select_best_checkpoint.py) "
+                             "instead of evaluating only the final one -- the last checkpoint is not "
+                             "always the best")
+    parser.add_argument("--record_video", action="store_true", help="also record an mp4 of the evaluated policy")
+    parser.add_argument("--record_video_s", type=float, default=120.0)
     parser.add_argument("--sim_device", help="passed to eval (default: from run config.yaml)")
     parser.add_argument("--rl_device", help="passed to eval (default: from run config.yaml)")
     args = parser.parse_args()
@@ -136,13 +145,25 @@ def main():
         print("(--skip_eval) done.")
         return
 
-    cmd = [
-        sys.executable, "eval_goal_pose.py",
-        "--task", task,
-        "--checkpoint", final_ckpt,
-        "--sim_device", sim_device,
-        "--rl_device", rl_device,
-    ]
+    if args.select_best:
+        cmd = [
+            sys.executable, os.path.join("tools", "select_best_checkpoint.py"),
+            "--run_dir", run_dir,
+            "--task", task,
+            "--sim_device", sim_device,
+            "--rl_device", rl_device,
+            "--link_best",
+        ]
+    else:
+        cmd = [
+            sys.executable, "eval_goal_pose.py",
+            "--task", task,
+            "--checkpoint", final_ckpt,
+            "--sim_device", sim_device,
+            "--rl_device", rl_device,
+        ]
+    if args.record_video:
+        cmd += ["--record_video", "--record_video_s", str(args.record_video_s)]
     print("running eval: {}".format(" ".join(cmd)))
     subprocess.run(cmd, check=False)
 

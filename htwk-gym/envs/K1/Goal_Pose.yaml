@@ -376,6 +376,10 @@ evaluation:
   # defaults for eval_goal_pose.py (CLI flags override)
   num_envs: 256
   duration_s: 120.
+  # Sustained walking speed treated as achievable when checking whether a goal was
+  # reachable at all in the time before the next resample (start_dist / segment_s).
+  # Diagnostic only -- the gates below are always judged on ALL segments.
+  feasible_speed_mps: 0.6
   gates:                     # MASTERPLAN §성공 기준
     pos_median_m: 0.05
     pos_p90_m: 0.10

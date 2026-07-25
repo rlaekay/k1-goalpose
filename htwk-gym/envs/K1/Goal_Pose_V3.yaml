@@ -487,6 +487,7 @@ rewards:
 evaluation:
   num_envs: 256
   duration_s: 120.0
+  feasible_speed_mps: 0.6   # see Goal_Pose.yaml; diagnostic only, gates use all segments
   gates:
     pos_median_m: 0.05
     pos_p90_m: 0.1

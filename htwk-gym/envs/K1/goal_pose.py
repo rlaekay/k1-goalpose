@@ -260,6 +260,14 @@ class GoalPose(BaseTask):
         self.heading_error = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         self.last_goal_dist = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
 
+        # Per-segment provenance, written in _resample_goals and never read by a reward,
+        # observation or termination: eval_goal_pose.py needs to know WHICH goal a
+        # segment was (category), where it started from and when, to tell "the policy is
+        # imprecise" apart from "the goal was unreachable in the time it was given".
+        self.goal_category = torch.full((self.num_envs,), -1, dtype=torch.int8, device=self.device)
+        self.goal_start_pos = torch.zeros(self.num_envs, 2, dtype=torch.float, device=self.device)
+        self.goal_start_step = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
         # curriculum machinery kept for compatibility with utils/runner.py's logging
         # (it reads self.env.mean_lin_vel_level etc. unconditionally); unused while
         # cfg["commands"]["curriculum"] is false.
@@ -408,6 +416,7 @@ class GoalPose(BaseTask):
         # goal components per category; uniform sampling when disabled.
         cat_cfg = self.cfg["commands"].get("goal_categories")
         stand = torch.zeros(len(env_ids), dtype=torch.bool, device=self.device)
+        cat = torch.full((len(env_ids),), -1, dtype=torch.long, device=self.device)  # -1 = uniform (mixture off)
         if cat_cfg and cat_cfg.get("enabled", False):
             probs = torch.tensor(
                 [cat_cfg["stand"], cat_cfg["straight"], cat_cfg["lateral"], cat_cfg["turn"], cat_cfg["combined"]],
@@ -427,6 +436,12 @@ class GoalPose(BaseTask):
         self.goal_pos_world[env_ids, 0] = self.base_pos[env_ids, 0] + cos_yaw * dx_local - sin_yaw * dy_local
         self.goal_pos_world[env_ids, 1] = self.base_pos[env_ids, 1] + sin_yaw * dx_local + cos_yaw * dy_local
         self.goal_heading_world[env_ids] = (base_yaw + dtheta_local + torch.pi) % (2 * torch.pi) - torch.pi
+
+        # eval-only provenance (see _init_buffers); base_pos here IS the frame the goal
+        # was sampled in, so start_dist == sqrt(dx_local^2 + dy_local^2) exactly.
+        self.goal_category[env_ids] = cat.to(torch.int8)
+        self.goal_start_pos[env_ids] = self.base_pos[env_ids, :2]
+        self.goal_start_step[env_ids] = self.episode_length_buf[env_ids]
 
         self.gait_frequency[env_ids] = torch_rand_float(
             self.cfg["commands"]["gait_frequency"][0], self.cfg["commands"]["gait_frequency"][1], (len(env_ids), 1), device=self.device

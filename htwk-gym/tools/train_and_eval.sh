@@ -1,71 +1,93 @@
 #!/bin/bash
-# 학습이 끝나면 자동으로 eval(2분 영상)을 돌리고 결과를 shared_eval_videos/ 에 모아둔다.
-# 영상은 git으로 옮기지 않는다 (.gitignore) -- 서버에서 scp/rsync로 pull할 것.
+# Train -> pick the best checkpoint -> record a video -> drop it in a shared folder.
 #
-# 사용법:
-#   bash tools/train_and_eval.sh <sim_device> <rl_device> -- <train.py 인자들...>
+# The videos and reports land in htwk-gym/shared_eval_videos/, which is gitignored:
+# pull them with scp/rsync, they are never carried by git push/pull.
 #
-# 예:
+# Usage:
+#   bash tools/train_and_eval.sh <sim_device> <rl_device> -- <train.py args...>
+#
+# Example:
 #   bash tools/train_and_eval.sh cuda:1 cuda:1 -- \
 #     --task=K1/Goal_Pose --config sweeps/armA_continue.yaml --headless True \
 #     --checkpoint logs/K1/K1/Goal_Pose/2026-07-23-21-54-01/nn/model_20000.pth \
 #     --num_envs 4096 --max_iterations 20000
+#
+# Environment overrides:
+#   SELECT_BEST=0   evaluate only the final checkpoint instead of searching for the best
+#   VIDEO_S=60      video length in seconds (default 120)
+#   SHARED_DIR=...  where to drop results (default htwk-gym/shared_eval_videos)
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-SHARED_DIR="$REPO_ROOT/shared_eval_videos"
+SHARED_DIR="${SHARED_DIR:-$REPO_ROOT/shared_eval_videos}"
+SELECT_BEST="${SELECT_BEST:-1}"
+VIDEO_S="${VIDEO_S:-120}"
 mkdir -p "$SHARED_DIR"
 
 if [ $# -lt 3 ]; then
-  echo "사용법: bash tools/train_and_eval.sh <sim_device> <rl_device> -- <train.py 인자들...>"
+  echo "usage: bash tools/train_and_eval.sh <sim_device> <rl_device> -- <train.py args...>" >&2
   exit 1
 fi
 
 SIM_DEV=$1
 RL_DEV=$2
 shift 2
-if [ "$1" == "--" ]; then shift; fi
+[ "${1:-}" = "--" ] && shift
 
+cd "$REPO_ROOT"
 LOGFILE=$(mktemp)
+trap 'rm -f "$LOGFILE"' EXIT
 
 echo "=== 학습 시작: python train.py $* ==="
-cd "$REPO_ROOT"
 python train.py "$@" 2>&1 | tee "$LOGFILE"
 
-# 학습 로그에서 run 디렉토리 추출 ("Saving model to logs/.../nn/model_X.pth" 마지막 줄 기준)
-RUN_DIR=$(grep "Saving model to" "$LOGFILE" | tail -1 | sed -E 's|Saving model to (.*)/nn/model_[0-9]+\.pth|\1|')
-
-if [ -z "$RUN_DIR" ]; then
-  echo "!!! run 디렉토리를 찾지 못했습니다. 로그: $LOGFILE"
+# The run dir is whatever the trainer last saved into; parsing its own log avoids
+# guessing at timestamped directory names.
+RUN_DIR=$(grep "Saving model to" "$LOGFILE" | tail -1 \
+          | sed -E 's|.*Saving model to (.*)/nn/model_[0-9]+\.pth.*|\1|')
+if [ -z "$RUN_DIR" ] || [ ! -d "$RUN_DIR" ]; then
+  echo "!!! run 디렉토리를 찾지 못했습니다. 학습 로그를 확인하세요." >&2
   exit 1
 fi
-
-CKPT=$(ls -t "$RUN_DIR"/nn/model_*.pth | head -1)
-echo "=== 학습 종료. checkpoint: $CKPT ==="
-
-echo "=== eval 시작 (2분 영상) ==="
-python eval_goal_pose.py \
-  --task K1/Goal_Pose \
-  --checkpoint "$CKPT" \
-  --sim_device "$SIM_DEV" \
-  --rl_device "$RL_DEV" \
-  --record_video \
-  --record_video_s 120
-
-EVAL_DIR=$(ls -td "$RUN_DIR"/eval/*/ | head -1)
-VIDEO_SRC="${EVAL_DIR}rollout_env0.mp4"
-
 RUN_NAME=$(basename "$RUN_DIR")
-TS=$(date +%Y%m%d-%H%M%S)
-VIDEO_DST="$SHARED_DIR/${RUN_NAME}_${TS}.mp4"
+TASK=$(python -c "import yaml,sys; print(yaml.safe_load(open(sys.argv[1]))['basic']['task'])" "$RUN_DIR/config.yaml")
+echo "=== 학습 종료: $RUN_DIR (task $TASK) ==="
 
-if [ -f "$VIDEO_SRC" ]; then
-  cp "$VIDEO_SRC" "$VIDEO_DST"
-  echo "=== 영상 복사 완료: $VIDEO_DST ==="
+TS=$(date +%Y%m%d-%H%M%S)
+DEST="$SHARED_DIR/${RUN_NAME}_${TS}"
+mkdir -p "$DEST"
+
+if [ "$SELECT_BEST" = "1" ]; then
+  echo "=== 최적 체크포인트 탐색 + 평가 + 영상 ==="
+  python tools/select_best_checkpoint.py \
+    --run_dir "$RUN_DIR" --task "$TASK" \
+    --sim_device "$SIM_DEV" --rl_device "$RL_DEV" \
+    --record_video --record_video_s "$VIDEO_S" --link_best
+  EVAL_DIR=$(ls -td "$RUN_DIR"/eval/select_*/ 2>/dev/null | head -1)
+  VIDEO_SRC="${EVAL_DIR}winner_video/rollout_env0.mp4"
 else
-  echo "!!! 영상 파일을 찾지 못했습니다: $VIDEO_SRC"
+  echo "=== 마지막 체크포인트 평가 + 영상 ==="
+  CKPT=$(ls -t "$RUN_DIR"/nn/model_*.pth | head -1)
+  python eval_goal_pose.py \
+    --task "$TASK" --checkpoint "$CKPT" \
+    --sim_device "$SIM_DEV" --rl_device "$RL_DEV" \
+    --record_video --record_video_s "$VIDEO_S"
+  EVAL_DIR=$(ls -td "$RUN_DIR"/eval/*/ | head -1)
+  VIDEO_SRC="${EVAL_DIR}rollout_env0.mp4"
 fi
 
-rm -f "$LOGFILE"
+# Ship the video together with the reports that explain it, so the mp4 is never
+# looked at without the numbers next to it.
+for f in "$VIDEO_SRC" "${EVAL_DIR}report.md" "${EVAL_DIR}selection.md" "${EVAL_DIR}BEST_CHECKPOINT"; do
+  [ -f "$f" ] && cp "$f" "$DEST/"
+done
+
+if [ -f "$DEST/rollout_env0.mp4" ]; then
+  echo "=== 완료: $DEST ==="
+  ls -lh "$DEST"
+else
+  echo "!!! 영상을 찾지 못했습니다 (평가 결과는 $EVAL_DIR 확인)" >&2
+fi
