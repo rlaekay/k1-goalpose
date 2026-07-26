@@ -341,6 +341,27 @@ class GoalPoseV7(GoalPoseV3):
             gymapi.LOCAL_SPACE,
         )
 
+    # ---- 6. goal_reached with an angular-rate term --------------------------
+
+    def _reward_goal_reached(self):
+        """armB's winning lever, plus the term it was missing.
+
+        The base version tests root_states[:, 7:9] -- LINEAR velocity only. A
+        policy can therefore rock, yaw and pitch in place and still collect the
+        +1/step bonus. Two independent video observations converge on this: armB
+        (the only arm with goal_reached on) wobbles in place more than armA, and
+        armC (no goal_reached) wobbles less than armB. Gating on |omega| too
+        closes the loophole without touching what makes the term work.
+
+        stop_ang_speed_threshold <= 0 restores the exact armB behaviour.
+        """
+        base = super()._reward_goal_reached()
+        thr = self.cfg["rewards"].get("stop_ang_speed_threshold", 0.0)
+        if thr <= 0.0:
+            return base
+        settled = torch.norm(self.root_states[:, 10:13], dim=-1) < thr
+        return base * settled.float()
+
     # ---- 5. joint / actuator protection -------------------------------------
 
     def _margin_penalty(self, value, limit, frac):

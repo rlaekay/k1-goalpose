@@ -17,6 +17,8 @@
 #   SELECT_BEST=0   evaluate only the final checkpoint instead of searching for the best
 #   VIDEO_S=60      video length in seconds (default 120)
 #   SHARED_DIR=...  where to drop results (default htwk-gym/shared_eval_videos)
+#   TRAIN=train_v7.py  trainer entrypoint (default train.py; v7 needs the v3 runner)
+#   STRESS=1        also run the goal-jitter robustness eval on the winner
 
 set -euo pipefail
 
@@ -25,6 +27,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SHARED_DIR="${SHARED_DIR:-$REPO_ROOT/shared_eval_videos}"
 SELECT_BEST="${SELECT_BEST:-1}"
 VIDEO_S="${VIDEO_S:-120}"
+TRAIN="${TRAIN:-train.py}"
+STRESS="${STRESS:-0}"
 mkdir -p "$SHARED_DIR"
 
 if [ $# -lt 3 ]; then
@@ -41,8 +45,8 @@ cd "$REPO_ROOT"
 LOGFILE=$(mktemp)
 trap 'rm -f "$LOGFILE"' EXIT
 
-echo "=== 학습 시작: python train.py $* ==="
-python train.py "$@" 2>&1 | tee "$LOGFILE"
+echo "=== 학습 시작: python $TRAIN $* ==="
+python "$TRAIN" "$@" 2>&1 | tee "$LOGFILE"
 
 # The run dir is whatever the trainer last saved into; parsing its own log avoids
 # guessing at timestamped directory names.
@@ -84,6 +88,19 @@ fi
 for f in "$VIDEO_SRC" "${EVAL_DIR}report.md" "${EVAL_DIR}selection.md" "${EVAL_DIR}BEST_CHECKPOINT"; do
   [ -f "$f" ] && cp "$f" "$DEST/"
 done
+
+if [ "$STRESS" = "1" ]; then
+  echo "=== 강건성 스트레스 평가 (goal jitter 50Hz) ==="
+  BEST_CKPT=$(cat "${EVAL_DIR}BEST_CHECKPOINT" 2>/dev/null || ls -t "$RUN_DIR"/nn/model_*.pth | head -1)
+  # Non-fatal: a failed stress run must not discard the training result above.
+  if python eval_goal_pose.py --task "$TASK" --checkpoint "$BEST_CKPT" \
+      --sim_device "$SIM_DEV" --rl_device "$RL_DEV" --stress jitter --duration_s 60; then
+    STRESS_DIR=$(ls -td "$RUN_DIR"/eval/*_stress_jitter/ 2>/dev/null | head -1)
+    [ -n "$STRESS_DIR" ] && cp "${STRESS_DIR}report.md" "$DEST/report_stress_jitter.md" 2>/dev/null || true
+  else
+    echo "!!! 스트레스 평가 실패 (학습/기본 평가 결과는 유효)" >&2
+  fi
+fi
 
 if [ -f "$DEST/rollout_env0.mp4" ]; then
   echo "=== 완료: $DEST ==="

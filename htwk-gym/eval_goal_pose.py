@@ -273,7 +273,8 @@ def bootstrap_ci(x, q=50.0, n_boot=600, alpha=0.05, seed=0, max_n=20000):
 # --------------------------------------------------------------------------
 
 def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
-                record_video=False, keep_perturbations=False, no_noise=False):
+                record_video=False, keep_perturbations=False, no_noise=False,
+                stress=None):
     """Apply the standard evaluation conditions to a task config, in place."""
     cfg["basic"]["task"] = task
     cfg["basic"]["headless"] = True
@@ -287,8 +288,30 @@ def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
     if not keep_perturbations:
         cfg["randomization"]["kick_interval_s"] = 1.0e9
         cfg["randomization"]["push_interval_s"] = 1.0e9
+        # v7's two-class disturbance runs off its OWN config key and per-env
+        # timers, so the two interval knobs above do not touch it. Without this
+        # a "clean" v7 eval would silently keep 150 N collisions switched on and
+        # would not be comparable to the armA-D numbers.
+        if isinstance(cfg["randomization"].get("disturbance"), dict):
+            cfg["randomization"]["disturbance"]["enabled"] = False
     if no_noise:
         cfg["noise"] = {}
+
+    if stress == "jitter":
+        # BT thrash / ball re-detection worst case: the TRUE goal is redrawn
+        # uniformly in a +-3 m box on every control step (50 Hz). Position error
+        # is undefined here -- the goal's expectation is the robot's own
+        # neighbourhood -- so this run is scored on "does it stay upright and
+        # non-divergent", not on the gates.
+        c = cfg["commands"]
+        c["resampling_time_s"] = [cfg["control"]["decimation"] * cfg["sim"]["dt"],
+                                  2 * cfg["control"]["decimation"] * cfg["sim"]["dt"]]
+        c["goal_dx"] = [-3.0, 3.0]
+        c["goal_dy"] = [-3.0, 3.0]
+        if isinstance(c.get("goal_categories"), dict):
+            c["goal_categories"]["enabled"] = False   # else 30% of draws are zero-distance
+        if isinstance(c.get("goal_mode_mixture"), dict):
+            c["goal_mode_mixture"] = {"waypoint": 1.0, "path": 0.0}  # jitter is a waypoint stress
     return cfg
 
 
@@ -318,7 +341,7 @@ def load_policy(checkpoint, env, device, model=None, verbose=True):
 # --------------------------------------------------------------------------
 
 def rollout(env, model, total_steps, device, stochastic=False, record_video=False,
-            record_video_s=8.0, progress_every=500, progress_prefix="  "):
+            record_video_s=8.0, progress_every=500, progress_prefix="  ", stress=None):
     """Roll the policy and collect one record per completed goal segment.
 
     Per segment we keep not just the final error but the provenance needed to
@@ -337,6 +360,11 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     # fast it can actually go, which is the number the MASTERPLAN target is in.
     speed_hist = np.zeros(400, dtype=np.int64)  # 0..4 m/s in 1 cm/s bins
     speed_hist_max = 4.0
+    # Body angular rate: under goal jitter the failure mode is not "wrong place"
+    # but "shaking itself apart", and |omega| is what shows that.
+    angvel_hist = np.zeros(400, dtype=np.int64)  # 0..8 rad/s
+    angvel_hist_max = 8.0
+    upright_steps = 0
     fall_ctx = {k: [] for k in ("category", "goal_dist", "t_into_segment", "start_dist")}
     falls = 0
     censored = 0
@@ -370,6 +398,12 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
         np.add.at(speed_hist,
                   np.clip((cur_speed.cpu().numpy() / speed_hist_max * len(speed_hist)).astype(int),
                           0, len(speed_hist) - 1), 1)
+        cur_omega = torch.norm(env.base_ang_vel, dim=-1)
+        np.add.at(angvel_hist,
+                  np.clip((cur_omega.cpu().numpy() / angvel_hist_max * len(angvel_hist)).astype(int),
+                          0, len(angvel_hist) - 1), 1)
+        # projected_gravity z near -1 == upright; > -0.7 is ~45 deg off vertical
+        upright_steps += int((env.projected_gravity[:, 2] < -0.7).sum().item())
 
         # Everything a terminated env needs must be snapshotted here: _reset_idx()
         # runs inside step() and zeroes base_pos/episode_length_buf for fallen envs,
@@ -412,6 +446,10 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
         else:
             changed = (env.goal_pos_world != prev_goal_pos).any(dim=1) | (env.goal_heading_world != prev_goal_heading)
         completed = changed & ~done
+        if stress:
+            # Goals are redrawn every control step, so a "segment" is one step
+            # long and every per-segment statistic is meaningless. Skip them.
+            completed = completed & False
         if completed.any():
             ids = completed.nonzero(as_tuple=False).flatten()
             final_xy = env.base_pos[ids, :2]
@@ -503,6 +541,10 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     out["overlay_states"] = overlay_states
     out["speed_hist"] = speed_hist
     out["speed_hist_max"] = speed_hist_max
+    out["angvel_hist"] = angvel_hist
+    out["angvel_hist_max"] = angvel_hist_max
+    out["upright_share"] = upright_steps / float(max(total_steps * env.num_envs, 1))
+    out["env_minutes"] = total_steps * env.dt * env.num_envs / 60.0
     return out
 
 
@@ -1082,6 +1124,100 @@ def render_report(r):
     return "\n".join(md)
 
 
+def _hist_pct(hist, hist_max, p):
+    if hist.sum() == 0:
+        return float("nan")
+    edges = np.arange(len(hist)) * (hist_max / len(hist))
+    cdf = np.cumsum(hist) / hist.sum()
+    idx = int(np.searchsorted(cdf, p / 100.0))
+    return float(edges[min(idx, len(edges) - 1)])
+
+
+def summarize_stress(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path,
+                     task, mode, perturbations, setup_wall_s, seed):
+    """Stress runs are scored on survival and oscillation, not on the gates.
+
+    Under 50 Hz goal jitter the goal's expectation IS the robot's neighbourhood,
+    so "position error" measures the sampler, not the policy. What still carries
+    information is whether the robot stays upright and whether it shakes itself
+    apart trying to chase a target that keeps moving.
+    """
+    sh, sm = roll["speed_hist"], roll["speed_hist_max"]
+    ah, am = roll["angvel_hist"], roll["angvel_hist_max"]
+    env_min = roll["env_minutes"]
+    falls = roll["falls"]
+    results = {
+        "task": task, "config": config_path, "checkpoint": checkpoint,
+        "date": time.strftime("%Y-%m-%d %H:%M:%S"), "mode": "stress:" + mode,
+        "authoritative_gate_evaluation": False,
+        "num_envs": num_envs, "duration_s": duration_s, "seed": seed,
+        "perturbations": bool(perturbations),
+        "env_minutes": env_min,
+        "falls": falls,
+        "falls_per_env_minute": falls / max(env_min, 1e-9),
+        "upright_share": roll["upright_share"],
+        "body_speed": {"median": _hist_pct(sh, sm, 50), "p90": _hist_pct(sh, sm, 90),
+                       "p99": _hist_pct(sh, sm, 99)},
+        "body_angvel": {"median": _hist_pct(ah, am, 50), "p90": _hist_pct(ah, am, 90),
+                        "p99": _hist_pct(ah, am, 99)},
+        "timing": {"setup_wall_s": setup_wall_s, "rollout_wall_s": roll["rollout_wall_s"]},
+    }
+
+    md = ["# GoalPose 강건성 스트레스 리포트 ({}) — {}".format(mode, results["date"]), ""]
+    md.append("- checkpoint: `{}`".format(checkpoint))
+    md.append("- config: `{}`".format(config_path))
+    md.append("- 조건: {} envs × {:.0f}s, 목표를 매 제어스텝(50 Hz) ±3 m 균일 재추첨, 외란 {}".format(
+        num_envs, duration_s, "ON" if perturbations else "OFF"))
+    md.append("- 누적 관측 시간: {:.0f} env·분".format(env_min))
+    md.append("")
+    md.append("> ⚠️ **이 리포트에는 위치오차 게이트가 없다.** 목표가 50 Hz로 무작위 재추첨되면 "
+              "참값 목표의 기댓값이 로봇 주변이 되어 위치오차는 정책이 아니라 샘플러를 측정한다. "
+              "여기서 의미가 있는 것은 **넘어지지 않는가**와 **발산하지 않는가**뿐이다.")
+    md.append("")
+    md.append("## 생존")
+    md.append("")
+    md += _table(["지표", "값"], [
+        ["낙상", "{}회".format(falls)],
+        ["낙상률", "{:.2f} 회/env·분".format(results["falls_per_env_minute"])],
+        ["직립 유지 시간 비율", "{:.1f}%".format(results["upright_share"] * 100)],
+    ])
+    md.append("")
+    md.append("## 발산 여부 (몸통 각속도)")
+    md.append("")
+    md.append("목표를 쫓아 몸통이 경련하면 |ω|가 커진다. 정상 보행의 |ω|는 대략 1~2 rad/s다.")
+    md.append("")
+    md += _table(["지표", "각속도 |ω|", "선속도 |v|"], [
+        ["median", "{:.2f} rad/s".format(results["body_angvel"]["median"]),
+         "{:.2f} m/s".format(results["body_speed"]["median"])],
+        ["p90", "{:.2f} rad/s".format(results["body_angvel"]["p90"]),
+         "{:.2f} m/s".format(results["body_speed"]["p90"])],
+        ["p99", "{:.2f} rad/s".format(results["body_angvel"]["p99"]),
+         "{:.2f} m/s".format(results["body_speed"]["p99"])],
+    ])
+    md.append("")
+    md.append("## 판정")
+    md.append("")
+    verdict = []
+    if results["falls_per_env_minute"] > 0.5:
+        verdict.append("❌ **낙상률 {:.2f}/env·분** — 목표 흔들림에 무너진다. 학습 쪽 "
+                       "`noise.goal_bt_flicker.prob_per_step`을 올려 더 많이 노출시킬 것."
+                       .format(results["falls_per_env_minute"]))
+    else:
+        verdict.append("✅ 낙상률 {:.2f}/env·분 — 목표 흔들림에서도 서 있다."
+                       .format(results["falls_per_env_minute"]))
+    if results["body_angvel"]["p90"] > 3.0:
+        verdict.append("❌ **각속도 p90 {:.2f} rad/s** — 흔들리는 목표를 쫓고 있다(경련). "
+                       "정책이 필터링을 배우지 못했다는 뜻이므로, 보상이 참값 목표를 읽고 "
+                       "있는지 확인하고 `action_rate` 페널티를 키울 것."
+                       .format(results["body_angvel"]["p90"]))
+    else:
+        verdict.append("✅ 각속도 p90 {:.2f} rad/s — 목표 흔들림을 쫓지 않고 걸러낸다."
+                       .format(results["body_angvel"]["p90"]))
+    md += ["- " + v for v in verdict]
+    md.append("")
+    return results, "\n".join(md)
+
+
 def write_outputs(out_dir, results, roll, report_md, env=None, cfg=None):
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "report.json"), "w", encoding="utf-8") as f:
@@ -1133,6 +1269,7 @@ def main():
     parser.add_argument("--record_video", action="store_true", help="also record an mp4 of env 0 (first --record_video_s seconds)")
     parser.add_argument("--record_video_s", type=float, default=8.0)
     parser.add_argument("--feasible_speed", type=float, help="override evaluation.feasible_speed_mps (m/s) used by the feasibility check")
+    parser.add_argument("--stress", choices=["jitter"], help="robustness stress mode instead of a gate evaluation. 'jitter': the true goal is redrawn uniformly in a +-3 m box every control step (50 Hz), modelling BT thrash / ball re-detection. Scored on falls and body oscillation -- position error is undefined in this mode.")
     parser.add_argument("--exploratory", action="store_true", help="label this run as a non-authoritative preview rather than an official gate evaluation")
     parser.add_argument("--out", help="output dir (default: <run_dir>/eval/<timestamp>)")
     args = parser.parse_args()
@@ -1149,7 +1286,7 @@ def main():
 
     prepare_cfg(cfg, args.task, num_envs, args.sim_device, args.rl_device,
                 record_video=args.record_video, keep_perturbations=args.keep_perturbations,
-                no_noise=args.no_noise)
+                no_noise=args.no_noise, stress=args.stress)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -1169,7 +1306,27 @@ def main():
     setup_wall_s = time.perf_counter() - eval_started
     roll = rollout(env, model, int(duration_s / env.dt), device,
                    stochastic=args.stochastic, record_video=args.record_video,
-                   record_video_s=args.record_video_s)
+                   record_video_s=args.record_video_s, stress=args.stress)
+
+    if args.stress:
+        results, report_md = summarize_stress(
+            roll, cfg, num_envs, duration_s, env.dt, checkpoint, config_path,
+            args.task, args.stress, args.keep_perturbations, setup_wall_s, args.seed)
+        out_dir = args.out
+        if not out_dir:
+            run_dir = os.path.dirname(os.path.dirname(os.path.abspath(checkpoint)))
+            out_dir = os.path.join(run_dir, "eval",
+                                   time.strftime("%Y-%m-%d-%H-%M-%S") + "_stress_" + args.stress)
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, "report.json"), "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False, default=float)
+        with open(os.path.join(out_dir, "report.md"), "w", encoding="utf-8") as f:
+            f.write(report_md + "\n")
+        if args.record_video and hasattr(env, "camera_frames") and len(env.camera_frames) > 0:
+            write_outputs(out_dir, results, roll, report_md, env=env, cfg=cfg)
+        print(report_md)
+        print("\nwritten: {}".format(out_dir))
+        return
 
     results = summarize(
         roll, cfg, num_envs, duration_s, env.dt, checkpoint, config_path, args.task,

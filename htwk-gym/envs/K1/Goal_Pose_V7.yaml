@@ -437,6 +437,10 @@ rewards:
   constellation_radius: 1.0    # [m] constellation circle radius; r^2 sets heading-vs-position coupling
   goal_progress_clip: 1.0      # [m/s] clip for goal_progress (robustness to kicks/resets)
   stop_speed_threshold: 0.1    # [m/s] "stopped" threshold for goal_reached
+  # v7: goal_reached also requires the trunk to be SETTLED, not just not
+  # translating. Base checks linear velocity only, so a policy can rock in place
+  # and keep the bonus (armB's in-place wobble). 0 = exact armB behaviour.
+  stop_ang_speed_threshold: 0.3   # [rad/s]
   heading_gate_sigma: 0.25     # [m^2] distance-gate width for heading_near_goal
   stand_posture_radius: 0.3    # [m] inside this goal distance, stand_posture penalty activates
 
