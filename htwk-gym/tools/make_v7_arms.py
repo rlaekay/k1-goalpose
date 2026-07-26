@@ -69,6 +69,33 @@ ARMS = {
     "E1_path": dict(**_OFF_ROBUST, **_OFF_PROTECT),
     # + the robustness machinery, nothing else.
     "E2_robust": dict(**_OFF_PATH, **_OFF_PROTECT),
+    # E1 with the SCHEDULER REMOVED: one wide fixed commanded-speed distribution
+    # instead of a curriculum that creeps the ceiling upward.
+    #
+    # Why this might beat E1 rather than just differ from it:
+    #   * The curriculum is a single global float shared by all 4096 envs, so it
+    #     throws away every per-env signal. legged_gym's terrain curriculum is
+    #     per-env; this one is cruder than that.
+    #   * A curriculum stops raising the demand once the policy stops keeping up,
+    #     so it CANNOT distinguish "cannot do it yet" from "cannot ever do it".
+    #     Wherever it settles tells us nothing about K1's physical ceiling.
+    #   * With a wide fixed range the achieved-vs-commanded curve saturates, and
+    #     the knee IS the physical ceiling -- measured, for free, in the same run.
+    #     That was masterplan2's open item #2 (a separate MaxSpeed probe).
+    # The leash is what makes this safe: a robot handed an impossible speed just
+    # parks the goal at lookahead_max, so those samples degrade into "run flat
+    # out" episodes rather than into dead gradient.
+    #
+    # speed_init is pinned to 1.0 because path_speed is drawn from
+    # [smin, smin + (smax-smin)*speed_level]; with the curriculum off, the level
+    # never moves, so anything below 1.0 would silently clamp the range.
+    "E3_wide_nosched": dict(
+        **_OFF_ROBUST, **_OFF_PROTECT,
+        **{
+            "commands.path.speed_curriculum": False,
+            "commands.path.speed_init": 1.0,
+            "commands.path.speed_range_mps": [0.2, 2.0],
+        }),
     # everything (base Goal_Pose_V7.yaml as written).
     "V7_full": {},
 }
@@ -100,7 +127,8 @@ def main():
 
     # GPU 0 gets the two arms that answer the primary questions.
     gpu_of = {"E0_armB_armsdown": "cuda:0", "E1_path": "cuda:0",
-              "E2_robust": "cuda:1", "V7_full": "cuda:1"}
+              "E2_robust": "cuda:1", "V7_full": "cuda:1",
+              "E3_wide_nosched": "cuda:0"}
 
     for arm, patch in arms.items():
         cfg = copy.deepcopy(base)

@@ -351,9 +351,10 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     """
     instrumented = hasattr(env, "goal_start_pos") and hasattr(env, "goal_start_step")
     has_segment_id = hasattr(env, "goal_segment_id")
+    has_path_speed = hasattr(env, "path_speed")
 
     keys = ("pos_err", "head_err", "speed", "category", "start_dist", "duration_s",
-            "min_dist", "along", "cross", "peak_speed", "mean_speed")
+            "min_dist", "along", "cross", "peak_speed", "mean_speed", "cmd_speed")
     seg = {k: [] for k in keys}
     # Whole-rollout body-speed histogram, over every env and every control step.
     # The per-segment "final_speed" only says how well it stops; this says how
@@ -411,6 +412,9 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
         prev_goal_pos = env.goal_pos_world.clone()
         prev_goal_heading = env.goal_heading_world.clone()
         prev_segment_id = env.goal_segment_id.clone() if has_segment_id else None
+        # path_speed is re-rolled at the segment boundary, so the commanded speed
+        # that the finished segment was actually run under is the PREVIOUS value.
+        prev_cmd_speed = env.path_speed.clone() if has_path_speed else None
         prev_goal_dist = env.goal_dist.clone()
         prev_len = env.episode_length_buf.clone()
         if instrumented:
@@ -464,6 +468,10 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
             seg["min_dist"].extend(torch.minimum(min_dist[ids], d).cpu().tolist())
             seg["peak_speed"].extend(peak_speed[ids].cpu().tolist())
             seg["mean_speed"].extend((sum_speed[ids] / n_speed[ids].clamp(min=1.0)).cpu().tolist())
+            if has_path_speed:
+                seg["cmd_speed"].extend(prev_cmd_speed[ids].cpu().tolist())
+            else:
+                seg["cmd_speed"].extend([float("nan")] * len(ids))
 
             if instrumented:
                 approach = goal_xy - prev_start_pos[ids]
@@ -730,6 +738,33 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
         }
     else:
         results["body_speed"] = None
+
+    # ---- commanded vs achieved speed (path mode) --------------------------
+    # The point of a WIDE FIXED commanded-speed distribution (no curriculum) is
+    # that this curve saturates: below the robot's physical limit achieved
+    # tracks commanded, above it the curve flattens. The knee is the limit --
+    # measured, not scheduled. A curriculum can never show this, because it
+    # stops raising the demand once the policy stops keeping up and so cannot
+    # distinguish "not yet" from "never".
+    cmd = roll.get("cmd_speed")
+    results["speed_tracking"] = None
+    if cmd is not None and np.isfinite(cmd).any():
+        ok = np.isfinite(cmd) & (cmd > 0) & np.isfinite(roll["mean_speed"])
+        if ok.sum() >= 20:
+            bins = [0.0, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, float("inf")]
+            rows = []
+            for lo, hi in zip(bins[:-1], bins[1:]):
+                m = ok & (cmd >= lo) & (cmd < hi)
+                if m.sum() < 5:
+                    continue
+                rows.append({
+                    "cmd_lo": lo, "cmd_hi": hi, "n": int(m.sum()),
+                    "cmd_median": _median(cmd[m]),
+                    "achieved_mean_median": _median(roll["mean_speed"][m]),
+                    "achieved_peak_median": _median(roll["peak_speed"][m]),
+                    "tracking_ratio": float(_median(roll["mean_speed"][m]) / max(_median(cmd[m]), 1e-9)),
+                })
+            results["speed_tracking"] = {"bins": rows, "n": int(ok.sum())}
 
     # ---- per goal category ----------------------------------------------
     cats = roll["category"]
@@ -1012,6 +1047,32 @@ def render_report(r):
                       "과제의 한계다.".format(bs["share_above_1p0"] * 100))
             md.append("")
 
+    st = r.get("speed_tracking")
+    if st and st["bins"]:
+        md.append("## 명령속도 vs 실제속도 (path mode)")
+        md.append("")
+        md.append("추종비 = 실제/명령. 1.0 근처면 따라가는 것이고, 명령을 올려도 실제가 "
+                  "안 오르면 **거기가 이 로봇의 물리적 한계**다.")
+        md.append("")
+        md += _table(
+            ["명령속도 구간", "n", "명령 median", "실제 평균속도", "실제 최고속도", "추종비"],
+            [["{:.1f}–{:.1f} m/s".format(b["cmd_lo"], b["cmd_hi"]) if b["cmd_hi"] != float("inf")
+              else "{:.1f}+ m/s".format(b["cmd_lo"]),
+              b["n"], "{:.2f}".format(b["cmd_median"]),
+              "{:.2f} m/s".format(b["achieved_mean_median"]),
+              "{:.2f} m/s".format(b["achieved_peak_median"]),
+              "{:.2f}".format(b["tracking_ratio"])] for b in st["bins"]])
+        md.append("")
+        knee = [b for b in st["bins"] if b["tracking_ratio"] < 0.75]
+        if knee:
+            md.append("> 📌 추종비가 0.75 아래로 떨어지는 첫 구간: **{:.1f}–{:.1f} m/s** "
+                      "(실제 평균 {:.2f} m/s). 이 부근이 현재 정책의 지속 가능 상한이다."
+                      .format(knee[0]["cmd_lo"], knee[0]["cmd_hi"], knee[0]["achieved_mean_median"]))
+        else:
+            md.append("> 📌 모든 구간에서 추종비 0.75 이상 — **아직 한계에 도달하지 않았다.** "
+                      "`commands.path.speed_range_mps` 상단을 더 올려 한계를 찾을 것.")
+        md.append("")
+
     feas = r.get("feasibility")
     if feas:
         md.append("## 과제 실현가능성 점검")
@@ -1226,11 +1287,11 @@ def write_outputs(out_dir, results, roll, report_md, env=None, cfg=None):
         w = csv.writer(f)
         w.writerow(["pos_err_m", "heading_err_deg", "final_speed_mps", "category",
                     "start_dist_m", "duration_s", "min_dist_m", "along_err_m", "cross_err_m",
-                    "peak_speed_mps", "mean_speed_mps"])
+                    "peak_speed_mps", "mean_speed_mps", "cmd_speed_mps"])
         rows = zip(roll["pos_err"], np.degrees(roll["head_err"]), roll["speed"],
                    roll["category"], roll["start_dist"], roll["duration_s"],
                    roll["min_dist"], roll["along"], roll["cross"],
-                   roll["peak_speed"], roll["mean_speed"])
+                   roll["peak_speed"], roll["mean_speed"], roll["cmd_speed"])
         for row in rows:
             w.writerow([CATEGORY_NAMES.get(int(c), c) if i == 3 else "{:.4f}".format(c)
                         for i, c in enumerate(row)])
