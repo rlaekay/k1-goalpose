@@ -150,12 +150,33 @@ commands:
     path: 0.5
 
   path:
-    shapes: [0, 1, 2, 3, 4]      # figure8, circle, spiral, rose/star, wander
+    shapes: [0, 1, 2, 3, 4, 5]  # figure8, circle, spiral, rose/star, wander, serpentine
     scale_m: [1.5, 4.0]          # curve size
-    lookahead_m: [0.5, 3.0]      # user request: A* lookahead band
+    lookahead_m: [0.5, 3.0]      # MINIMUM carrot distance, per env. Enforced now:
+                                 # before, this was sampled and never read, and the
+                                 # goal drifted onto the robot (measured gap median
+                                 # 0.41 m) where constellation is flat and the
+                                 # gradient vanishes.
+    leash_ratio: 1.6             # max carrot distance = lookahead_m * this
     lookahead_max_m: 3.5         # leash: goal never runs further ahead than this
     speed_range_mps: [0.3, 1.6]  # commanded path speed; top end scaled by curriculum
-    speed_curriculum: true
+    speed_curriculum: true       # scalar fallback; ignored when speed_grid.enabled
+
+    # Grid-adaptive curriculum over (speed x curvature), after Margolis et al.
+    # "Rapid Locomotion via RL" (RSS 2022). Two findings from that paper decide
+    # this: (a) with NO curriculum the robot never learns to walk at all, even
+    # slowly -- wide uniform sampling starves it of reward; (b) their curriculum
+    # is a GRID over (v_x, omega_z) rather than a scalar, because high linear and
+    # high angular velocity together are much harder than either alone
+    # (omega ~ 1/v at the feasibility boundary).
+    # On a path omega = v * kappa, so (speed, curvature) IS that grid -- and it
+    # trains the translation/rotation coupling explicitly at the same time.
+    # Curvature is commanded via path size: path_scale = 1/kappa.
+    speed_grid:
+      enabled: false             # turn on in the next batch, not mid-flight
+      speeds:     [0.3, 0.6, 0.9, 1.2, 1.5, 1.8]
+      curvatures: [0.25, 0.4, 0.6, 0.8, 1.0]   # 1/m -> path radius 4.0 .. 1.0 m
+      up_threshold: 0.8          # fraction of the segment spent within keepup_gap_m
     speed_init: 0.4              # level in [speed_min_level, 1] -> top speed
     speed_min_level: 0.1
     speed_step: 0.05

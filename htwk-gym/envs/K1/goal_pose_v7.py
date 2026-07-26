@@ -82,6 +82,14 @@ class GoalPoseV7(GoalPoseV3):
         self.path_u = torch.zeros(n, dtype=torch.float, device=dev)
         self.path_speed = torch.zeros(n, dtype=torch.float, device=dev)
         self.lookahead = torch.zeros(n, dtype=torch.float, device=dev)
+        # tracking error against the carrot, and the per-segment counters the
+        # grid curriculum promotes on. path_lag is exported for eval: goal
+        # distance can never reach 0 in path mode (the goal is meant to sit
+        # lookahead_min ahead), so raw distance is not the tracking error.
+        self.path_lag = torch.zeros(n, dtype=torch.float, device=dev)
+        self.track_ok_steps = torch.zeros(n, dtype=torch.float, device=dev)
+        self.track_steps = torch.zeros(n, dtype=torch.float, device=dev)
+        self.grid_on = False
         # curriculum state
         self.speed_level = float(self.path_cfg.get("speed_init", 0.4))
         self.keepup_ema = 0.0
@@ -94,6 +102,7 @@ class GoalPoseV7(GoalPoseV3):
         self.dist_steps_left = torch.zeros(n, dtype=torch.long, device=dev)
         self.dist_next = torch.zeros(n, dtype=torch.long, device=dev)
         self._init_disturbance_schedule()
+        self._init_speed_grid()
         # step() calls _update_goal_state() twice and _resample_goals() once, so an
         # unguarded advance would run the path 3x per control step (i.e. 3x the
         # commanded speed). Advance at most once per common_step_counter tick.
@@ -133,6 +142,14 @@ class GoalPoseV7(GoalPoseV3):
         m = s == 4                                        # pseudo-random wander
         x = torch.where(m, torch.sin(u) + 0.5 * torch.sin(2.3 * u + 1.1), x)
         y = torch.where(m, torch.cos(0.7 * u) + 0.5 * torch.sin(1.7 * u), y)
+
+        # 5 serpentine: translation advances monotonically while curvature flips
+        # sign every half period. The canonical translation/rotation coupling
+        # test -- the robot must keep a steady forward pace while yaw rate
+        # reverses, which is precisely the regime where the two interfere.
+        m = s == 5
+        x = torch.where(m, 0.45 * u, x)
+        y = torch.where(m, torch.sin(u), y)
         return x, y
 
     def _path_world(self, u):
@@ -161,20 +178,76 @@ class GoalPoseV7(GoalPoseV3):
         self.path_u[env_ids] = torch_rand_float(-np.pi, np.pi, (k, 1), device=self.device).squeeze(1)
         lo, hi = p.get("lookahead_m", [0.5, 3.0])
         self.lookahead[env_ids] = torch_rand_float(lo, hi, (k, 1), device=self.device).squeeze(1)
-        # commanded path speed, scaled by the curriculum level
-        smin, smax = p.get("speed_range_mps", [0.3, 1.6])
-        top = smin + (smax - smin) * self.speed_level
-        self.path_speed[env_ids] = torch_rand_float(smin, max(smin + 1e-3, top), (k, 1), device=self.device).squeeze(1)
+
+        if self.grid_on:
+            # Report on the segment that just ended BEFORE overwriting its cell,
+            # then draw the next (speed, curvature) pair from the active set.
+            self._grid_report(env_ids)
+            flat, si, ci = self._sample_cells(k)
+            self.env_cell[env_ids] = flat
+            jitter = torch_rand_float(0.85, 1.15, (k, 1), device=self.device).squeeze(1)
+            self.path_speed[env_ids] = self.grid_speeds[si] * jitter
+            # kappa ~ 1/scale for these curve families, so curvature is commanded
+            # through the path size. This is what couples yaw rate to speed:
+            # omega = v * kappa, i.e. the grid axis pair IS (v_x, omega_z).
+            self.path_scale[env_ids] = 1.0 / self.grid_curvs[ci].clamp(min=1e-3)
+        else:
+            # commanded path speed, scaled by the scalar curriculum level
+            smin, smax = p.get("speed_range_mps", [0.3, 1.6])
+            top = smin + (smax - smin) * self.speed_level
+            self.path_speed[env_ids] = torch_rand_float(smin, max(smin + 1e-3, top), (k, 1), device=self.device).squeeze(1)
+        self.track_ok_steps[env_ids] = 0.0
+        self.track_steps[env_ids] = 0.0
+        self.path_lag[env_ids] = 0.0
         # anchor the path so the lookahead point starts just ahead of the robot
         wx, wy = self._path_world(self.path_u)
         self.path_origin[env_ids, 0] += self.base_pos[env_ids, 0] - wx[env_ids]
         self.path_origin[env_ids, 1] += self.base_pos[env_ids, 1] - wy[env_ids]
 
+    def _project_robot(self, u_goal, ds_du):
+        """Arc-length phase of the point on the path nearest the robot.
+
+        Needed for a real lookahead: "0.5-3.0 m ahead" is only meaningful
+        relative to where the robot IS on the path, not relative to where the
+        goal happened to drift to. Searched locally (a window behind the goal)
+        rather than globally, because a global nearest-point search on a
+        self-intersecting curve like a figure-8 can snap to the wrong lobe.
+        """
+        span = float(self.path_cfg.get("lookahead_max_m", 3.5))
+        probes = torch.linspace(-1.2 * span, 0.2 * span, 9, device=self.device)
+        best_u = u_goal.clone()
+        best_d = torch.full_like(u_goal, float("inf"))
+        for off in probes:
+            uc = u_goal + self.path_dir * off / ds_du
+            xc, yc = self._path_world(uc)
+            d = torch.norm(torch.stack([xc, yc], dim=-1) - self.base_pos[:, :2], dim=-1)
+            closer = d < best_d
+            best_d = torch.where(closer, d, best_d)
+            best_u = torch.where(closer, uc, best_u)
+        return best_u
+
     def _advance_paths(self):
-        """Move the lookahead point along the path at path_speed, but never let it
-        get further than lookahead_max ahead of the robot (the "leash"). Without
-        the leash a robot that cannot keep up is handed an ever-receding target
-        and the gradient dies; with it, falling behind simply parks the goal."""
+        """Advance the lookahead point.
+
+        Three constraints act at once, and each fixes a different failure:
+
+          pace   u advances at path_speed              -> creates the speed demand.
+                 A goal that only sits `L` ahead of the robot moves at whatever
+                 speed the robot chooses, so pure pursuit alone demands nothing.
+          floor  goal stays >= lookahead_min ahead     -> keeps it a LOOKAHEAD.
+                 Without this the goal drifts onto the robot (measured: gap
+                 median 0.41 m, below the configured 0.5 m minimum), and there
+                 constellation = exp(-w d^2) ~ 1 with gradient ~ 0 -- the reward
+                 goes flat exactly where the robot is.
+          leash  goal stays <= lookahead_max ahead     -> keeps the gradient alive
+                 when the robot cannot keep up, instead of handing it a target
+                 that recedes forever.
+
+        The floor also means a robot faster than path_speed drags the carrot
+        along faster than commanded, so path_speed is a floor on pace rather
+        than a ceiling -- which is what lets the achieved-speed distribution
+        reveal the physical limit instead of the commanded one.
+        """
         ids = self.is_path_env
         if not bool(ids.any()) or self._path_advanced_at == self.common_step_counter:
             return
@@ -186,12 +259,19 @@ class GoalPoseV7(GoalPoseV3):
         x1, y1 = self._path_world(u0 + du)
         ds_du = torch.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2).clamp(min=1.0e-4) / du
 
-        step_u = self.path_dir * self.path_speed * self.dt / ds_du
-        gap = torch.norm(torch.stack([x0, y0], dim=-1) - self.base_pos[:, :2], dim=-1)
-        leash = float(p.get("lookahead_max_m", 3.5))
-        # freeze the phase for envs whose lookahead point already ran too far
-        step_u = torch.where(gap > leash, torch.zeros_like(step_u), step_u)
-        self.path_u = torch.where(ids, u0 + step_u, u0)
+        l_min = self.lookahead                                   # per-env, [0.5, 3.0]
+        l_max = torch.clamp(self.lookahead * float(p.get("leash_ratio", 1.6)),
+                            max=float(p.get("lookahead_max_m", 3.5)))
+        l_max = torch.maximum(l_max, l_min + 0.1)
+
+        u_proj = self._project_robot(u0, ds_du)
+        u_paced = u0 + self.path_dir * self.path_speed * self.dt / ds_du
+        # clamp in "progress" coordinates so the sign of path_dir drops out
+        d = self.path_dir
+        prog = torch.clamp(d * u_paced,
+                           min=d * u_proj + l_min / ds_du,
+                           max=d * u_proj + l_max / ds_du)
+        self.path_u = torch.where(ids, d * prog, u0)
 
         gx, gy = self._path_world(self.path_u)
         gx1, gy1 = self._path_world(self.path_u + self.path_dir * du)
@@ -200,10 +280,85 @@ class GoalPoseV7(GoalPoseV3):
         self.goal_pos_world[:, 1] = torch.where(ids, gy, self.goal_pos_world[:, 1])
         self.goal_heading_world = torch.where(ids, tangent, self.goal_heading_world)
 
-        self._update_speed_curriculum(gap[ids])
+        # How far the robot has fallen behind its own projection-based carrot.
+        # This, not the raw goal distance, is the tracking error: the goal is
+        # SUPPOSED to sit l_min ahead, so distance alone can never reach zero.
+        gap_now = torch.norm(torch.stack([gx, gy], dim=-1) - self.base_pos[:, :2], dim=-1)
+        self.path_lag = torch.where(ids, (gap_now - l_min).clamp(min=0.0), self.path_lag)
+        keep = float(p.get("keepup_gap_m", 2.0))
+        self.track_ok_steps = torch.where(ids & (self.path_lag < keep),
+                                          self.track_ok_steps + 1, self.track_ok_steps)
+        self.track_steps = torch.where(ids, self.track_steps + 1, self.track_steps)
+
+        self._update_speed_curriculum(self.path_lag[ids])
+
+    # ---- 2b. grid-adaptive curriculum over (speed x curvature) --------------
+    #
+    # Margolis et al., "Rapid Locomotion via Reinforcement Learning" (RSS 2022,
+    # 3.9 m/s on Mini Cheetah) report two things that decide this design:
+    #
+    #   * "In the absence of any curriculum, no useful locomotion behavior is
+    #     learned, even at low speeds" -- the robot jitters in place. Sampling
+    #     uniformly from a wide command range fails because most commands are
+    #     too hard to collect reward from. That is exactly what E3_wide_nosched
+    #     does, so E3 is a genuine risk, not a safe simplification.
+    #   * Their curriculum is a GRID over (v_x, omega_z), not a scalar, because
+    #     "simultaneous high linear and angular velocities are more demanding
+    #     due to centrifugal forces", giving roughly omega ~ 1/v at the
+    #     feasibility boundary. A scalar level cannot represent that boundary.
+    #
+    # On a path, yaw rate is not free: omega = v * kappa. So (speed, curvature)
+    # IS Margolis's (v, omega) grid, reparameterised -- and it is simultaneously
+    # the translation/rotation coupling this project wanted trained explicitly.
+    # Curvature is set through path_scale (kappa ~ 1/scale for these curves).
+
+    def _init_speed_grid(self):
+        g = self.path_cfg.get("speed_grid") or {}
+        self.grid_on = bool(g.get("enabled", False))
+        if not self.grid_on:
+            return
+        self.grid_speeds = torch.tensor(g.get("speeds", [0.3, 0.6, 0.9, 1.2, 1.5, 1.8]),
+                                        dtype=torch.float, device=self.device)
+        self.grid_curvs = torch.tensor(g.get("curvatures", [0.25, 0.4, 0.6, 0.8, 1.0]),
+                                       dtype=torch.float, device=self.device)
+        ns, nc = len(self.grid_speeds), len(self.grid_curvs)
+        self.grid_active = torch.zeros(ns, nc, dtype=torch.bool, device=self.device)
+        self.grid_active[0, 0] = True          # seed: slowest, straightest
+        self.env_cell = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.grid_success = torch.zeros(ns, nc, dtype=torch.float, device=self.device)
+        self.grid_trials = torch.zeros(ns, nc, dtype=torch.float, device=self.device)
+
+    def _sample_cells(self, k):
+        flat = self.grid_active.flatten().float()
+        idx = torch.multinomial(flat / flat.sum(), k, replacement=True)
+        nc = len(self.grid_curvs)
+        return idx, idx // nc, idx % nc
+
+    def _grid_report(self, env_ids):
+        """Promote neighbours of any cell the policy is now tracking well."""
+        if not self.grid_on or len(env_ids) == 0:
+            return
+        ok = (self.track_ok_steps[env_ids] /
+              self.track_steps[env_ids].clamp(min=1.0)) > float(
+                  self.path_cfg.get("speed_grid", {}).get("up_threshold", 0.8))
+        nc = len(self.grid_curvs)
+        cells = self.env_cell[env_ids]
+        self.grid_trials.view(-1).index_add_(0, cells, torch.ones_like(ok, dtype=torch.float))
+        self.grid_success.view(-1).index_add_(0, cells, ok.float())
+        won = cells[ok]
+        if won.numel() == 0:
+            return
+        si, ci = won // nc, won % nc
+        ns = len(self.grid_speeds)
+        # 4-neighbourhood, exactly as the paper expands into adjacent bins
+        for dsi, dci in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            s2, c2 = (si + dsi).clamp(0, ns - 1), (ci + dci).clamp(0, nc - 1)
+            self.grid_active[s2, c2] = True
 
     def _update_speed_curriculum(self, gap):
         p = self.path_cfg
+        if self.grid_on:
+            return   # the grid replaces the scalar level entirely
         if not p.get("speed_curriculum", False) or gap.numel() == 0:
             return
         target = float(p.get("keepup_gap_m", 2.0))
@@ -251,6 +406,45 @@ class GoalPoseV7(GoalPoseV3):
     def _update_goal_state(self):
         self._advance_paths()
         super()._update_goal_state()
+
+    # ---- instrumentation ----------------------------------------------------
+
+    def _compute_observations(self):
+        super()._compute_observations()
+        # Coverage audit (2026-07-27): three v7 intents had no measurement at
+        # all, so after a run there was no way to tell "the mechanism did
+        # nothing" from "the mechanism was never exercised".
+        e = self.extras.setdefault("v7", {})
+        if self.grid_on:
+            # Was the curriculum climbing, or stuck? A scalar level that never
+            # got logged could not answer that after the fact.
+            e["grid_cells_active"] = float(self.grid_active.sum().item())
+            e["grid_cells_total"] = float(self.grid_active.numel())
+            tried = self.grid_trials > 0
+            e["grid_success_rate"] = float(
+                (self.grid_success[tried] / self.grid_trials[tried]).mean().item()) if bool(tried.any()) else 0.0
+            act = self.grid_active.nonzero()
+            if act.numel():
+                e["grid_max_speed"] = float(self.grid_speeds[act[:, 0]].max().item())
+                e["grid_max_curv"] = float(self.grid_curvs[act[:, 1]].max().item())
+        if bool(self.is_path_env.any()):
+            e["path_lag_mean"] = float(self.path_lag[self.is_path_env].mean().item())
+
+        # Joint protection: a zero penalty is ambiguous -- it means either
+        # "well within limits" or "the term is switched off". Margin occupancy
+        # disambiguates, and is the number that maps to the hardware spec.
+        half = 0.5 * (self.dof_pos_limits[:, 1] - self.dof_pos_limits[:, 0])
+        mid = 0.5 * (self.dof_pos_limits[:, 1] + self.dof_pos_limits[:, 0])
+        e["dof_pos_occupancy"] = float(((self.dof_pos - mid).abs() / half.clamp(min=1e-6)).max(dim=-1)[0].mean().item())
+        e["torque_occupancy"] = float((self.torques.abs() / self.torque_limits.clamp(min=1e-6)).max(dim=-1)[0].mean().item())
+        e["torque_saturated"] = float((self.torques.abs() > 0.95 * self.torque_limits).float().mean().item())
+
+        # Symmetry: we finally switched the loss on, but had no way to check
+        # whether left/right actually became symmetric. This is the direct
+        # readout of armA's "left foot always slightly ahead" observation.
+        if hasattr(self, "feet_pos") and self.feet_pos.shape[1] >= 2:
+            fwd = self.feet_pos[:, 0, 0] - self.feet_pos[:, 1, 0]
+            e["feet_fwd_asymmetry"] = float(fwd.mean().item())
 
     # ---- 3. BT-flicker on the perceived goal --------------------------------
 

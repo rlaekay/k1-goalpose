@@ -217,7 +217,7 @@
     type="fixed">
     <origin
       xyz="0 0.077 0.1845"
-      rpy="0 0 0" />
+      rpy="0.00000 0.43633 0.00000" />
     <parent
       link="Trunk" />
     <child
@@ -275,7 +275,7 @@
     type="fixed">
     <origin
       xyz="0.0025 0.068 -0.0135"
-      rpy="-1.39626 0 0" />
+      rpy="-1.57080 0.00000 0.00000" />
     <parent
       link="Left_Arm_1" />
     <child
@@ -443,7 +443,7 @@
     type="fixed">
     <origin
       xyz="0 -0.077 0.1845"
-      rpy="0 0 0" />
+      rpy="0.00000 0.43633 0.00000" />
     <parent
       link="Trunk" />
     <child
@@ -501,7 +501,7 @@
     type="fixed">
     <origin
       xyz="0.0025 -0.068 -0.0135"
-      rpy="1.39626 0 0" />
+      rpy="1.57080 0.00000 0.00000" />
     <parent
       link="Right_Arm_1" />
     <child
