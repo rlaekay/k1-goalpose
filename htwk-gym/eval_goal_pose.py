@@ -53,7 +53,8 @@ from utils.runner import get_task_class
 
 
 # goal_categories mixture in envs/K1/*.yaml, as recorded by GoalPose._resample_goals
-CATEGORY_NAMES = {-1: "uniform", 0: "stand", 1: "straight", 2: "lateral", 3: "turn", 4: "combined"}
+CATEGORY_NAMES = {-1: "uniform", 0: "stand", 1: "straight", 2: "lateral", 3: "turn", 4: "combined",
+                  5: "path"}
 
 # start-distance bins [m] for the per-distance breakdown
 DISTANCE_BINS = [0.0, 0.25, 0.5, 1.0, 1.5, 2.0, float("inf")]
@@ -107,6 +108,98 @@ def _draw_line(img, x0, y0, x1, y1, color):
         x, y = int(x0 + (x1 - x0) * t), int(y0 + (y1 - y0) * t)
         if 0 <= y < h and 0 <= x < w:
             img[y, x] = color
+
+
+# 5x7 bitmap font, one entry per glyph = 7 row bitmaps (bit 4 = leftmost column).
+# Hand-rolled because the eval box has no cv2/PIL and the HUD must never be the
+# reason a video fails to render.
+_FONT = {
+    "0": (0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E),
+    "1": (0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E),
+    "2": (0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F),
+    "3": (0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E),
+    "4": (0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02),
+    "5": (0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E),
+    "6": (0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E),
+    "7": (0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08),
+    "8": (0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E),
+    "9": (0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C),
+    "A": (0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11),
+    "B": (0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E),
+    "C": (0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E),
+    "D": (0x1C, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1C),
+    "E": (0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F),
+    "F": (0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10),
+    "G": (0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F),
+    "H": (0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11),
+    "I": (0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E),
+    "K": (0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11),
+    "L": (0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F),
+    "M": (0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11),
+    "N": (0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11),
+    "O": (0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E),
+    "P": (0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10),
+    "R": (0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11),
+    "S": (0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E),
+    "T": (0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04),
+    "U": (0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E),
+    "V": (0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04),
+    "W": (0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11),
+    "X": (0x11, 0x0A, 0x04, 0x04, 0x04, 0x0A, 0x11),
+    "Y": (0x11, 0x0A, 0x04, 0x04, 0x04, 0x04, 0x04),
+    "Z": (0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F),
+    ".": (0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C),
+    ":": (0x00, 0x0C, 0x0C, 0x00, 0x0C, 0x0C, 0x00),
+    "-": (0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00),
+    "+": (0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00),
+    "/": (0x01, 0x02, 0x02, 0x04, 0x08, 0x08, 0x10),
+    "|": (0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04),
+    "*": (0x0C, 0x12, 0x12, 0x0C, 0x00, 0x00, 0x00),  # degree sign
+    " ": (0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00),
+}
+
+
+def _draw_text(img, x, y, text, color=(235, 235, 235), scale=2):
+    """Blit `text` at (x, y) top-left, `scale` pixels per font pixel."""
+    h, w = img.shape[:2]
+    cx = x
+    for ch in text.upper():
+        glyph = _FONT.get(ch)
+        if glyph is None:
+            cx += 6 * scale
+            continue
+        for row, bits in enumerate(glyph):
+            for col in range(5):
+                if not (bits >> (4 - col)) & 1:
+                    continue
+                px, py = cx + col * scale, y + row * scale
+                if 0 <= py < h and 0 <= px < w:
+                    img[py:py + scale, px:px + scale] = color
+        cx += 6 * scale
+    return cx
+
+
+def draw_telemetry_hud(frame, st, size=240, scale=2):
+    """Text HUD under the constellation inset: body velocity (the number the
+    MASTERPLAN speed target is stated in), goal distance, position error and the
+    external disturbance currently being applied. Without these on-screen there
+    is no way to tell a slow policy from a policy given a near goal."""
+    vx, vy, wz, dist, herr_deg, push_n, push_nm = st[4:11]
+    speed = float(np.hypot(vx, vy))
+    x0, y0 = 12, 8 + size + 8
+    lines = [
+        ("VEL  {:5.2f} M/S".format(speed), (120, 230, 255) if speed < 1.0 else (140, 255, 160)),
+        ("  VX {:+5.2f}  VY {:+5.2f}".format(vx, vy), (190, 190, 190)),
+        ("  WZ {:+5.2f} RAD/S".format(wz), (190, 190, 190)),
+        ("DIST {:5.2f} M".format(dist), (235, 235, 235)),
+        ("HEAD {:+6.1f}*".format(herr_deg), (235, 235, 235)),
+    ]
+    for i, (text, color) in enumerate(lines):
+        _draw_text(frame, x0, y0 + i * 9 * scale, text, color, scale)
+    y_push = y0 + len(lines) * 9 * scale
+    if push_n > 1e-3 or push_nm > 1e-3:
+        _draw_text(frame, x0, y_push, "PUSH {:4.1f}N {:4.1f}NM".format(push_n, push_nm), (255, 140, 120), scale)
+    return frame
 
 
 def draw_constellation_inset(frame, base_xy, base_yaw, goal_xy, goal_yaw, radius, size=240, span=3.0):
@@ -236,8 +329,13 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     instrumented = hasattr(env, "goal_start_pos") and hasattr(env, "goal_start_step")
 
     keys = ("pos_err", "head_err", "speed", "category", "start_dist", "duration_s",
-            "min_dist", "along", "cross")
+            "min_dist", "along", "cross", "peak_speed", "mean_speed")
     seg = {k: [] for k in keys}
+    # Whole-rollout body-speed histogram, over every env and every control step.
+    # The per-segment "final_speed" only says how well it stops; this says how
+    # fast it can actually go, which is the number the MASTERPLAN target is in.
+    speed_hist = np.zeros(400, dtype=np.int64)  # 0..4 m/s in 1 cm/s bins
+    speed_hist_max = 4.0
     fall_ctx = {k: [] for k in ("category", "goal_dist", "t_into_segment", "start_dist")}
     falls = 0
     censored = 0
@@ -246,6 +344,10 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
 
     # closest approach to the goal currently being pursued, per env
     min_dist = torch.full((env.num_envs,), float("inf"), device=env.device)
+    # peak and accumulated body speed within the segment currently in progress
+    peak_speed = torch.zeros(env.num_envs, device=env.device)
+    sum_speed = torch.zeros(env.num_envs, device=env.device)
+    n_speed = torch.zeros(env.num_envs, device=env.device)
 
     obs, _ = env.reset()
     obs = obs.to(device)
@@ -260,6 +362,13 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
         # goal_dist still refers to the segment in progress; fold it in before the
         # step can replace the goal.
         torch.minimum(min_dist, env.goal_dist, out=min_dist)
+        cur_speed = torch.norm(env.root_states[:, 7:9], dim=-1)
+        torch.maximum(peak_speed, cur_speed, out=peak_speed)
+        sum_speed += cur_speed
+        n_speed += 1.0
+        np.add.at(speed_hist,
+                  np.clip((cur_speed.cpu().numpy() / speed_hist_max * len(speed_hist)).astype(int),
+                          0, len(speed_hist) - 1), 1)
 
         # Everything a terminated env needs must be snapshotted here: _reset_idx()
         # runs inside step() and zeroes base_pos/episode_length_buf for fallen envs,
@@ -308,6 +417,8 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
             seg["head_err"].extend(h.cpu().tolist())
             seg["speed"].extend(v.cpu().tolist())
             seg["min_dist"].extend(torch.minimum(min_dist[ids], d).cpu().tolist())
+            seg["peak_speed"].extend(peak_speed[ids].cpu().tolist())
+            seg["mean_speed"].extend((sum_speed[ids] / n_speed[ids].clamp(min=1.0)).cpu().tolist())
 
             if instrumented:
                 approach = goal_xy - prev_start_pos[ids]
@@ -333,17 +444,32 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
                 seg["start_dist"].extend(nan_list)
                 seg["duration_s"].extend(nan_list)
 
-        # reset the closest-approach tracker for every env that got a new goal
+        # reset the per-segment trackers for every env that got a new goal
         if changed.any() or done.any():
-            min_dist[changed | done] = float("inf")
+            stale = changed | done
+            min_dist[stale] = float("inf")
+            peak_speed[stale] = 0.0
+            sum_speed[stale] = 0.0
+            n_speed[stale] = 0.0
 
         if not video_done:
             _, _, yaw_all = get_euler_xyz(env.base_quat[0:1])
+            push_n = push_nm = 0.0
+            if hasattr(env, "pushing_forces") and hasattr(env, "base_indice"):
+                push_n = float(torch.norm(env.pushing_forces[0, env.base_indice, :]).item())
+                push_nm = float(torch.norm(env.pushing_torques[0, env.base_indice, :]).item())
             overlay_states.append((
                 env.base_pos[0, :2].cpu().numpy().copy(),
                 float(wrap(yaw_all)[0].item()),
                 env.goal_pos_world[0].cpu().numpy().copy(),
                 float(env.goal_heading_world[0].item()),
+                float(env.base_lin_vel[0, 0].item()),
+                float(env.base_lin_vel[0, 1].item()),
+                float(env.base_ang_vel[0, 2].item()),
+                float(env.goal_dist[0].item()),
+                float(np.degrees(env.heading_error[0].item())),
+                push_n,
+                push_nm,
             ))
             if (step_i + 1) * env.dt >= record_video_s:
                 env.cfg["viewer"]["record_video"] = False  # stop accumulating frames (memory)
@@ -368,6 +494,8 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     out["total_steps"] = total_steps
     out["instrumented"] = instrumented
     out["overlay_states"] = overlay_states
+    out["speed_hist"] = speed_hist
+    out["speed_hist_max"] = speed_hist_max
     return out
 
 
@@ -527,6 +655,32 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
         }
     else:
         results["feasibility"] = None
+
+    # ---- body speed -------------------------------------------------------
+    # The MASTERPLAN speed target is stated as a body velocity, but every metric
+    # above is an error in metres. Without this block a policy that is merely
+    # never ASKED to walk fast is indistinguishable from one that CANNOT.
+    hist = roll.get("speed_hist")
+    if hist is not None and hist.sum() > 0:
+        edges = np.arange(len(hist)) * (roll["speed_hist_max"] / len(hist))
+        cdf = np.cumsum(hist) / hist.sum()
+
+        def _hpct(p):
+            return float(edges[int(np.searchsorted(cdf, p / 100.0))]) if p / 100.0 <= cdf[-1] else float(edges[-1])
+
+        occupied = np.nonzero(hist)[0]
+        peaks = roll.get("peak_speed", np.array([]))
+        results["body_speed"] = {
+            "median": _hpct(50), "p90": _hpct(90), "p99": _hpct(99),
+            "max_instant": float(edges[occupied[-1]]) if len(occupied) else float("nan"),
+            "share_above_0p5": float(hist[edges >= 0.5].sum() / hist.sum()),
+            "share_above_1p0": float(hist[edges >= 1.0].sum() / hist.sum()),
+            "segment_peak_median": _median(peaks) if len(peaks) else float("nan"),
+            "segment_peak_p90": _pct(peaks, 90) if len(peaks) else float("nan"),
+            "segment_peak_max": float(np.max(peaks)) if len(peaks) else float("nan"),
+        }
+    else:
+        results["body_speed"] = None
 
     # ---- per goal category ----------------------------------------------
     cats = roll["category"]
@@ -782,6 +936,33 @@ def render_report(r):
             "모든 수치 기준 충족" if r["all_gates_pass"] else "미충족 수치 있음"))
     md.append("")
 
+    bs = r.get("body_speed")
+    if bs:
+        md.append("## 몸통 속도 (body velocity)")
+        md.append("")
+        md.append("위의 오차 지표는 전부 '거리'다. 속도를 따로 보지 않으면 **느린 정책**과 "
+                  "**빠르게 갈 이유가 없었던 정책**을 구분할 수 없다. 아래는 전 env·전 스텝의 "
+                  "|v_xy| 분포다.")
+        md.append("")
+        md += _table(
+            ["지표", "값"],
+            [["median", "{:.2f} m/s".format(bs["median"])],
+             ["p90", "{:.2f} m/s".format(bs["p90"])],
+             ["p99", "{:.2f} m/s".format(bs["p99"])],
+             ["순간 최대", "{:.2f} m/s".format(bs["max_instant"])],
+             ["구간 최고속도 median", "{:.2f} m/s".format(bs["segment_peak_median"])],
+             ["구간 최고속도 p90", "{:.2f} m/s".format(bs["segment_peak_p90"])],
+             ["구간 최고속도 최대", "{:.2f} m/s".format(bs["segment_peak_max"])],
+             ["0.5 m/s 초과 시간 비율", "{:.1f}%".format(bs["share_above_0p5"] * 100)],
+             ["1.0 m/s 초과 시간 비율", "{:.1f}%".format(bs["share_above_1p0"] * 100)]])
+        md.append("")
+        if bs["share_above_1p0"] < 0.01:
+            md.append("> ⚠️ 1.0 m/s를 넘긴 시간이 {:.1f}%다. 목표 속도(1.3~1.5 m/s)를 학습·측정하려면 "
+                      "**목표 샘플링이 그 속도를 요구해야 한다** — 아래 실현가능성 표의 '필요속도'를 "
+                      "함께 볼 것. 필요속도 p90이 0.3 m/s 수준이면 이 수치는 정책의 한계가 아니라 "
+                      "과제의 한계다.".format(bs["share_above_1p0"] * 100))
+            md.append("")
+
     feas = r.get("feasibility")
     if feas:
         md.append("## 과제 실현가능성 점검")
@@ -901,10 +1082,12 @@ def write_outputs(out_dir, results, roll, report_md, env=None, cfg=None):
     with open(os.path.join(out_dir, "segments.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["pos_err_m", "heading_err_deg", "final_speed_mps", "category",
-                    "start_dist_m", "duration_s", "min_dist_m", "along_err_m", "cross_err_m"])
+                    "start_dist_m", "duration_s", "min_dist_m", "along_err_m", "cross_err_m",
+                    "peak_speed_mps", "mean_speed_mps"])
         rows = zip(roll["pos_err"], np.degrees(roll["head_err"]), roll["speed"],
                    roll["category"], roll["start_dist"], roll["duration_s"],
-                   roll["min_dist"], roll["along"], roll["cross"])
+                   roll["min_dist"], roll["along"], roll["cross"],
+                   roll["peak_speed"], roll["mean_speed"])
         for row in rows:
             w.writerow([CATEGORY_NAMES.get(int(c), c) if i == 3 else "{:.4f}".format(c)
                         for i, c in enumerate(row)])
@@ -917,8 +1100,11 @@ def write_outputs(out_dir, results, roll, report_md, env=None, cfg=None):
         video_path = os.path.join(out_dir, "rollout_env0.mp4")
         with imageio.get_writer(video_path, fps=int(1.0 / env.dt)) as writer:
             for frame, st in zip(env.camera_frames, roll["overlay_states"]):
-                writer.append_data(draw_constellation_inset(frame.copy(), st[0], st[1], st[2], st[3], radius))
-        print("video written (with constellation inset): {}".format(video_path))
+                f = draw_constellation_inset(frame.copy(), st[0], st[1], st[2], st[3], radius)
+                if len(st) >= 11:
+                    f = draw_telemetry_hud(f, st)
+                writer.append_data(f)
+        print("video written (constellation inset + velocity/disturbance HUD): {}".format(video_path))
 
 
 # --------------------------------------------------------------------------

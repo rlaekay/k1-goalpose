@@ -1,0 +1,465 @@
+basic:
+  checkpoint: null # set to a ParameterWalk .pth path (or -1) to warm-start
+  headless: true
+  max_iterations: 20000 # set the maximum number of learning iterations to train for
+  sim_device: "cuda:0" # device for physics simulation
+  rl_device: "cuda:0" # device for the RL algorithm
+  seed: 42 # seed - set to -1 to choose random seed
+  description: "v7_ultimate"
+  debug_feet_offset: false # enable debug print for feet_x_offset in play mode
+  task: "K1/Goal_Pose_V7"
+
+env:
+  num_envs: 4096
+  num_observations: 54
+  num_privileged_obs: 14
+  num_actions: 12
+  env_spacing: 1.  # not used with plane terrain
+
+runner:
+  horizon_length: 24
+  mini_epochs: 5   # was 20; rsl_rl/legged_gym standard is 5 learning epochs -- 4x less
+                   # learning-phase compute per iteration (2026-07-24, see MASTERPLAN)
+  save_interval: 100
+  num_minibatches: 4   # rsl_rl convention (v3 stack)
+  use_wandb: false
+
+viewer:
+  pos: [3., -3., 2.]  # [m]
+  lookat: [0., 0., 0.]  # [m]
+  record_video: false  # only in play
+  record_interval: 5.  # [s]
+  record_env_idx: 0
+
+algorithm:
+  learning_rate: 5.e-6
+  gamma: 0.995
+  lam: 0.95
+  bound_coef: 1.0
+  entropy_coef: -0.01
+  symmetric_coef: 10.
+  desired_kl: 0.01
+  symmetry_coef: 0.5   # RunnerV3 L/R mirror loss (user request: symmetric loss)
+
+sim:
+  dt: 0.002
+  substeps: 1
+  up_axis: "z"
+  gravity: [0.0, 0.0, -9.81]
+  physics_engine: "physx" # "physx" or "flex"
+  physx:
+    num_threads: 4 # Number of worker threads per scene used by PhysX - for CPU PhysX only.
+    solver_type: 1 # 0: pgs, 1: tgs
+    num_position_iterations: 4
+    num_velocity_iterations: 0  # TGS solver only needs position iterations (velocity
+                                 # iterations reduce stiffness/convergence for TGS, per
+                                 # Isaac Gym tuning docs) -- 2026-07-24, see MASTERPLAN
+    contact_offset: 0.02
+    rest_offset: 0.0
+    bounce_threshold_velocity: 0.2
+    max_depenetration_velocity: 100.0
+    default_buffer_size_multiplier: 5.0
+    max_gpu_contact_pairs: 8388608 # 8*1024*1024
+    num_subscenes: 4 # Splits the simulation into N physics scenes and runs each one in a separate thread
+    contact_collection: 1 # 0: CC_NEVER (don't collect contact info), 1: CC_LAST_SUBSTEP (collect only contacts on last substep), 2: CC_ALL_SUBSTEPS (broken - do not use!)
+
+asset:
+  file: "resources/K1/K1_locomotion_armsdown.urdf"
+  name: "K1"
+  base_name: "Trunk"
+  foot_names: ["left_foot_link", "right_foot_link"]
+  disable_gravity: false
+  default_dof_drive_mode: 3 # see GymDofDriveModeFlags (0 is none, 1 is pos tgt, 2 is vel tgt, 3 effort)
+  collapse_fixed_joints: true # bug: if collapse_fixed_joints = false, foot doesn't collide with ground
+  fix_base_link: false # fix the base of the robot
+  self_collisions: 0 # 1 to disable, 0 to enable...bitwise filter
+  replace_cylinder_with_capsule: false # replace collision cylinders with capsules, leads to faster/more stable simulation
+  flip_visual_attachments: false # Some .obj meshes must be flipped from y-up to z-up
+  density: 0.001
+  angular_damping: 0.
+  linear_damping: 0.
+  max_angular_velocity: 1000.
+  max_linear_velocity: 1000.
+  armature: 0.
+  thickness: 0.01
+  feet_edge_pos: [[ 0.1215,  0.05, -0.03],
+                  [ 0.1215, -0.05, -0.03],
+                  [-0.1015,  0.05, -0.03],
+                  [-0.1015, -0.05, -0.03]] # x,y,z [m]
+
+init_state:
+  pos: [0.0, 0.0, 0.58] # x,y,z [m]
+  rot: [0.0, 0.0, 0.0, 1.0] # x,y,z,w [quat]
+  lin_vel: [0.0, 0.0, 0.0]  # x,y,z [m/s]
+  ang_vel: [0.0, 0.0, 0.0]  # x,y,z [rad/s]
+  default_joint_angles: {"Hip_Pitch": -0.2, "Knee_Pitch": 0.4, "Ankle_Pitch": -0.25, "default": 0.} # target angles when action = 0.0
+
+control:
+  stiffness: {"Hip": 100., "Knee": 100., "Ankle": 50.} # [N*m/rad]
+  damping: {"Hip": 2., "Knee": 2., "Ankle": 1.} # [N*m*s/rad]
+  action_scale: 1.
+  decimation: 10
+
+terrain:
+  type: "plane" # "plane" or "trimesh" -- MASTERPLAN scope: flat ground only
+  static_friction: 1.0  # [-]
+  dynamic_friction: 1.0  # [-]
+  restitution: 0.        # [-]
+  # trimesh only:
+  terrain_length: 10.
+  terrain_width: 10.
+  border_size: 5.
+  num_terrains: 8
+  terrain_proportions: [0.0, 0.0, 0.5, 0.5] # terrain types: [plane, slope, random, discrete]
+  slope: 0.1
+  random_height: 0.1
+  discrete_height: 0.02
+  horizontal_scale: 0.1
+  vertical_scale: 0.005
+  slope_threshold: 2.0
+
+commands:
+  num_commands: 10                     # goal_dx, goal_dy, heading_error, freq, yawL, yawR, pitch, roll, offset_x, offset_y
+  command_order: [goal_rel_x, goal_rel_y, heading_error, gait_frequency,
+                  foot_yaw_L, foot_yaw_R, body_pitch_target, body_roll_target, feet_offset_x_target, feet_offset_y_target]
+
+  # Goal sampled in the robot's local frame at resample time (MASTERPLAN §범위 고정)
+  goal_dx: [-2.0, 2.0]       # [m]
+  goal_dy: [-1.5, 1.5]       # [m]
+  goal_dtheta: [-3.14159265, 3.14159265]  # [rad]
+  resampling_time_s: [4., 8.]
+
+  # "No More Marching" goal-type mixture (paper Table: stand 0.1 / straight 0.2 /
+  # lateral 0.2 / turn 0.2 / combined 0.3). enabled=false -> uniform sampling (v0).
+  # stand goals also zero the gait clock, disabling the feet_swing stepping incentive.
+  goal_categories:
+    enabled: true
+    stand: 0.1
+    straight: 0.2
+    lateral: 0.2
+    turn: 0.2
+    combined: 0.3
+
+  # ---- v7: goal mode mixture -------------------------------------------
+  # waypoint = the armA-D task (fixed goal, resampled every 4-8 s). Its measured
+  # required speed was median 0.116 / max 0.574 m/s over 4647 segments, so it can
+  # never teach or measure a 1.3 m/s walk. path = a lookahead point that ADVANCES
+  # along a curve at a commanded speed, which is what creates a speed demand.
+  goal_mode_mixture:
+    waypoint: 0.5
+    path: 0.5
+
+  path:
+    shapes: [0, 1, 2, 3, 4]      # figure8, circle, spiral, rose/star, wander
+    scale_m: [1.5, 4.0]          # curve size
+    lookahead_m: [0.5, 3.0]      # user request: A* lookahead band
+    lookahead_max_m: 3.5         # leash: goal never runs further ahead than this
+    speed_range_mps: [0.3, 1.6]  # commanded path speed; top end scaled by curriculum
+    speed_curriculum: true
+    speed_init: 0.4              # level in [speed_min_level, 1] -> top speed
+    speed_min_level: 0.1
+    speed_step: 0.05
+    keepup_gap_m: 2.0            # "keeping up" = lookahead gap stays under this
+    up_threshold: 0.8
+    down_threshold: 0.5
+    ema: 0.995
+    adjust_every_steps: 500
+
+  gait_frequency: [1.8, 2.4] # widened: a 1.3 m/s walk needs cadence headroom
+
+  # Style commands inherited from ParameterWalk's slots; fixed to neutral (min==max)
+  # so warm-started behavior stays close to upright walking. Widen these again in
+  # milestone 3 if style diversity is wanted.
+  foot_yaw_L:         [0.0, 0.0]     # [rad]
+  foot_yaw_R:         [0.0, 0.0]     # [rad]
+  body_pitch_target:  [0.0, 0.0]     # [rad]
+  body_roll_target:   [0.0, 0.0]     # [rad]
+  feet_offset_x_target: [0.0, 0.0]   # [m]
+  feet_offset_y_target: [0.0, 0.0]   # [m]
+
+  curriculum: false
+  # v3's success-adaptive curriculum shrinks goal DISTANCE, which REDUCES the
+  # speed demand as the policy improves -- the opposite of what v7 needs. Off.
+  goal_curriculum:
+    enabled: false
+    init_level: 1.0
+    min_level: 0.2
+    step: 0.05
+    up_threshold: 0.7
+    down_threshold: 0.4
+    success_pos_m: 0.25
+    success_heading_rad: 0.35
+    ema: 0.98
+    adjust_every_steps: 500
+  # Unused while curriculum is false, but base_task._init_buffers sizes
+  # curriculum_prob from these unconditionally -- keep them defined.
+  lin_vel_levels: 10
+  ang_vel_levels: 10
+
+normalization:
+  gravity: 1.0
+  lin_vel: 1.0              # used for privileged_obs base_lin_vel channel
+  ang_vel: 1.0               # used for the raw base_ang_vel obs channel
+  goal_pos: 0.5               # scales commands[0:2] (Δx up to 2m, Δy up to 1.5m) toward ~[-1,1]
+  goal_heading: 0.31831       # = 1/pi, scales commands[2] (heading_error, already in [-pi,pi]) to [-1,1]
+  gait_frequency: 1.0
+  foot_yaw: 1.0
+  body_pitch_target: 1.0          # [rad] stays in rad
+  body_roll_target:  1.0          # [rad] stays in rad
+  feet_offset_x_target: 1.0       # [m] stays in meters
+  feet_offset_y_target: 1.0       # [m] stays in meters
+  dof_pos: 1.0
+  dof_vel: 0.1
+  filter_weight: 0.1
+  push_force: 0.1
+  push_torque: 0.5
+  clip_actions: 1.
+
+noise:
+  # BT/perception goal model (sim2real): on the real robot goal_rel_x/y and
+  # heading_error come from vision/localization/odometry, not an instant noiseless
+  # read. These noise the OBSERVATION only (rewards read ground-truth goal_dist/
+  # heading_error) -- see _update_perceived_goal() in goal_pose.py. All [0,0]/off
+  # here = v1 behavior (instant noiseless read); v2 arms turn these up.
+  goal_pos:                # per-step jitter, [mean, std] gaussian, meters
+    range: [0., 0.04]
+    operation: "additive"
+    distribution: "gaussian"
+  goal_heading:             # per-step jitter, [mean, std] gaussian, radians
+    range: [0., 0.04]
+    operation: "additive"
+    distribution: "gaussian"
+  goal_pos_bias:             # per-goal-segment systematic bias (resampled on each new goal), meters
+    range: [0., 0.05]
+    operation: "additive"
+    distribution: "gaussian"
+  goal_heading_bias:         # per-goal-segment systematic bias, radians
+    range: [0., 0.05]
+    operation: "additive"
+    distribution: "gaussian"
+  goal_obs_hold_steps: [2, 3]  # camera ~20fps vs 50Hz control (armD/v3 setting, kept)
+  # Rare, LARGE, discrete jumps of the perceived goal: a behaviour-tree branch
+  # flip or a ball re-detection MOVES the goal, it does not nudge it. Reward
+  # still reads ground truth, so this trains filtering, not chasing.
+  goal_bt_flicker:
+    prob_per_step: 0.004       # ~1 flicker per 5 s at 50 Hz
+    radius_m: 1.0
+    heading_rad: 0.5
+                                # randint per env); [0,0] = refresh every step (50Hz, v1 behavior).
+                                # Camera is ~20fps per K1 manual vs 50Hz control -> try [2,3].
+  gravity:
+    range: [0., 0.01]
+    operation: "additive"
+    distribution: "gaussian"
+  lin_vel:
+    range: [0., 0.05]
+    operation: "additive"
+    distribution: "gaussian"
+  ang_vel:
+    range: [0., 0.1]
+    operation: "additive"
+    distribution: "gaussian"
+  dof_pos:
+    range: [0., 0.01]
+    operation: "additive"
+    distribution: "gaussian"
+  dof_vel:
+    range: [0., 0.1]
+    operation: "additive"
+    distribution: "gaussian"
+  height:
+    range: [0., 0.02]
+    operation: "additive"
+    distribution: "gaussian"
+
+randomization:
+  init_dof_pos:
+    range: [0., 0.05]
+    operation: "additive"
+    distribution: "gaussian"
+  init_base_pos_xy:
+    range: [-1., 1.]
+    operation: "additive"
+    distribution: "uniform"
+  init_base_lin_vel_xy:
+    range: [0., 0.1]
+    operation: "additive"
+    distribution: "gaussian"
+
+  kick_interval_s: 4.
+  kick_lin_vel:
+    range: [0., 0.15]
+    operation: "additive"
+    distribution: "gaussian"
+  kick_ang_vel:
+    range: [0., 0.04]
+    operation: "additive"
+    distribution: "gaussian"
+
+  # ---- v7: two-class disturbance ---------------------------------------
+  # Robot mass 18.71 kg (URDF). Two identical robots colliding have reduced mass
+  # m1*m2/(m1+m2) = 9.36 kg; at 1.0 m/s closing speed that is a 9.4 N*s impulse,
+  # which over a 0.1 s contact is ~94 N -- 6x the old 15 N push but 10x shorter.
+  # An off-centre hit at a ~0.15 m moment arm adds ~14 N*m. Modelled separately
+  # from a human holding the robot (gentle, seconds long).
+  disturbance:
+    enabled: true
+    interval_s: [3.0, 8.0]       # per-env, independent (base task pushed all envs at once)
+    collision_share: 0.5
+    collision:
+      force_n: [40., 150.]
+      torque_nm: [3., 20.]
+      duration_s: [0.05, 0.15]
+    support:
+      force_n: [3., 15.]
+      torque_nm: [0.2, 2.]
+      duration_s: [1.5, 3.0]
+
+  push_interval_s: 5.
+  push_duration_s: 1.
+  push_force:
+    range: [0., 15.]
+    operation: "additive"
+    distribution: "gaussian"
+  push_torque:
+    range: [0., 2.]
+    operation: "additive"
+    distribution: "gaussian"
+
+  dof_stiffness:
+    range: [0.95, 1.05]
+    operation: "scaling"
+    distribution: "uniform"
+  dof_damping:
+    range: [0.95, 1.05]
+    operation: "scaling"
+    distribution: "uniform"
+  dof_friction:
+    range: [0.0, 2.0]
+    operation: "additive"
+    distribution: "uniform"
+
+  friction:
+    range: [0.1, 2.0]
+    operation: "additive"
+    distribution: "uniform"
+  compliance:
+    range: [0.5, 1.5]
+    operation: "additive"
+    distribution: "uniform"
+  restitution:
+    range: [0.1, 0.9]
+    operation: "additive"
+    distribution: "uniform"
+
+  base_com:
+    range: [-0.1, 0.1]
+    operation: "additive"
+    distribution: "uniform"
+  base_mass:
+    range: [0.8, 1.2]
+    operation: "scaling"
+    distribution: "uniform"
+  other_com:
+    range: [-0.005, 0.005]
+    operation: "additive"
+    distribution: "uniform"
+  other_mass:
+    range: [0.98, 1.02]
+    operation: "scaling"
+    distribution: "uniform"
+
+rewards:
+  scales:
+    survival: 0.25
+    # v1 (2026-07-23 사용자 결정): constellation 단독 — v0의 덧셈 분리 보상은 0으로 보존
+    goal_position: 0.
+    goal_heading: 0.
+    goal_stop: 0.
+    base_height: -20.
+    foot_yaw_L:            -1.0
+    foot_yaw_R:            -1.0
+    orientation: -20.
+    torques: -3.e-4
+    torque_tiredness: -1.e-2
+    power: -3.e-3
+    lin_vel_z: -2.
+    ang_vel_xy: -0.2
+    dof_vel: -2.e-4
+    dof_acc: -2.e-7
+    root_acc: -1.e-4
+    action_rate: -1.5
+    dof_pos_limits: -1.
+    dof_vel_limits: -0.
+    torque_limits: -0.
+    collision: -1.
+    feet_slip: -0.1
+    feet_vel_z: -0.
+    feet_yaw_diff: -0.5
+    feet_yaw_mean: -0.5
+    feet_roll: -0.2
+    feet_pitch: -0.1
+    feet_offset_x: -0.        # disabled at milestone 2 (was velocity-scaled by old vx/vy command; see MASTERPLAN log)
+    feet_offset_y: -0.        # disabled at milestone 2
+    feet_swing: 3.
+    # --- modular goal-reward alternatives, swap in by setting nonzero scales ---
+    constellation: 3.5        # paper-faithful unified pos+heading kernel ("No More Marching" arXiv:2508.14098)
+    goal_progress: 0.         # potential-based, + for closing distance [m/s]; dense far-field gradient
+    goal_reached: 1.0        # armB's ONE lever; A vs B = 7.6cm -> 3.9cm, 13.9% -> 52.8% strict
+    heading_near_goal: 0.     # heading reward gated to near-goal region; alternative to global goal_heading
+    stand_posture: -1.0       # softer than armD's -2.0; keeps the RLKick handoff stance
+    # --- v7 joint/actuator protection (margin-based, zero inside the normal band) ---
+    dof_pos_margin: -0.5
+    dof_vel_margin: -0.02
+    torque_margin: -0.002
+    electrical_power: -2.e-3
+  episode_length_s: 30.
+  terminate_height: 0.35
+  terminate_vel: 50.
+  terminate_contacts_on: []
+  penalize_contacts_on: ["Trunk", "H1", "H2", "AL", "AR", "Waist", "Hip", "Shank", "Ankle"]
+  only_positive_rewards: true # if true negative total rewards are clipped at zero (avoids early termination problems)
+  base_height_target: 0.52
+  soft_dof_pos_limit: 1. # percentage of urdf limits, values above this limit are penalized
+  soft_dof_vel_limit: 1.
+  soft_torque_limit: 1.
+  swing_period: 0.2
+  feet_distance_ref: 0.18
+  final_window_s: 0.0          # v3 Rudin timed gate; 0 = off
+
+  # Goal-pose reward shaping (MASTERPLAN §성공 기준: median <=5cm/10cm p90, heading <=10deg)
+  goal_position_sigma: 1.0   # exp(-dist^2/sigma), dist in meters
+  goal_heading_sigma: 0.4    # exp(-heading_error^2/sigma), error in radians
+  goal_reach_radius: 0.1     # [m] radius inside which goal_stop penalty activates
+
+  # params for the modular alternatives (only used if their scales are nonzero)
+  constellation_weight: 0.2    # w_c from the paper (exp(-w_c * d_con))
+  constellation_radius: 1.0    # [m] constellation circle radius; r^2 sets heading-vs-position coupling
+  goal_progress_clip: 1.0      # [m/s] clip for goal_progress (robustness to kicks/resets)
+  stop_speed_threshold: 0.1    # [m/s] "stopped" threshold for goal_reached
+  heading_gate_sigma: 0.25     # [m^2] distance-gate width for heading_near_goal
+  stand_posture_radius: 0.3    # [m] inside this goal distance, stand_posture penalty activates
+
+  # v7 protection: penalties start at this fraction of the hard limit, not AT it
+  protect_pos_frac: 0.85
+  protect_vel_frac: 0.85
+  protect_torque_frac: 0.85
+  copper_loss_coef: 0.02       # I^2R proxy weight in electrical_power
+
+  # feet_offset_x/y velocity-scaling reference speeds (used only if those scales are re-enabled)
+  feet_offset_vel_scale_x: 0.6  # [m/s]
+  feet_offset_vel_scale_y: 0.3  # [m/s]
+
+evaluation:
+  # defaults for eval_goal_pose.py (CLI flags override)
+  num_envs: 256
+  duration_s: 120.
+  # Sustained walking speed treated as achievable when checking whether a goal was
+  # reachable at all in the time before the next resample (start_dist / segment_s).
+  # Diagnostic only -- the gates below are always judged on ALL segments.
+  feasible_speed_mps: 0.6
+  gates:                     # MASTERPLAN §성공 기준
+    pos_median_m: 0.05
+    pos_p90_m: 0.10
+    heading_median_deg: 10.
+    max_falls: 0
