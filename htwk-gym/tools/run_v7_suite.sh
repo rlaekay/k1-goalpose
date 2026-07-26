@@ -43,6 +43,23 @@ if [ ! -f "$CKPT" ]; then
   exit 1
 fi
 
+# ---- rebuild this shell's environment inside each tmux window ---------------
+# A tmux window does NOT inherit the launching shell's environment: if a tmux
+# server is already running, new windows get the environment that server was
+# started with. That server predates the conda activation, so isaacgym dies with
+# "libpython3.8.so.1.0: cannot open shared object file" -- while the smoke test,
+# run directly in this shell, passes. Reconstruct the env explicitly.
+ENV_PRELUDE=""
+if [ -n "${CONDA_PREFIX:-}" ]; then
+  CONDA_BASE="$(conda info --base 2>/dev/null || echo "${CONDA_PREFIX%/envs/*}")"
+  ENV_NAME="${CONDA_DEFAULT_ENV:-$(basename "$CONDA_PREFIX")}"
+  ENV_PRELUDE="source '$CONDA_BASE/etc/profile.d/conda.sh' && conda activate '$ENV_NAME' && export LD_LIBRARY_PATH='$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}' &&"
+  echo "conda 환경 '$ENV_NAME'을 각 tmux 창에서 재활성화합니다."
+else
+  echo "!!! conda 환경이 활성화돼 있지 않습니다. 'conda activate k1goalpose' 후 다시 실행하십시오." >&2
+  exit 1
+fi
+
 # ---- gate 1: does the v7 machinery actually work? --------------------------
 if [ "$SKIP_SMOKE" != "1" ]; then
   echo "=== [1/3] 스모크 테스트 (v7은 아직 한 번도 실행된 적이 없음) ==="
@@ -71,7 +88,7 @@ fi
 
 launch() {  # name gpu
   local name=$1 gpu=$2
-  local cmd="cd $REPO_ROOT && TRAIN=train_v7.py STRESS=1 VIDEO_S=$VIDEO_S \
+  local cmd="$ENV_PRELUDE cd $REPO_ROOT && TRAIN=train_v7.py STRESS=1 VIDEO_S=$VIDEO_S \
 bash tools/train_and_eval.sh cuda:$gpu cuda:$gpu -- \
 --task=K1/Goal_Pose_V7 --config sweeps/$name.yaml --headless True \
 --checkpoint $CKPT --num_envs $ENVS --max_iterations $ITERS \
@@ -89,6 +106,33 @@ launch E0_armB_armsdown 0
 launch E1_path          0
 launch E2_robust        1
 launch V7_full          1
+
+# ---- verify they are actually alive ----------------------------------------
+# Previously this script announced "4개 실행 중" the instant tmux accepted the
+# windows, which it does even when every process dies on the first import.
+WAIT="${HEALTHCHECK_S:-90}"
+echo ""
+echo "기동 확인 중 (${WAIT}s)..."
+sleep "$WAIT"
+
+DEAD=""
+for name in E0_armB_armsdown E1_path E2_robust V7_full; do
+  pane_pid=$(tmux list-panes -t "$SESSION:$name" -F '#{pane_pid}' 2>/dev/null | head -1)
+  if [ -n "$pane_pid" ] && pgrep -P "$pane_pid" -f python >/dev/null 2>&1 \
+     || ([ -n "$pane_pid" ] && pstree -p "$pane_pid" 2>/dev/null | grep -q python); then
+    echo "  ✅ $name  살아 있음"
+  else
+    echo "  ❌ $name  죽었음"
+    DEAD="$DEAD $name"
+  fi
+done
+
+if [ -n "$DEAD" ]; then
+  echo "" >&2
+  echo "!!! 죽은 arm:$DEAD" >&2
+  echo "    마지막 출력 확인:  tmux capture-pane -p -t $SESSION:<이름> | tail -30" >&2
+  exit 1
+fi
 
 echo ""
 echo "완료. 4개 실행 중 (GPU당 2개)."
