@@ -46,7 +46,12 @@ LOGFILE=$(mktemp)
 trap 'rm -f "$LOGFILE"' EXIT
 
 echo "=== 학습 시작: python $TRAIN $* ==="
-python "$TRAIN" "$@" 2>&1 | tee "$LOGFILE"
+# -u: Python fully buffers stdout (~8 KB) whenever it isn't a tty, which a pipe
+# into `tee` always triggers. Short per-iteration prints then sit unflushed for
+# hundreds of iterations, so a live tmux pane looks stalled while GPU-Util sits
+# at 95% -- training is fine, only the console feedback is delayed. -u forces
+# line buffering so `tmux capture-pane` reflects reality within one print.
+python -u "$TRAIN" "$@" 2>&1 | tee "$LOGFILE"
 
 # The run dir is whatever the trainer last saved into; parsing its own log avoids
 # guessing at timestamped directory names.
