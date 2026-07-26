@@ -87,9 +87,17 @@ class GoalPoseV7(GoalPoseV3):
         self.keepup_ema = 0.0
         self._last_speed_adjust = 0
         # disturbance state (per-env timers)
+        # In path mode the goal moves EVERY step, so eval_goal_pose.py's "did
+        # goal_pos_world change?" test would close a segment on every control
+        # step. Publish an explicit segment counter it can use instead.
+        self.goal_segment_id = torch.zeros(n, dtype=torch.long, device=dev)
         self.dist_steps_left = torch.zeros(n, dtype=torch.long, device=dev)
         self.dist_next = torch.zeros(n, dtype=torch.long, device=dev)
         self._init_disturbance_schedule()
+        # step() calls _update_goal_state() twice and _resample_goals() once, so an
+        # unguarded advance would run the path 3x per control step (i.e. 3x the
+        # commanded speed). Advance at most once per common_step_counter tick.
+        self._path_advanced_at = -1
 
     # ---- 1. path goal mode --------------------------------------------------
 
@@ -168,8 +176,9 @@ class GoalPoseV7(GoalPoseV3):
         the leash a robot that cannot keep up is handed an ever-receding target
         and the gradient dies; with it, falling behind simply parks the goal."""
         ids = self.is_path_env
-        if not bool(ids.any()):
+        if not bool(ids.any()) or self._path_advanced_at == self.common_step_counter:
             return
+        self._path_advanced_at = self.common_step_counter
         p = self.path_cfg
         du = 1.0e-3
         u0 = self.path_u
@@ -214,16 +223,22 @@ class GoalPoseV7(GoalPoseV3):
         super()._reset_idx(env_ids)
         if len(env_ids) == 0:
             return
-        # goal mode is fixed for the whole episode so eval can attribute cleanly
+        # goal mode is fixed for the whole episode so eval can attribute cleanly.
+        # The path itself is NOT rolled here: base _reset_idx zeroes both
+        # episode_length_buf and cmd_resample_time, so these envs are "due" in the
+        # _resample_goals call that follows, and rolling there uses a base_pos that
+        # has actually been refreshed from the new root state.
         self.is_path_env[env_ids] = torch.rand(len(env_ids), device=self.device) < self.path_share
-        self._reroll_paths(env_ids[self.is_path_env[env_ids]])
 
     def _resample_goals(self):
         # base samples a waypoint for every due env; path envs then have their
         # goal overwritten by _advance_paths. The resample event is reused as the
         # natural moment to re-roll path shape/speed/lookahead.
-        due = (self.episode_length_buf == self.cmd_resample_time) & self.is_path_env
+        all_due = self.episode_length_buf == self.cmd_resample_time
+        due = all_due & self.is_path_env
         super()._resample_goals()
+        if not getattr(self, "manual_control", False):
+            self.goal_segment_id[all_due] += 1
         ids = due.nonzero(as_tuple=False).flatten()
         if len(ids) > 0:
             self._reroll_paths(ids)

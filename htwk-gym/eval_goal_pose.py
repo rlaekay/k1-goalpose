@@ -327,6 +327,7 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     error is along or across the approach direction.
     """
     instrumented = hasattr(env, "goal_start_pos") and hasattr(env, "goal_start_step")
+    has_segment_id = hasattr(env, "goal_segment_id")
 
     keys = ("pos_err", "head_err", "speed", "category", "start_dist", "duration_s",
             "min_dist", "along", "cross", "peak_speed", "mean_speed")
@@ -375,6 +376,7 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
         # so post-step reads would describe the fresh episode, not the failure.
         prev_goal_pos = env.goal_pos_world.clone()
         prev_goal_heading = env.goal_heading_world.clone()
+        prev_segment_id = env.goal_segment_id.clone() if has_segment_id else None
         prev_goal_dist = env.goal_dist.clone()
         prev_len = env.episode_length_buf.clone()
         if instrumented:
@@ -403,7 +405,12 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
             fall_ctx["start_dist"].extend(
                 torch.norm(prev_goal_pos[fids] - prev_start_pos[fids], dim=-1).cpu().tolist())
 
-        changed = (env.goal_pos_world != prev_goal_pos).any(dim=1) | (env.goal_heading_world != prev_goal_heading)
+        if has_segment_id:
+            # v7's path mode moves the goal every step, so "the goal moved" no
+            # longer means "the segment ended"; the env tells us explicitly.
+            changed = env.goal_segment_id != prev_segment_id
+        else:
+            changed = (env.goal_pos_world != prev_goal_pos).any(dim=1) | (env.goal_heading_world != prev_goal_heading)
         completed = changed & ~done
         if completed.any():
             ids = completed.nonzero(as_tuple=False).flatten()
