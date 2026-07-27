@@ -1,0 +1,589 @@
+{
+  "date": "2026-07-27 09:16:44",
+  "run_dirs": [
+    "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full"
+  ],
+  "config": "envs/K1/Goal_Pose_V7.yaml",
+  "task": "K1/Goal_Pose_V7",
+  "num_envs": 256,
+  "seed": 0,
+  "tail_frac": 0.6,
+  "total_checkpoints": 120,
+  "candidates": [
+    {
+      "iteration": 4900,
+      "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_4900.pth"
+    },
+    {
+      "iteration": 5500,
+      "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_5500.pth"
+    },
+    {
+      "iteration": 6200,
+      "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_6200.pth"
+    },
+    {
+      "iteration": 6800,
+      "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_6800.pth"
+    },
+    {
+      "iteration": 7500,
+      "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_7500.pth"
+    },
+    {
+      "iteration": 8100,
+      "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_8100.pth"
+    },
+    {
+      "iteration": 8800,
+      "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_8800.pth"
+    },
+    {
+      "iteration": 9400,
+      "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_9400.pth"
+    },
+    {
+      "iteration": 10100,
+      "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_10100.pth"
+    },
+    {
+      "iteration": 10700,
+      "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_10700.pth"
+    },
+    {
+      "iteration": 11400,
+      "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_11400.pth"
+    },
+    {
+      "iteration": 12000,
+      "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_12000.pth"
+    }
+  ],
+  "stages": [
+    {
+      "duration_s": 20.0,
+      "n_candidates": 12,
+      "authoritative": false,
+      "entries": [
+        {
+          "iteration": 7500,
+          "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_7500.pth",
+          "run_dir": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full",
+          "segments": 747,
+          "pos_median": 0.40693968534469604,
+          "pos_p90": 0.7106718778610229,
+          "heading_median": 4.341227255325085,
+          "falls": 0,
+          "success_rate_strict": 0.01740294511378849,
+          "all_gates_pass": false,
+          "worst_ratio": 8.138793706893921,
+          "mean_ratio": 3.919908802759165,
+          "gate_ratios": {
+            "pos_median": 8.138793706893921,
+            "pos_p90": 7.106718778610229,
+            "heading_median": 0.43412272553250847,
+            "falls": 0.0
+          },
+          "ci95_pos_median": [
+            0.39166226983070374,
+            0.419769287109375
+          ],
+          "advanced": true
+        },
+        {
+          "iteration": 4900,
+          "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_4900.pth",
+          "run_dir": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full",
+          "segments": 731,
+          "pos_median": 0.41396668553352356,
+          "pos_p90": 0.6750460267066956,
+          "heading_median": 5.174701579363401,
+          "falls": 9,
+          "success_rate_strict": 0.03419972640218878,
+          "all_gates_pass": false,
+          "worst_ratio": 8.279333710670471,
+          "mean_ratio": 5.425803722016937,
+          "gate_ratios": {
+            "pos_median": 8.279333710670471,
+            "pos_p90": 6.750460267066956,
+            "heading_median": 0.5174701579363401,
+            "falls": 6.155950752393981
+          },
+          "ci95_pos_median": [
+            0.38578367233276367,
+            0.43412572145462036
+          ],
+          "advanced": true
+        },
+        {
+          "iteration": 6200,
+          "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_6200.pth",
+          "run_dir": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full",
+          "segments": 747,
+          "pos_median": 0.419222354888916,
+          "pos_p90": 0.6479439258575439,
+          "heading_median": 4.193476603199368,
+          "falls": 0,
+          "success_rate_strict": 0.025435073627844713,
+          "all_gates_pass": false,
+          "worst_ratio": 8.38444709777832,
+          "mean_ratio": 3.8208085041684243,
+          "gate_ratios": {
+            "pos_median": 8.38444709777832,
+            "pos_p90": 6.479439258575439,
+            "heading_median": 0.4193476603199368,
+            "falls": 0.0
+          },
+          "ci95_pos_median": [
+            0.4026398092508316,
+            0.4298918232321739
+          ],
+          "advanced": true
+        },
+        {
+          "iteration": 6800,
+          "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_6800.pth",
+          "run_dir": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full",
+          "segments": 747,
+          "pos_median": 0.433469295501709,
+          "pos_p90": 0.7210516929626465,
+          "heading_median": 4.621155728268887,
+          "falls": 0,
+          "success_rate_strict": 0.028112449799196786,
+          "all_gates_pass": false,
+          "worst_ratio": 8.66938591003418,
+          "mean_ratio": 4.085504603121883,
+          "gate_ratios": {
+            "pos_median": 8.66938591003418,
+            "pos_p90": 7.210516929626465,
+            "heading_median": 0.4621155728268887,
+            "falls": 0.0
+          },
+          "ci95_pos_median": [
+            0.4179117545485497,
+            0.45023050904273987
+          ],
+          "advanced": true
+        },
+        {
+          "iteration": 10100,
+          "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_10100.pth",
+          "run_dir": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full",
+          "segments": 747,
+          "pos_median": 0.435749888420105,
+          "pos_p90": 0.8714625597000121,
+          "heading_median": 4.877397105171085,
+          "falls": 0,
+          "success_rate_strict": 0.024096385542168676,
+          "all_gates_pass": false,
+          "worst_ratio": 8.7149977684021,
+          "mean_ratio": 4.479340768979832,
+          "gate_ratios": {
+            "pos_median": 8.7149977684021,
+            "pos_p90": 8.71462559700012,
+            "heading_median": 0.4877397105171085,
+            "falls": 0.0
+          },
+          "ci95_pos_median": [
+            0.4266132414340973,
+            0.4542118310928345
+          ],
+          "advanced": true
+        },
+        {
+          "iteration": 9400,
+          "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_9400.pth",
+          "run_dir": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full",
+          "segments": 747,
+          "pos_median": 0.443441778421402,
+          "pos_p90": 0.9042179226875305,
+          "heading_median": 5.098326404064318,
+          "falls": 0,
+          "success_rate_strict": 0.025435073627844713,
+          "all_gates_pass": false,
+          "worst_ratio": 9.042179226875305,
+          "mean_ratio": 4.6052118589274444,
+          "gate_ratios": {
+            "pos_median": 8.86883556842804,
+            "pos_p90": 9.042179226875305,
+            "heading_median": 0.5098326404064318,
+            "falls": 0.0
+          },
+          "ci95_pos_median": [
+            0.4279824703931808,
+            0.4591460734605789
+          ],
+          "advanced": false
+        },
+        {
+          "iteration": 10700,
+          "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_10700.pth",
+          "run_dir": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full",
+          "segments": 747,
+          "pos_median": 0.4534880816936493,
+          "pos_p90": 0.8476332545280456,
+          "heading_median": 4.976912961378171,
+          "falls": 0,
+          "success_rate_strict": 0.025435073627844713,
+          "all_gates_pass": false,
+          "worst_ratio": 9.069761633872986,
+          "mean_ratio": 4.510946368822815,
+          "gate_ratios": {
+            "pos_median": 9.069761633872986,
+            "pos_p90": 8.476332545280455,
+            "heading_median": 0.49769129613781715,
+            "falls": 0.0
+          },
+          "ci95_pos_median": [
+            0.441593199968338,
+            0.46522364020347595
+          ],
+          "advanced": false
+        },
+        {
+          "iteration": 11400,
+          "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_11400.pth",
+          "run_dir": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full",
+          "segments": 731,
+          "pos_median": 0.4457501173019409,
+          "pos_p90": 0.9576723575592041,
+          "heading_median": 4.825692573154089,
+          "falls": 3,
+          "success_rate_strict": 0.023255813953488372,
+          "all_gates_pass": false,
+          "worst_ratio": 9.576723575592041,
+          "mean_ratio": 5.256569690769399,
+          "gate_ratios": {
+            "pos_median": 8.915002346038818,
+            "pos_p90": 9.576723575592041,
+            "heading_median": 0.4825692573154089,
+            "falls": 2.051983584131327
+          },
+          "ci95_pos_median": [
+            0.4322029955685139,
+            0.4555197060108185
+          ],
+          "advanced": false
+        },
+        {
+          "iteration": 5500,
+          "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_5500.pth",
+          "run_dir": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full",
+          "segments": 737,
+          "pos_median": 0.4886358976364136,
+          "pos_p90": 0.7472136378288269,
+          "heading_median": 4.47776273683364,
+          "falls": 1,
+          "success_rate_strict": 0.0203527815468114,
+          "all_gates_pass": false,
+          "worst_ratio": 9.772717952728271,
+          "mean_ratio": 4.592764164065071,
+          "gate_ratios": {
+            "pos_median": 9.772717952728271,
+            "pos_p90": 7.472136378288268,
+            "heading_median": 0.447776273683364,
+            "falls": 0.6784260515603799
+          },
+          "ci95_pos_median": [
+            0.4665790505707264,
+            0.5147917896509171
+          ],
+          "advanced": false
+        },
+        {
+          "iteration": 12000,
+          "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_12000.pth",
+          "run_dir": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full",
+          "segments": 747,
+          "pos_median": 0.4887089133262634,
+          "pos_p90": 0.8302427411079406,
+          "heading_median": 4.862958085265679,
+          "falls": 0,
+          "success_rate_strict": 0.02677376171352075,
+          "all_gates_pass": false,
+          "worst_ratio": 9.774178266525269,
+          "mean_ratio": 4.6407253715328105,
+          "gate_ratios": {
+            "pos_median": 9.774178266525269,
+            "pos_p90": 8.302427411079405,
+            "heading_median": 0.4862958085265679,
+            "falls": 0.0
+          },
+          "ci95_pos_median": [
+            0.4758028984069824,
+            0.5050150960683822
+          ],
+          "advanced": false
+        },
+        {
+          "iteration": 8100,
+          "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_8100.pth",
+          "run_dir": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full",
+          "segments": 747,
+          "pos_median": 0.49139460921287537,
+          "pos_p90": 0.8336393117904662,
+          "heading_median": 5.016623681212625,
+          "falls": 0,
+          "success_rate_strict": 0.0214190093708166,
+          "all_gates_pass": false,
+          "worst_ratio": 9.827892184257507,
+          "mean_ratio": 4.666486917570858,
+          "gate_ratios": {
+            "pos_median": 9.827892184257507,
+            "pos_p90": 8.336393117904661,
+            "heading_median": 0.5016623681212625,
+            "falls": 0.0
+          },
+          "ci95_pos_median": [
+            0.4750338301062584,
+            0.5061338543891907
+          ],
+          "advanced": false
+        },
+        {
+          "iteration": 8800,
+          "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_8800.pth",
+          "run_dir": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full",
+          "segments": 755,
+          "pos_median": 0.5364857316017151,
+          "pos_p90": 0.9012413024902345,
+          "heading_median": 4.932762618583209,
+          "falls": 1,
+          "success_rate_strict": 0.015894039735099338,
+          "all_gates_pass": false,
+          "worst_ratio": 10.729714632034302,
+          "mean_ratio": 5.224413893606026,
+          "gate_ratios": {
+            "pos_median": 10.729714632034302,
+            "pos_p90": 9.012413024902344,
+            "heading_median": 0.4932762618583209,
+            "falls": 0.6622516556291391
+          },
+          "ci95_pos_median": [
+            0.52332424223423,
+            0.5506038069725037
+          ],
+          "advanced": false
+        }
+      ]
+    },
+    {
+      "duration_s": 60.0,
+      "n_candidates": 5,
+      "authoritative": false,
+      "entries": [
+        {
+          "iteration": 7500,
+          "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_7500.pth",
+          "run_dir": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full",
+          "segments": 2310,
+          "pos_median": 0.4240390509366989,
+          "pos_p90": 0.8980299293994902,
+          "heading_median": 4.999042774289013,
+          "falls": 5,
+          "success_rate_strict": 0.02207792207792208,
+          "all_gates_pass": false,
+          "worst_ratio": 8.980299293994902,
+          "mean_ratio": 4.760808918102216,
+          "gate_ratios": {
+            "pos_median": 8.480781018733978,
+            "pos_p90": 8.980299293994902,
+            "heading_median": 0.49990427742890126,
+            "falls": 1.0822510822510822
+          },
+          "ci95_pos_median": [
+            0.41496279165148736,
+            0.4350009858608246
+          ],
+          "advanced": true
+        },
+        {
+          "iteration": 6200,
+          "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_6200.pth",
+          "run_dir": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full",
+          "segments": 2314,
+          "pos_median": 0.460053950548172,
+          "pos_p90": 0.8996378898620608,
+          "heading_median": 4.404932429713794,
+          "falls": 1,
+          "success_rate_strict": 0.029386343993085567,
+          "all_gates_pass": false,
+          "worst_ratio": 9.20107901096344,
+          "mean_ratio": 4.713506802832028,
+          "gate_ratios": {
+            "pos_median": 9.20107901096344,
+            "pos_p90": 8.996378898620607,
+            "heading_median": 0.4404932429713794,
+            "falls": 0.21607605877268798
+          },
+          "ci95_pos_median": [
+            0.45244536064565183,
+            0.46993024982512
+          ],
+          "advanced": true
+        },
+        {
+          "iteration": 10100,
+          "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_10100.pth",
+          "run_dir": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full",
+          "segments": 2295,
+          "pos_median": 0.4444432258605957,
+          "pos_p90": 0.9826218724250789,
+          "heading_median": 5.198033505568164,
+          "falls": 1,
+          "success_rate_strict": 0.02570806100217865,
+          "all_gates_pass": false,
+          "worst_ratio": 9.826218724250788,
+          "mean_ratio": 4.863187878941699,
+          "gate_ratios": {
+            "pos_median": 8.888864517211914,
+            "pos_p90": 9.826218724250788,
+            "heading_median": 0.5198033505568164,
+            "falls": 0.2178649237472767
+          },
+          "ci95_pos_median": [
+            0.4377656877040863,
+            0.4542920410633087
+          ],
+          "advanced": false
+        },
+        {
+          "iteration": 4900,
+          "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_4900.pth",
+          "run_dir": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full",
+          "segments": 2323,
+          "pos_median": 0.5013281106948853,
+          "pos_p90": 0.8917286753654483,
+          "heading_median": 5.098968441846299,
+          "falls": 1,
+          "success_rate_strict": 0.02152389151958674,
+          "all_gates_pass": false,
+          "worst_ratio": 10.026562213897705,
+          "mean_ratio": 4.917246181733171,
+          "gate_ratios": {
+            "pos_median": 10.026562213897705,
+            "pos_p90": 8.917286753654482,
+            "heading_median": 0.5098968441846299,
+            "falls": 0.2152389151958674
+          },
+          "ci95_pos_median": [
+            0.49194058775901794,
+            0.5107686519622803
+          ],
+          "advanced": false
+        },
+        {
+          "iteration": 6800,
+          "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_6800.pth",
+          "run_dir": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full",
+          "segments": 2330,
+          "pos_median": 0.4854385554790497,
+          "pos_p90": 1.0422983169555662,
+          "heading_median": 4.783085853111549,
+          "falls": 1,
+          "success_rate_strict": 0.032188841201716736,
+          "all_gates_pass": false,
+          "worst_ratio": 10.42298316955566,
+          "mean_ratio": 5.20616378478148,
+          "gate_ratios": {
+            "pos_median": 9.708771109580994,
+            "pos_p90": 10.42298316955566,
+            "heading_median": 0.47830858531115494,
+            "falls": 0.2145922746781116
+          },
+          "ci95_pos_median": [
+            0.4762136787176132,
+            0.4956087559461594
+          ],
+          "advanced": false
+        }
+      ]
+    },
+    {
+      "duration_s": 120.0,
+      "n_candidates": 2,
+      "authoritative": true,
+      "entries": [
+        {
+          "iteration": 7500,
+          "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_7500.pth",
+          "run_dir": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full",
+          "segments": 4630,
+          "pos_median": 0.41859830915927887,
+          "pos_p90": 0.9071326076984411,
+          "heading_median": 5.054483419782006,
+          "falls": 2,
+          "success_rate_strict": 0.02159827213822894,
+          "all_gates_pass": false,
+          "worst_ratio": 9.07132607698441,
+          "mean_ratio": 4.54118083088262,
+          "gate_ratios": {
+            "pos_median": 8.371966183185577,
+            "pos_p90": 9.07132607698441,
+            "heading_median": 0.5054483419782005,
+            "falls": 0.2159827213822894
+          },
+          "ci95_pos_median": [
+            0.4122589033097029,
+            0.42613404169678687
+          ],
+          "advanced": false
+        },
+        {
+          "iteration": 6200,
+          "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_6200.pth",
+          "run_dir": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full",
+          "segments": 4640,
+          "pos_median": 0.45943640172481537,
+          "pos_p90": 0.9216283082962037,
+          "heading_median": 4.488704699884,
+          "falls": 3,
+          "success_rate_strict": 0.03103448275862069,
+          "all_gates_pass": false,
+          "worst_ratio": 9.216283082962036,
+          "mean_ratio": 4.794289362378927,
+          "gate_ratios": {
+            "pos_median": 9.188728034496307,
+            "pos_p90": 9.216283082962036,
+            "heading_median": 0.44887046998839997,
+            "falls": 0.3232758620689655
+          },
+          "ci95_pos_median": [
+            0.4535991847515106,
+            0.4661983046680689
+          ],
+          "advanced": false
+        }
+      ]
+    }
+  ],
+  "final_iteration": 12000,
+  "best": {
+    "iteration": 7500,
+    "checkpoint": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full/nn/model_7500.pth",
+    "run_dir": "logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_V7_full",
+    "segments": 4630,
+    "pos_median": 0.41859830915927887,
+    "pos_p90": 0.9071326076984411,
+    "heading_median": 5.054483419782006,
+    "falls": 2,
+    "success_rate_strict": 0.02159827213822894,
+    "all_gates_pass": false,
+    "worst_ratio": 9.07132607698441,
+    "mean_ratio": 4.54118083088262,
+    "gate_ratios": {
+      "pos_median": 8.371966183185577,
+      "pos_p90": 9.07132607698441,
+      "heading_median": 0.5054483419782005,
+      "falls": 0.2159827213822894
+    },
+    "ci95_pos_median": [
+      0.4122589033097029,
+      0.42613404169678687
+    ],
+    "advanced": false
+  },
+  "tie_note": null,
+  "wall_s": 2342.6080592782237,
+  "speedup_vs_bruteforce": 1.8461538461538463
+}

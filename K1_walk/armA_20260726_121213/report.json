@@ -1,0 +1,280 @@
+{
+  "checkpoint": "logs/K1/K1/Goal_Pose/2026-07-24-17-21-10_armA_continue/nn/model_11700.pth",
+  "config": "envs/K1/Goal_Pose.yaml",
+  "task": "K1/Goal_Pose",
+  "date": "2026-07-25 15:37:30",
+  "seed": 0,
+  "num_envs": 256,
+  "duration_s": 120.0,
+  "deterministic": true,
+  "perturbations": false,
+  "obs_noise": true,
+  "authoritative_gate_evaluation": true,
+  "segments_completed": 4648,
+  "segments_censored_by_episode_end": 768,
+  "falls": 34,
+  "fall_rate_per_attempt": 0.007261853908586074,
+  "pos_err_m": {
+    "median": 0.07644809409976006,
+    "p90": 0.1466449394822121,
+    "mean": 0.08370507355473243,
+    "max": 0.725727379322052
+  },
+  "heading_err_deg": {
+    "median": 2.0813157344537956,
+    "p90": 4.918021704316487,
+    "mean": 2.50260789496541,
+    "max": 35.90578537238011
+  },
+  "final_speed_mps": {
+    "median": 0.09336061030626297,
+    "p90": 0.2157330647110939,
+    "mean": 0.10895494162923412
+  },
+  "success_rate_strict": 0.13919965576592083,
+  "success_rate_loose": 0.6867469879518072,
+  "ci95": {
+    "pos_median": [
+      0.07484616674482822,
+      0.07849538214504719
+    ],
+    "pos_p90": [
+      0.1436718612909317,
+      0.15000957176089286
+    ],
+    "heading_median": [
+      2.0246456549102,
+      2.1434381832570835
+    ]
+  },
+  "timing": {
+    "setup_wall_s": 4.398693941999227,
+    "rollout_wall_s": 794.6904900250956,
+    "simulated_time_per_env_s": 120.0,
+    "aggregate_env_simulated_time_s": 30720.0,
+    "single_env_realtime_factor": 0.15100218450608424,
+    "aggregate_env_seconds_per_wall_second": 38.656559233557566,
+    "vectorized_control_iterations_per_wall_second": 7.550109225304213,
+    "aggregate_env_transitions_per_wall_second": 1932.8279616778784
+  },
+  "gates": {
+    "pos_median": {
+      "limit": 0.05,
+      "value": 0.07644809409976006,
+      "pass": false
+    },
+    "pos_p90": {
+      "limit": 0.1,
+      "value": 0.1466449394822121,
+      "pass": false
+    },
+    "heading_median": {
+      "limit": 10.0,
+      "value": 2.0813157344537956,
+      "pass": true
+    },
+    "falls": {
+      "limit": 0,
+      "value": 34,
+      "pass": false
+    }
+  },
+  "stop_speed_threshold": 0.1,
+  "instrumented": true,
+  "all_gates_pass": false,
+  "failure_modes": {
+    "ok": {
+      "count": 1641,
+      "share": 0.3530550774526678
+    },
+    "not_stopped": {
+      "count": 1551,
+      "share": 0.33369191049913943
+    },
+    "heading_only": {
+      "count": 9,
+      "share": 0.00193631669535284
+    },
+    "arrived_then_left": {
+      "count": 549,
+      "share": 0.11811531841652323
+    },
+    "never_arrived": {
+      "count": 898,
+      "share": 0.1932013769363167
+    }
+  },
+  "closest_approach_m": {
+    "median": 0.02844227198511362,
+    "p90": 0.1141746930778027
+  },
+  "approach_error_m": {
+    "along_median": -0.023710940033197403,
+    "along_p10": -0.11067709177732467,
+    "along_p90": 0.06404527723789215,
+    "cross_median_abs": 0.04024134576320648,
+    "overshoot_share": 0.3709531013615734,
+    "n": 3305
+  },
+  "feasibility": {
+    "feasible_speed_mps": 0.6,
+    "achieved_closing_speed_p95": 0.3412720040415052,
+    "achieved_closing_speed_median": 0.10620547566840828,
+    "required_speed_median": 0.11895999879972882,
+    "required_speed_p90": 0.30982127715704144,
+    "infeasible_share": 0.0,
+    "infeasible_count": 0,
+    "feasible_subset": {
+      "n": 4648,
+      "pos_median": 0.07644809409976006,
+      "pos_p90": 0.1466449394822121,
+      "heading_median": 2.0813157344537956,
+      "success_rate_strict": 0.13919965576592083
+    },
+    "infeasible_subset": {
+      "n": 0,
+      "pos_median": NaN,
+      "pos_p90": NaN
+    },
+    "segment_duration_s": {
+      "median": 5.900000095367432,
+      "min": 4.0
+    }
+  },
+  "per_category": {
+    "stand": {
+      "n": 475,
+      "share": 0.10219449225473322,
+      "pos_median": 0.07302358746528625,
+      "pos_p90": 0.18956642746925353,
+      "heading_median": 3.545592179288639,
+      "speed_median": 0.02862611599266529,
+      "success_rate_strict": 0.30105263157894735,
+      "arrived_then_left_share": 0.35578947368421054,
+      "never_arrived_share": 0.0
+    },
+    "straight": {
+      "n": 938,
+      "share": 0.20180722891566266,
+      "pos_median": 0.07611504197120667,
+      "pos_p90": 0.14073996245861056,
+      "heading_median": 1.9432161396253078,
+      "speed_median": 0.1081257238984108,
+      "success_rate_strict": 0.12473347547974413,
+      "arrived_then_left_share": 0.04904051172707889,
+      "never_arrived_share": 0.2505330490405117
+    },
+    "lateral": {
+      "n": 983,
+      "share": 0.21148881239242684,
+      "pos_median": 0.07391052693128586,
+      "pos_p90": 0.14328899681568147,
+      "heading_median": 2.068700375056782,
+      "speed_median": 0.10419350117444992,
+      "success_rate_strict": 0.12919633774160733,
+      "arrived_then_left_share": 0.06307222787385554,
+      "never_arrived_share": 0.23296032553407936
+    },
+    "turn": {
+      "n": 867,
+      "share": 0.1865318416523236,
+      "pos_median": 0.07485304027795792,
+      "pos_p90": 0.1320824921131134,
+      "heading_median": 1.9061828539454986,
+      "speed_median": 0.10708075016736984,
+      "success_rate_strict": 0.12572087658592848,
+      "arrived_then_left_share": 0.2560553633217993,
+      "never_arrived_share": 0.0
+    },
+    "combined": {
+      "n": 1385,
+      "share": 0.2979776247848537,
+      "pos_median": 0.08171764016151428,
+      "pos_p90": 0.14976417422294616,
+      "heading_median": 2.069192148677023,
+      "speed_median": 0.10432057827711105,
+      "success_rate_strict": 0.10902527075812274,
+      "arrived_then_left_share": 0.036101083032490974,
+      "never_arrived_share": 0.3133574007220217
+    }
+  },
+  "per_start_distance": [
+    {
+      "lo": 0.0,
+      "hi": 0.25,
+      "n": 1636,
+      "pos_median": 0.0729861706495285,
+      "pos_p90": 0.1473068743944168,
+      "heading_median": 2.121784605286121,
+      "arrived_then_left_share": 0.2591687041564792,
+      "never_arrived_share": 0.023838630806845965
+    },
+    {
+      "lo": 0.25,
+      "hi": 0.5,
+      "n": 357,
+      "pos_median": 0.06753059476613998,
+      "pos_p90": 0.1282080709934235,
+      "heading_median": 1.9911640675987972,
+      "arrived_then_left_share": 0.06722689075630252,
+      "never_arrived_share": 0.1792717086834734
+    },
+    {
+      "lo": 0.5,
+      "hi": 1.0,
+      "n": 826,
+      "pos_median": 0.07522283494472504,
+      "pos_p90": 0.1368020996451378,
+      "heading_median": 2.1553208341108836,
+      "arrived_then_left_share": 0.04721549636803874,
+      "never_arrived_share": 0.23728813559322035
+    },
+    {
+      "lo": 1.0,
+      "hi": 1.5,
+      "n": 1017,
+      "pos_median": 0.07986383885145187,
+      "pos_p90": 0.1499345988035202,
+      "heading_median": 2.116347774706791,
+      "arrived_then_left_share": 0.03343166175024582,
+      "never_arrived_share": 0.3008849557522124
+    },
+    {
+      "lo": 1.5,
+      "hi": 2.0,
+      "n": 671,
+      "pos_median": 0.08561557531356812,
+      "pos_p90": 0.15463131666183472,
+      "heading_median": 1.94981410236354,
+      "arrived_then_left_share": 0.03576751117734724,
+      "never_arrived_share": 0.3651266766020864
+    },
+    {
+      "lo": 2.0,
+      "hi": Infinity,
+      "n": 141,
+      "pos_median": 0.09016850590705872,
+      "pos_p90": 0.16854746639728546,
+      "heading_median": 1.9879128975538711,
+      "arrived_then_left_share": 0.028368794326241134,
+      "never_arrived_share": 0.3404255319148936
+    }
+  ],
+  "fall_analysis": {
+    "per_category": {
+      "stand": 5,
+      "straight": 8,
+      "lateral": 4,
+      "turn": 6,
+      "combined": 11
+    },
+    "t_into_segment_median_s": 0.03999999910593033,
+    "start_dist_median_m": 1.064501702785492
+  },
+  "recommendations": [
+    "**도착 후 안 멈춤** (33%가 위치·방향은 맞았는데 속도 > 0.10 m/s). → `rewards.scales.goal_stop`을 0.0에서 -3으로 강화하거나 `goal_reached`를 켤 것 (`goal_reach_radius` = 0.1 m 안에서만 작동하므로 이 반경도 함께 확인).",
+    "**위치만 미달, heading은 통과**: constellation의 d_con = d² + 2r²(1-cosθ)에서 r=1.0 m라 heading 항의 가중이 상대적으로 크다. → `rewards.constellation_radius`를 0.6~0.7로 낮춰 위치 항 비중을 올리거나, `rewards.goal_position_sigma`를 1.0에서 절반으로 줄여 근거리 정밀도를 세울 것.",
+    "**낙상 34회** (기준 0회). 낙상의 최다 유형은 `combined`(11회), 구간 시작 후 median 0.0s 시점. → 영상에서 해당 시점 확인(`--record_video`), `rewards.terminate_height`(0.35)와 `orientation`/`base_height` 페널티 균형 점검.",
+    "눈으로 확인: `python eval_goal_pose.py ... --record_video` (env 0을 mp4로 저장) 또는 로컬에서 `play.py`."
+  ]
+}

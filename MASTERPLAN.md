@@ -768,3 +768,350 @@ yaml 차원·보상함수 배선·CrossQ 키·obs 산술 전부 검증. 실 sim 
 `python train_vX.py --task K1/<Task> --headless True --num_envs 4 --max_iterations 3 --sim_device cuda:0 --rl_device cuda:0`.
 1차 판정지표(텐서보드, 별도 eval 불필요): v4 getup_success·upright_hold, v5 kick_success·fell,
 v6 ep_peak_force_kN(제로액션 기준선 대비). 필요시 eval 스크립트 3종(~150줄) 추후.
+
+# GoalPose 평가 리포트 — 2026-07-25 15:04:27
+
+- checkpoint: `logs/K1/K1/Goal_Pose/2026-07-24-17-22-03_armB_goal_reached/nn/model_11500.pth`
+- config: `envs/K1/Goal_Pose.yaml`
+- 조건: 256 envs × 120s, 결정론적 정책, 외란 OFF, 관측노이즈 ON, seed 0
+- 벽시계: setup 3.8s + rollout 432.5s; env당 0.3× real-time, 총 71 env·s/wall-s
+- 완료 구간 4647개 / 낙상 37회 / 에피소드경계 절단 768개
+
+## 게이트 판정 (MASTERPLAN §성공 기준)
+
+| 게이트 | 기준 | 측정값 | 95% CI | 판정 |
+|---|---|---|---|---|
+| 위치 오차 median | ≤ 5 cm | 3.9 cm | [3.8, 3.9] | ✅ PASS |
+| 위치 오차 p90 | ≤ 10 cm | 6.7 cm | [6.6, 6.8] | ✅ PASS |
+| heading 오차 median | ≤ 10° | 7.3° | [7.1, 7.4] | ✅ PASS |
+| 낙상 | ≤ 0 | 37 | — | ❌ FAIL |
+
+**종합: ❌ 미통과 게이트 있음**
+
+## 과제 실현가능성 점검
+
+목표는 4~8s마다 재샘플되므로, 먼 목표에는 애초에 도달할 시간이 없을 수 있다. 필요속도 = 초기거리 / 구간시간.
+
+- 필요속도 median 0.12 m/s, p90 0.30 m/s (실현가능 기준 0.60 m/s)
+- 이 정책이 실제로 낸 접근속도: median 0.11 m/s, p95 0.35 m/s — 기준값 0.60와 크게 다르면 `evaluation.feasible_speed_mps`를 실측에 맞게 조정할 것
+- **시간 내 도달 불가 구간: 0.0%** (0개)
+| 부분집합 | n | 위치 median | 위치 p90 | heading median |
+|---|---|---|---|---|
+| 실현가능 | 4647 | 3.9 cm | 6.7 cm | 7.3° |
+| 시간부족 | 0 | nan cm | nan cm | — |
+
+## 실패 모드 분해
+
+최종 오차가 같아도 원인이 다르면 처방이 반대다. `도달후이탈`은 멈추게 만들어야 하고, `미도달`은 더 가게 만들어야 한다.
+
+| 모드 | 구간 수 | 비율 |
+|---|---|---|
+| 성공 (위치·heading·정지 모두 충족) | 3490 | 75.1% |
+| 도착했으나 안 멈춤 | 24 | 0.5% |
+| 위치는 맞고 heading만 미달 | 1106 | 23.8% |
+| 도달했다가 이탈 | 17 | 0.4% |
+| 한 번도 도달 못함 | 10 | 0.2% |
+
+- 최근접 거리 median 1.4 cm / p90 5.1 cm (구간 중 목표에 가장 가까웠던 순간)
+- 접근방향 잔차 median -0.00 m (+ = 목표를 지나침), 횡방향 |오차| median 0.02 m, 오버슈트 비율 46%
+
+## 목표 유형별
+
+| 유형 | n | 비중 | 위치 median | 위치 p90 | heading median | 성공률(엄격) | 도달후이탈 |
+|---|---|---|---|---|---|---|---|
+| combined | 1390 | 30% | 4.0 cm | 6.7 cm | 7.9° | 49% | 0% |
+| lateral | 940 | 20% | 4.0 cm | 6.8 cm | 7.6° | 52% | 0% |
+| straight | 954 | 21% | 3.9 cm | 6.5 cm | 7.7° | 53% | 0% |
+| turn | 894 | 19% | 3.9 cm | 6.5 cm | 7.5° | 50% | 0% |
+| stand | 469 | 10% | 3.3 cm | 7.2 cm | 2.4° | 73% | 3% |
+
+## 초기 목표거리별
+
+| 거리 구간 | n | 위치 median | 위치 p90 | heading median | 미도달 | 도달후이탈 |
+|---|---|---|---|---|---|---|
+| 0.00–0.25 m | 1658 | 3.7 cm | 6.6 cm | 6.1° | 0% | 1% |
+| 0.25–0.50 m | 351 | 3.9 cm | 6.5 cm | 7.9° | 0% | 0% |
+| 0.50–1.00 m | 826 | 3.9 cm | 6.6 cm | 7.7° | 0% | 0% |
+| 1.00–1.50 m | 1025 | 4.0 cm | 6.8 cm | 7.7° | 0% | 0% |
+| 1.50–2.00 m | 657 | 3.9 cm | 6.6 cm | 8.1° | 0% | 0% |
+| 2.00–∞ m | 130 | 4.3 cm | 8.0 cm | 7.5° | 4% | 1% |
+
+## 낙상 분석
+
+- 유형별: stand 4회, straight 7회, lateral 5회, turn 4회, combined 17회
+- 구간 시작 후 median 0.0s 시점, 해당 구간 초기 목표거리 median 1.30 m
+
+## 부가 지표
+
+- 도착 시 속도 median 0.03 m/s (정지 기준 0.10 m/s)
+- 성공률(엄격: 5cm+10°+정지): 52.8%
+- 성공률(완화: 10cm+10°): 75.6%
+
+## 다음에 확인/시도할 것
+
+- **낙상 37회** (기준 0회). 낙상의 최다 유형은 `combined`(17회), 구간 시작 후 median 0.0s 시점. → 영상에서 해당 시점 확인(`--record_video`), `rewards.terminate_height`(0.35)와 `orientation`/`base_height` 페널티 균형 점검.
+- 눈으로 확인: `python eval_goal_pose.py ... --record_video` (env 0을 mp4로 저장) 또는 로컬에서 `play.py`.
+
+report saved to: /mnt/DATA/workspace/ws_eungkyu/k1-goalpose/htwk-gym/logs/K1/K1/Goal_Pose/2026-07-24-17-22-03_armB_goal_reached/eval/select_2026-07-25-14-57-08/winner_video
+
+# GoalPose 평가 리포트 — 2026-07-25 15:38:03
+
+- checkpoint: `logs/K1/K1/Goal_Pose/2026-07-24-17-22-16_armC_200hz/nn/model_16800.pth`
+- config: `envs/K1/Goal_Pose.yaml`
+- 조건: 256 envs × 120s, 결정론적 정책, 외란 OFF, 관측노이즈 ON, seed 0
+- 벽시계: setup 4.4s + rollout 784.2s; env당 0.2× real-time, 총 39 env·s/wall-s
+- 완료 구간 4654개 / 낙상 10회 / 에피소드경계 절단 768개
+
+## 게이트 판정 (MASTERPLAN §성공 기준)
+
+| 게이트 | 기준 | 측정값 | 95% CI | 판정 |
+|---|---|---|---|---|
+| 위치 오차 median | ≤ 5 cm | 8.3 cm | [8.2, 8.5] | ❌ FAIL |
+| 위치 오차 p90 | ≤ 10 cm | 16.7 cm | [16.4, 17.1] | ❌ FAIL |
+| heading 오차 median | ≤ 10° | 1.8° | [1.7, 1.8] | ✅ PASS |
+| 낙상 | ≤ 0 | 10 | — | ❌ FAIL |
+
+**종합: ❌ 미통과 게이트 있음**
+
+## 과제 실현가능성 점검
+
+목표는 4~8s마다 재샘플되므로, 먼 목표에는 애초에 도달할 시간이 없을 수 있다. 필요속도 = 초기거리 / 구간시간.
+
+- 필요속도 median 0.13 m/s, p90 0.32 m/s (실현가능 기준 0.60 m/s)
+- 이 정책이 실제로 낸 접근속도: median 0.11 m/s, p95 0.35 m/s — 기준값 0.60와 크게 다르면 `evaluation.feasible_speed_mps`를 실측에 맞게 조정할 것
+- **시간 내 도달 불가 구간: 0.0%** (0개)
+| 부분집합 | n | 위치 median | 위치 p90 | heading median |
+|---|---|---|---|---|
+| 실현가능 | 4654 | 8.3 cm | 16.7 cm | 1.8° |
+| 시간부족 | 0 | nan cm | nan cm | — |
+
+## 실패 모드 분해
+
+최종 오차가 같아도 원인이 다르면 처방이 반대다. `도달후이탈`은 멈추게 만들어야 하고, `미도달`은 더 가게 만들어야 한다.
+
+| 모드 | 구간 수 | 비율 |
+|---|---|---|
+| 성공 (위치·heading·정지 모두 충족) | 1516 | 32.6% |
+| 도착했으나 안 멈춤 | 1327 | 28.5% |
+| 위치는 맞고 heading만 미달 | 3 | 0.1% |
+| 도달했다가 이탈 | 632 | 13.6% |
+| 한 번도 도달 못함 | 1176 | 25.3% |
+
+- 최근접 거리 median 3.5 cm / p90 12.8 cm (구간 중 목표에 가장 가까웠던 순간)
+- 접근방향 잔차 median -0.02 m (+ = 목표를 지나침), 횡방향 |오차| median 0.05 m, 오버슈트 비율 41%
+
+## 목표 유형별
+
+| 유형 | n | 비중 | 위치 median | 위치 p90 | heading median | 성공률(엄격) | 도달후이탈 |
+|---|---|---|---|---|---|---|---|
+| combined | 1469 | 32% | 8.9 cm | 17.5 cm | 1.8° | 10% | 5% |
+| straight | 956 | 21% | 8.8 cm | 17.2 cm | 1.8° | 9% | 8% |
+| lateral | 910 | 20% | 8.7 cm | 16.4 cm | 1.8° | 9% | 8% |
+| turn | 877 | 19% | 8.3 cm | 16.7 cm | 1.8° | 9% | 40% |
+| stand | 442 | 9% | 5.2 cm | 10.9 cm | 1.5° | 48% | 14% |
+
+## 초기 목표거리별
+
+| 거리 구간 | n | 위치 median | 위치 p90 | heading median | 미도달 | 도달후이탈 |
+|---|---|---|---|---|---|---|
+| 0.00–0.25 m | 1590 | 7.3 cm | 15.5 cm | 1.7° | 3% | 29% |
+| 0.25–0.50 m | 326 | 8.4 cm | 16.1 cm | 1.7° | 30% | 10% |
+| 0.50–1.00 m | 807 | 8.7 cm | 16.9 cm | 1.8° | 34% | 6% |
+| 1.00–1.50 m | 1060 | 9.0 cm | 17.2 cm | 1.8° | 38% | 5% |
+| 1.50–2.00 m | 692 | 9.1 cm | 17.6 cm | 1.9° | 40% | 4% |
+| 2.00–∞ m | 179 | 9.2 cm | 20.8 cm | 1.6° | 44% | 2% |
+
+## 낙상 분석
+
+- 유형별: stand 4회, lateral 2회, turn 1회, combined 3회
+- 구간 시작 후 median 0.0s 시점, 해당 구간 초기 목표거리 median 0.38 m
+
+## 부가 지표
+
+- 도착 시 속도 median 0.10 m/s (정지 기준 0.10 m/s)
+- 성공률(엄격: 5cm+10°+정지): 13.0%
+- 성공률(완화: 10cm+10°): 61.1%
+
+## 다음에 확인/시도할 것
+
+- **도착 후 안 멈춤** (29%가 위치·방향은 맞았는데 속도 > 0.10 m/s). → `rewards.scales.goal_stop`을 0.0에서 -3으로 강화하거나 `goal_reached`를 켤 것 (`goal_reach_radius` = 0.1 m 안에서만 작동하므로 이 반경도 함께 확인).
+- **위치만 미달, heading은 통과**: constellation의 d_con = d² + 2r²(1-cosθ)에서 r=1.0 m라 heading 항의 가중이 상대적으로 크다. → `rewards.constellation_radius`를 0.6~0.7로 낮춰 위치 항 비중을 올리거나, `rewards.goal_position_sigma`를 1.0에서 절반으로 줄여 근거리 정밀도를 세울 것.
+- **낙상 10회** (기준 0회). 낙상의 최다 유형은 `stand`(4회), 구간 시작 후 median 0.0s 시점. → 영상에서 해당 시점 확인(`--record_video`), `rewards.terminate_height`(0.35)와 `orientation`/`base_height` 페널티 균형 점검.
+- 눈으로 확인: `python eval_goal_pose.py ... --record_video` (env 0을 mp4로 저장) 또는 로컬에서 `play.py`.
+
+report saved to: /mnt/DATA/workspace/ws_eungkyu/k1-goalpose/htwk-gym/logs/K1/K1/Goal_Pose/2026-07-24-17-22-16_armC_200hz/eval/select_2026-07-25-15-24-51/winner_video
+
+# GoalPose 평가 리포트 — 2026-07-25 15:37:30
+
+- checkpoint: `logs/K1/K1/Goal_Pose/2026-07-24-17-21-10_armA_continue/nn/model_11700.pth`
+- config: `envs/K1/Goal_Pose.yaml`
+- 조건: 256 envs × 120s, 결정론적 정책, 외란 OFF, 관측노이즈 ON, seed 0
+- 벽시계: setup 4.4s + rollout 794.7s; env당 0.2× real-time, 총 39 env·s/wall-s
+- 완료 구간 4648개 / 낙상 34회 / 에피소드경계 절단 768개
+
+## 게이트 판정 (MASTERPLAN §성공 기준)
+
+| 게이트 | 기준 | 측정값 | 95% CI | 판정 |
+|---|---|---|---|---|
+| 위치 오차 median | ≤ 5 cm | 7.6 cm | [7.5, 7.8] | ❌ FAIL |
+| 위치 오차 p90 | ≤ 10 cm | 14.7 cm | [14.4, 15.0] | ❌ FAIL |
+| heading 오차 median | ≤ 10° | 2.1° | [2.0, 2.1] | ✅ PASS |
+| 낙상 | ≤ 0 | 34 | — | ❌ FAIL |
+
+**종합: ❌ 미통과 게이트 있음**
+
+## 과제 실현가능성 점검
+
+목표는 4~8s마다 재샘플되므로, 먼 목표에는 애초에 도달할 시간이 없을 수 있다. 필요속도 = 초기거리 / 구간시간.
+
+- 필요속도 median 0.12 m/s, p90 0.31 m/s (실현가능 기준 0.60 m/s)
+- 이 정책이 실제로 낸 접근속도: median 0.11 m/s, p95 0.34 m/s — 기준값 0.60와 크게 다르면 `evaluation.feasible_speed_mps`를 실측에 맞게 조정할 것
+- **시간 내 도달 불가 구간: 0.0%** (0개)
+| 부분집합 | n | 위치 median | 위치 p90 | heading median |
+|---|---|---|---|---|
+| 실현가능 | 4648 | 7.6 cm | 14.7 cm | 2.1° |
+| 시간부족 | 0 | nan cm | nan cm | — |
+
+## 실패 모드 분해
+
+최종 오차가 같아도 원인이 다르면 처방이 반대다. `도달후이탈`은 멈추게 만들어야 하고, `미도달`은 더 가게 만들어야 한다.
+
+| 모드 | 구간 수 | 비율 |
+|---|---|---|
+| 성공 (위치·heading·정지 모두 충족) | 1641 | 35.3% |
+| 도착했으나 안 멈춤 | 1551 | 33.4% |
+| 위치는 맞고 heading만 미달 | 9 | 0.2% |
+| 도달했다가 이탈 | 549 | 11.8% |
+| 한 번도 도달 못함 | 898 | 19.3% |
+
+- 최근접 거리 median 2.8 cm / p90 11.4 cm (구간 중 목표에 가장 가까웠던 순간)
+- 접근방향 잔차 median -0.02 m (+ = 목표를 지나침), 횡방향 |오차| median 0.04 m, 오버슈트 비율 37%
+
+## 목표 유형별
+
+| 유형 | n | 비중 | 위치 median | 위치 p90 | heading median | 성공률(엄격) | 도달후이탈 |
+|---|---|---|---|---|---|---|---|
+| combined | 1385 | 30% | 8.2 cm | 15.0 cm | 2.1° | 11% | 4% |
+| straight | 938 | 20% | 7.6 cm | 14.1 cm | 1.9° | 12% | 5% |
+| turn | 867 | 19% | 7.5 cm | 13.2 cm | 1.9° | 13% | 26% |
+| lateral | 983 | 21% | 7.4 cm | 14.3 cm | 2.1° | 13% | 6% |
+| stand | 475 | 10% | 7.3 cm | 19.0 cm | 3.5° | 30% | 36% |
+
+## 초기 목표거리별
+
+| 거리 구간 | n | 위치 median | 위치 p90 | heading median | 미도달 | 도달후이탈 |
+|---|---|---|---|---|---|---|
+| 0.00–0.25 m | 1636 | 7.3 cm | 14.7 cm | 2.1° | 2% | 26% |
+| 0.25–0.50 m | 357 | 6.8 cm | 12.8 cm | 2.0° | 18% | 7% |
+| 0.50–1.00 m | 826 | 7.5 cm | 13.7 cm | 2.2° | 24% | 5% |
+| 1.00–1.50 m | 1017 | 8.0 cm | 15.0 cm | 2.1° | 30% | 3% |
+| 1.50–2.00 m | 671 | 8.6 cm | 15.5 cm | 1.9° | 37% | 4% |
+| 2.00–∞ m | 141 | 9.0 cm | 16.9 cm | 2.0° | 34% | 3% |
+
+## 낙상 분석
+
+- 유형별: stand 5회, straight 8회, lateral 4회, turn 6회, combined 11회
+- 구간 시작 후 median 0.0s 시점, 해당 구간 초기 목표거리 median 1.06 m
+
+## 부가 지표
+
+- 도착 시 속도 median 0.09 m/s (정지 기준 0.10 m/s)
+- 성공률(엄격: 5cm+10°+정지): 13.9%
+- 성공률(완화: 10cm+10°): 68.7%
+
+## 다음에 확인/시도할 것
+
+- **도착 후 안 멈춤** (33%가 위치·방향은 맞았는데 속도 > 0.10 m/s). → `rewards.scales.goal_stop`을 0.0에서 -3으로 강화하거나 `goal_reached`를 켤 것 (`goal_reach_radius` = 0.1 m 안에서만 작동하므로 이 반경도 함께 확인).
+- **위치만 미달, heading은 통과**: constellation의 d_con = d² + 2r²(1-cosθ)에서 r=1.0 m라 heading 항의 가중이 상대적으로 크다. → `rewards.constellation_radius`를 0.6~0.7로 낮춰 위치 항 비중을 올리거나, `rewards.goal_position_sigma`를 1.0에서 절반으로 줄여 근거리 정밀도를 세울 것.
+- **낙상 34회** (기준 0회). 낙상의 최다 유형은 `combined`(11회), 구간 시작 후 median 0.0s 시점. → 영상에서 해당 시점 확인(`--record_video`), `rewards.terminate_height`(0.35)와 `orientation`/`base_height` 페널티 균형 점검.
+- 눈으로 확인: `python eval_goal_pose.py ... --record_video` (env 0을 mp4로 저장) 또는 로컬에서 `play.py`.
+
+report saved to: /mnt/DATA/workspace/ws_eungkyu/k1-goalpose/htwk-gym/logs/K1/K1/Goal_Pose/2026-07-24-17-21-10_armA_continue/eval/select_2026-07-25-15-24-08/winner_video
+# GoalPose 평가 리포트 — 2026-07-25 15:02:51
+
+- checkpoint: `logs/K1/K1/Goal_Pose_V3/2026-07-25-04-07-04/nn/model_8000.pth`
+- config: `envs/K1/Goal_Pose_V3.yaml`
+- 조건: 256 envs × 120s, 결정론적 정책, 외란 OFF, 관측노이즈 ON, seed 0
+- 벽시계: setup 4.0s + rollout 480.9s; env당 0.2× real-time, 총 64 env·s/wall-s
+- 완료 구간 3925개 / 낙상 3회 / 에피소드경계 절단 768개
+
+## 게이트 판정 (MASTERPLAN §성공 기준)
+
+| 게이트 | 기준 | 측정값 | 95% CI | 판정 |
+|---|---|---|---|---|
+| 위치 오차 median | ≤ 5 cm | 13.6 cm | [13.2, 13.9] | ❌ FAIL |
+| 위치 오차 p90 | ≤ 10 cm | 30.8 cm | [29.9, 31.5] | ❌ FAIL |
+| heading 오차 median | ≤ 10° | 3.3° | [3.2, 3.5] | ✅ PASS |
+| 낙상 | ≤ 0 | 3 | — | ❌ FAIL |
+
+**종합: ❌ 미통과 게이트 있음**
+
+## 과제 실현가능성 점검
+
+목표는 4~8s마다 재샘플되므로, 먼 목표에는 애초에 도달할 시간이 없을 수 있다. 필요속도 = 초기거리 / 구간시간.
+
+- 필요속도 median 0.06 m/s, p90 0.25 m/s (실현가능 기준 0.60 m/s)
+- 이 정책이 실제로 낸 접근속도: median 0.04 m/s, p95 0.25 m/s — 기준값 0.60와 크게 다르면 `evaluation.feasible_speed_mps`를 실측에 맞게 조정할 것
+- **시간 내 도달 불가 구간: 0.0%** (0개)
+| 부분집합 | n | 위치 median | 위치 p90 | heading median |
+|---|---|---|---|---|
+| 실현가능 | 3925 | 13.6 cm | 30.8 cm | 3.3° |
+| 시간부족 | 0 | nan cm | nan cm | — |
+
+## 실패 모드 분해
+
+최종 오차가 같아도 원인이 다르면 처방이 반대다. `도달후이탈`은 멈추게 만들어야 하고, `미도달`은 더 가게 만들어야 한다.
+
+| 모드 | 구간 수 | 비율 |
+|---|---|---|
+| 성공 (위치·heading·정지 모두 충족) | 1225 | 31.2% |
+| 도착했으나 안 멈춤 | 135 | 3.4% |
+| 위치는 맞고 heading만 미달 | 71 | 1.8% |
+| 도달했다가 이탈 | 503 | 12.8% |
+| 한 번도 도달 못함 | 1991 | 50.7% |
+
+- 최근접 거리 median 9.0 cm / p90 30.3 cm (구간 중 목표에 가장 가까웠던 순간)
+- 접근방향 잔차 median -0.14 m (+ = 목표를 지나침), 횡방향 |오차| median 0.06 m, 오버슈트 비율 14%
+
+## 목표 유형별
+
+| 유형 | n | 비중 | 위치 median | 위치 p90 | heading median | 성공률(엄격) | 도달후이탈 |
+|---|---|---|---|---|---|---|---|
+| combined | 947 | 24% | 20.3 cm | 37.5 cm | 4.2° | 3% | 2% |
+| straight | 830 | 21% | 19.5 cm | 35.8 cm | 4.0° | 3% | 3% |
+| lateral | 806 | 21% | 14.0 cm | 27.1 cm | 4.1° | 7% | 5% |
+| turn | 742 | 19% | 10.5 cm | 19.6 cm | 4.0° | 13% | 53% |
+| stand | 600 | 15% | 2.4 cm | 6.2 cm | 1.1° | 84% | 4% |
+
+## 초기 목표거리별
+
+| 거리 구간 | n | 위치 median | 위치 p90 | heading median | 미도달 | 도달후이탈 |
+|---|---|---|---|---|---|---|
+| 0.00–0.25 m | 1657 | 6.9 cm | 18.1 cm | 2.4° | 8% | 29% |
+| 0.25–0.50 m | 420 | 12.5 cm | 23.2 cm | 4.3° | 63% | 3% |
+| 0.50–1.00 m | 860 | 17.7 cm | 29.5 cm | 4.3° | 81% | 1% |
+| 1.00–1.50 m | 568 | 22.4 cm | 37.4 cm | 3.8° | 87% | 1% |
+| 1.50–2.00 m | 278 | 26.6 cm | 45.5 cm | 4.1° | 94% | 0% |
+| 2.00–∞ m | 142 | 29.1 cm | 48.3 cm | 4.9° | 95% | 0% |
+
+## 낙상 분석
+
+- 유형별: stand 1회, lateral 1회, combined 1회
+- 구간 시작 후 median 0.0s 시점, 해당 구간 초기 목표거리 median 0.35 m
+
+## 부가 지표
+
+- 도착 시 속도 median 0.06 m/s (정지 기준 0.10 m/s)
+- 성공률(엄격: 5cm+10°+정지): 17.9%
+- 성공률(완화: 10cm+10°): 34.6%
+
+## 다음에 확인/시도할 것
+
+- **주 실패 모드: 애초에 도달 못함** (51%가 목표 5cm 안에 한 번도 못 들어옴). constellation은 exp(-w·d²) 형태라 멀리서는 기울기가 거의 사라진다 (w=0.2, d=2m → exp(-0.8)). → `rewards.scales.goal_progress`를 0.5~1.0으로 켜서 원거리 유인을 주거나, `rewards.constellation_weight`를 0.2에서 0.1로 낮춰 basin을 넓힐 것. 둘 다 하면 과하니 하나씩.
+- **위치만 미달, heading은 통과**: constellation의 d_con = d² + 2r²(1-cosθ)에서 r=1.0 m라 heading 항의 가중이 상대적으로 크다. → `rewards.constellation_radius`를 0.6~0.7로 낮춰 위치 항 비중을 올리거나, `rewards.goal_position_sigma`를 1.0에서 절반으로 줄여 근거리 정밀도를 세울 것.
+- **언더슈트 경향**: 접근 방향 기준 잔차 median -0.14 m (86%가 목표 앞에서 멈춤). 마지막 몇 cm를 좁힐 유인이 없다 → `goal_position_sigma` 축소 또는 `goal_reached`(+)로 최종 도달을 명시적으로 보상.
+- **유형 편차 큼**: `combined` 구간의 위치오차 median 20.3 cm vs `stand` 2.4 cm. 전체 median만 보면 가려지는 차이다 → `commands.goal_categories`에서 `combined` 비중을 0.25에서 올려 해당 유형을 더 학습시킬 것.
+- **낙상 3회** (기준 0회). 낙상의 최다 유형은 `stand`(1회), 구간 시작 후 median 0.0s 시점. → 영상에서 해당 시점 확인(`--record_video`), `rewards.terminate_height`(0.35)와 `orientation`/`base_height` 페널티 균형 점검.
+- 눈으로 확인: `python eval_goal_pose.py ... --record_video` (env 0을 mp4로 저장) 또는 로컬에서 `play.py`.
+
+report saved to: /mnt/DATA/workspace/ws_eungkyu/k1-goalpose/htwk-gym/logs/K1/K1/Goal_Pose_V3/2026-07-25-04-07-04/eval/select_2026-07-25-14-54-43/winner_video

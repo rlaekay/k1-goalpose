@@ -826,3 +826,22 @@ median ≤ 5 cm. 못 넘기면 팔 URDF가 warm start를 깬 것이므로, F 배
 > (`run_v7_suite.sh`가 실패 시 학습을 아예 시작하지 않는다), **`train_and_eval.sh`가 학습
 > 후 clean/stress eval을 자동 실행**한다. 즉 **사람이 기억할 필요가 없는 구조**로 이미 묶여
 > 있고, 여기에 위 3개 지표를 넣어 커버리지를 채웠다.
+
+
+
+#### video 감상
+### E0
+- symmetric loss에 문제가 좀 있어보임. 안 들어갔나?
+### E1
+- robust한 따라가기 좋고, 전반적으로 괜찮아보임. 잘 안 넘어지고, 순간속도도 매우 올라감.
+- steady state error가 있음. 그냥 offset to goal 이 학습된 것 같은데
+- standing posture에서 오른발이 안쪽으로 치우쳐있음.
+### E2
+- 가까운 goal을 chase하는 속도가 매우 느림
+- 다리 대칭문제 있음
+- 그냥 속도가 매우 느림
+### V7
+- goal jitter에는 잘 대응함을 확인할 수 있었음. 그러나 e1과 같이 goal chasing관련해서는 flickering goal을 잘 따르지 못하는 듯 함. 이걸 jitter에 robust한 특성만 살려서 다음 version of training에 어떻게 반영할 수 잇을까?
+- 오른발 symmetry문제 존재
+- 순간속도는 적절하게 나옴
+- walking이 살짝 불안함. 외란에 어떻게 대응하는지 모르겠음
