@@ -423,7 +423,8 @@ def main():
             "--rl_device", cfg["basic"]["rl_device"],
             "--out", video_dir,
             "--record_video", "--record_video_s", str(args.record_video_s),
-        ], check=False, cwd=repo_root, capture_output=True, text=True)
+        ], check=False, cwd=repo_root, capture_output=True, text=True,
+           encoding="utf-8", errors="replace")
         # This used to be check=False with the output discarded, so when the
         # 2026-07-27 v7 batch produced no mp4 for any of its four runs there was
         # nothing anywhere saying why. A failure here must not kill the
