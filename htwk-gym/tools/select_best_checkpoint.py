@@ -413,16 +413,34 @@ def main():
     if args.record_video:
         print("\nrecording video for the winner...")
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        subprocess.run([
+        video_dir = os.path.abspath(os.path.join(out_dir, "winner_video"))
+        proc = subprocess.run([
             sys.executable, "eval_goal_pose.py",
             "--task", args.task,
             "--config", config_path,
             "--checkpoint", winner["checkpoint"],
             "--sim_device", cfg["basic"]["sim_device"],
             "--rl_device", cfg["basic"]["rl_device"],
-            "--out", os.path.abspath(os.path.join(out_dir, "winner_video")),
+            "--out", video_dir,
             "--record_video", "--record_video_s", str(args.record_video_s),
-        ], check=False, cwd=repo_root)
+        ], check=False, cwd=repo_root, capture_output=True, text=True)
+        # This used to be check=False with the output discarded, so when the
+        # 2026-07-27 v7 batch produced no mp4 for any of its four runs there was
+        # nothing anywhere saying why. A failure here must not kill the
+        # selection (the numbers above are already valid and expensive), but it
+        # must be impossible to miss.
+        mp4 = os.path.join(video_dir, "rollout_env0.mp4")
+        if proc.returncode != 0 or not os.path.exists(mp4):
+            print("!" * 70)
+            print("VIDEO FAILED (exit {}) — selection results above are still valid.".format(proc.returncode))
+            for stream, name in ((proc.stderr, "stderr"), (proc.stdout, "stdout")):
+                tail = [ln for ln in (stream or "").strip().splitlines() if ln.strip()][-15:]
+                if tail:
+                    print("--- {} (last {} lines) ---".format(name, len(tail)))
+                    print("\n".join(tail))
+            print("!" * 70)
+        else:
+            print("video: {}".format(mp4))
 
 
 if __name__ == "__main__":

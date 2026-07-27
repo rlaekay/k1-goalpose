@@ -1327,6 +1327,21 @@ def write_outputs(out_dir, results, roll, report_md, env=None, cfg=None):
     with open(os.path.join(out_dir, "report.md"), "w", encoding="utf-8") as f:
         f.write(report_md + "\n")
 
+    if env is not None and cfg is not None and not (hasattr(env, "camera_frames") and len(env.camera_frames) > 0):
+        # The 2026-07-27 v7 batch produced no mp4 for any of its four runs and
+        # nothing said why. Pin down which layer dropped it: Isaac Gym silently
+        # disables graphics when headless unless viewer.record_video was already
+        # true at sim-creation time, and create_camera_sensor can also fail on a
+        # headless box with several processes contending for the GPU.
+        print("!!! VIDEO: no frames captured.")
+        print("    graphics_device_id = {} (-1 means Isaac Gym created the sim with NO "
+              "graphics; viewer.record_video must be true BEFORE build_env)".format(
+                  getattr(env, "graphics_device_id", "?")))
+        print("    viewer.record_video (now) = {}".format(cfg.get("viewer", {}).get("record_video")))
+        print("    env.camera = {}".format(getattr(env, "camera", "<unset>")))
+        print("    env.camera_frames = {}".format(
+            len(env.camera_frames) if hasattr(env, "camera_frames") else "<attribute never created>"))
+
     if env is not None and cfg is not None and hasattr(env, "camera_frames") and len(env.camera_frames) > 0:
         import imageio
         radius = cfg["rewards"].get("constellation_radius", 1.0)

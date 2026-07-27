@@ -120,19 +120,33 @@ F_ARMS = {
     # its first real measurement anywhere in the project.
     "F1_timed": dict(**_OFF_PATH, **_OFF_ROBUST, **_OFF_PROTECT,
                      **{"rewards.final_window_s": 2.0}),
-    # + path mode, but now on the FIXED lookahead (pace/floor/leash) and the
-    # grid-adaptive (speed x curvature) curriculum instead of the scalar one.
-    # This is the arm masterplan2 answer #2/#3 exists to produce: the achieved-
-    # vs-commanded speed table's saturation point is K1's measured physical
-    # ceiling, and the grid's active-cell footprint is the first real evidence
-    # on whether translation/rotation coupling is the actual bottleneck.
+    # + path mode on the FIXED lookahead (pace/floor/leash), the grid-adaptive
+    # (speed x curvature) curriculum, and carrot dwell.
+    #
+    # The v7 batch made this the load-bearing arm. It confirmed path mode raises
+    # speed (segment peak median 0.35 -> 1.20 m/s) but also exposed that path
+    # training wrecks waypoint accuracy (6.3 cm -> 37.9 cm) because the goal is
+    # never reachable, and left the sustained ceiling unresolved because the
+    # tracking ratio came out NON-MONOTONIC (0.92 -> 0.45 -> 0.77). That
+    # non-monotonicity is the speed/curvature confound in raw form: speed and
+    # curvature were sampled independently, so one commanded-speed bin mixes
+    # easy wide curves with impossible tight ones. The grid separates them, and
+    # dwell (in the base config) removes the waypoint conflict -- so F2 is now
+    # testing three coupled repairs, not one lever. That is deliberate: they are
+    # mutually dependent (path_lag needs the floor, the grid promotes on
+    # path_lag, dwell keeps the waypoint gate meaningful), and E1 already
+    # provides the without-any-of-them control.
     "F2_grid": dict(**_OFF_ROBUST, **_OFF_PROTECT,
                     **{"commands.path.speed_grid.enabled": True}),
-    # + robustness, with BT flicker turned up (0.004 -> 0.01) as the answer to
-    # "does flicker training actually buy stress-jitter robustness". Compare
-    # its stress:jitter report against E0's (flicker OFF) for the same question
-    # E2 vs E0 was supposed to answer, this time with the arms-down URDF and a
-    # harder flicker rate.
+    # + robustness, with BT flicker turned up (0.004 -> 0.01).
+    #
+    # The v7 batch left this question unresolved rather than answered: E2
+    # (flicker on) did get the lowest stress |omega| p90 at 2.46 vs E0's 2.76,
+    # but E2 was also by far the slowest arm (3.6% of time above 1.0 m/s vs
+    # E0's 14.4%), so "filters the jitter" and "simply moves less" are not
+    # separable in that comparison. F3 keeps the disturbance suite identical to
+    # E2's and changes only the flicker rate, so if F3 lands at E2-like |omega|
+    # WITHOUT E2's speed collapse, filtering is real.
     "F3_stress": dict(**_OFF_PATH, **_OFF_PROTECT,
                       **{"noise.goal_bt_flicker.prob_per_step": 0.01}),
     # F4: reserved. Filled in after the v7 + F1-F3 results are in hand, as the
