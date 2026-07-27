@@ -165,6 +165,11 @@ _FONT = {
 def _draw_text(img, x, y, text, color=(235, 235, 235), scale=2):
     """Blit `text` at (x, y) top-left, `scale` pixels per font pixel."""
     h, w = img.shape[:2]
+    draw_color = np.asarray(color, dtype=img.dtype)
+    if img.ndim == 3 and img.shape[2] == 4 and draw_color.shape[0] == 3:
+        draw_color = np.asarray((color[0], color[1], color[2], 255), dtype=img.dtype)
+    elif img.ndim == 3 and draw_color.shape[0] != img.shape[2]:
+        draw_color = draw_color[:img.shape[2]]
     cx = x
     for ch in text.upper():
         glyph = _FONT.get(ch)
@@ -177,7 +182,7 @@ def _draw_text(img, x, y, text, color=(235, 235, 235), scale=2):
                     continue
                 px, py = cx + col * scale, y + row * scale
                 if 0 <= py < h and 0 <= px < w:
-                    img[py:py + scale, px:px + scale] = color
+                    img[py:py + scale, px:px + scale] = draw_color
         cx += 6 * scale
     return cx
 
@@ -1354,6 +1359,8 @@ def write_outputs(out_dir, results, roll, report_md, env=None, cfg=None):
                 f = draw_constellation_inset(frame.copy(), st[0], st[1], st[2], st[3], radius)
                 if len(st) >= 11:
                     f = draw_telemetry_hud(f, st)
+                if f.ndim == 3 and f.shape[2] == 4:
+                    f = f[..., :3]
                 writer.append_data(f)
         print("video written (constellation inset + velocity/disturbance HUD): {}".format(video_path))
 
