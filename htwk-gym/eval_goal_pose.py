@@ -54,7 +54,7 @@ from utils.runner import get_task_class
 
 # goal_categories mixture in envs/K1/*.yaml, as recorded by GoalPose._resample_goals
 CATEGORY_NAMES = {-1: "uniform", 0: "stand", 1: "straight", 2: "lateral", 3: "turn", 4: "combined",
-                  5: "path"}
+                  5: "path", 6: "seq"}
 # Mirrors envs/K1/goal_pose_v7.CATEGORY_PATH. Duplicated rather than imported so
 # eval_goal_pose stays usable for tasks that never load the v7 env.
 CATEGORY_PATH = 5

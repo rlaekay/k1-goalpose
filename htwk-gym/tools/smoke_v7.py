@@ -121,6 +121,8 @@ def main():
 
     falls = 0
     dwell_seen = 0
+    seq_adv = 0
+    seq_prev = env.seq_idx.clone() if hasattr(env, "seq_idx") else None
     for i in range(args.steps):
         if model is not None:
             with torch.no_grad():
@@ -155,6 +157,10 @@ def main():
         prev_path_mask = path_mask
         prev_goal = env.goal_pos_world.clone()
 
+        if seq_prev is not None:
+            seq_adv += int((env.seq_idx > seq_prev).sum().item())
+            seq_prev = env.seq_idx.clone()
+
         if hasattr(env, "path_dwell_left"):
             dwell_seen += int(((env.path_dwell_left > 0) & env.is_path_env).sum().item())
 
@@ -165,6 +171,8 @@ def main():
             push_active_steps += 1
             push_f_seen.append(f[act_mask].cpu().numpy())
             push_t_seen.append(t[act_mask].cpu().numpy())
+
+    seq_r = env._reward_seq_goal() if hasattr(env, "_reward_seq_goal") else torch.zeros(1)
 
     check("rewards and observations stay finite", rew_bad == 0,
           "{} bad steps".format(rew_bad))
@@ -232,6 +240,33 @@ def main():
         check("dwell duty cycle is in the configured ballpark",
               observed <= expect * 3.0 + 0.02,
               "observed {:.1%} vs configured ~{:.1%}".format(observed, expect))
+
+    # ---- v8 SmoothTurn ------------------------------------------------------
+    if getattr(env, "st_on", False):
+        n_seq = int(env.is_seq_env.sum().item())
+        share = cfg["commands"].get("smooth_turn", {}).get("share", 0.0)
+        check("sequential-nav share matches config",
+              abs(n_seq / float(env.num_envs) - share) < 0.12 or share == 0.0,
+              "configured {:.2f}, got {:.2f} ({} envs)".format(
+                  share, n_seq / float(env.num_envs), n_seq))
+        if n_seq > 0:
+            # Goals must be BANKED, not just approached: if seq_idx never
+            # advances the sequential reward is stuck at rho/N and the whole
+            # mechanism reduces to a single-goal task with extra bookkeeping.
+            check("goals actually get banked", seq_adv > 0,
+                  "{} goal advances across {} seq envs in {} steps".format(
+                      seq_adv, n_seq, args.steps))
+            # The lookahead window must be live in the six reused slots. All-zero
+            # means the observation is carrying nothing and the policy is blind
+            # to upcoming turns -- the ablation in the paper shows that costs
+            # most of the benefit.
+            look = env.commands[env.is_seq_env, 4:10]
+            check("lookahead window populated (command slots 4-9)",
+                  float(look.abs().max().item()) > 1e-3,
+                  "max |lookahead| = {:.3f}".format(float(look.abs().max().item())))
+            check("sequential reward finite and in [0, 1]",
+                  bool(torch.isfinite(seq_r).all()) and float(seq_r.max().item()) <= 1.001,
+                  "max {:.3f}".format(float(seq_r.max().item())))
 
     if getattr(env, "grid_on", False):
         active = int(env.grid_active.sum().item())
