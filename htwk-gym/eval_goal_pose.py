@@ -246,6 +246,46 @@ def draw_constellation_inset(frame, base_xy, base_yaw, goal_xy, goal_yaw, radius
     return frame
 
 
+def draw_goal_sequence(frame, base_xy, base_yaw, seq, k, size=240, span=3.0):
+    """Overlay the upcoming goal sequence on the constellation inset (v8).
+
+    Sequential navigation is impossible to judge from a single goal marker: the
+    whole question is whether the robot sets up a turn BEFORE it arrives, which
+    only reads if the next goals are visible in the same frame. Banked goals go
+    grey, the active one amber, upcoming ones green and fading.
+
+    Writes through `rgb = inset[..., :3]` so it is correct for both RGB and RGBA
+    camera frames -- Isaac Gym's IMAGE_COLOR is RGBA, which is what broke the
+    HUD once already (commit 5493840).
+    """
+    if seq is None or len(seq) == 0:
+        return frame
+    inset = frame[8:8 + size, 8:8 + size]
+    rgb = inset[..., :3]
+    scale = size / (2.0 * span)
+
+    def to_px(wx, wy):
+        return size / 2.0 - (wy - base_xy[1]) * scale, size / 2.0 - (wx - base_xy[0]) * scale
+
+    prev = None
+    for i, g in enumerate(seq):
+        x, y = to_px(g[0], g[1])
+        if i < k:
+            color = (90, 90, 90)                       # banked
+        elif i == k:
+            color = (255, 190, 60)                     # active
+        else:
+            fade = max(0.35, 1.0 - 0.25 * (i - k))
+            color = (int(70 * fade), int(220 * fade), int(120 * fade))
+        _draw_disk(rgb, x, y, 6 if i == k else 4, color)
+        hx, hy = to_px(g[0] + 0.3 * np.cos(g[2]), g[1] + 0.3 * np.sin(g[2]))
+        _draw_line(rgb, x, y, hx, hy, color)
+        if prev is not None:
+            _draw_line(rgb, prev[0], prev[1], x, y, (60, 60, 60))
+        prev = (x, y)
+    return frame
+
+
 # --------------------------------------------------------------------------
 # statistics helpers
 # --------------------------------------------------------------------------
@@ -551,6 +591,9 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
                 float(np.degrees(env.heading_error[0].item())),
                 push_n,
                 push_nm,
+                (env.seq_goals[0].cpu().numpy().copy()
+                 if hasattr(env, "seq_goals") and bool(env.is_seq_env[0]) else None),
+                int(env.seq_idx[0].item()) if hasattr(env, "seq_idx") else 0,
             ))
             if (step_i + 1) * env.dt >= record_video_s:
                 env.cfg["viewer"]["record_video"] = False  # stop accumulating frames (memory)
@@ -579,6 +622,7 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     out["speed_hist_max"] = speed_hist_max
     out["angvel_hist"] = angvel_hist
     out["angvel_hist_max"] = angvel_hist_max
+    out["v7_extras"] = dict(getattr(env, "extras", {}).get("v7", {}) or {})
     out["upright_share"] = upright_steps / float(max(total_steps * env.num_envs, 1))
     out["env_minutes"] = total_steps * env.dt * env.num_envs / 60.0
     return out
@@ -654,6 +698,10 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
         "obs_noise": obs_noise,
         "authoritative_gate_evaluation": not exploratory,
         "env_code_sha": env_code_sha(),
+        # Symmetry / joint-margin telemetry. These were being written into
+        # env.extras["v7"] and read by nothing, so every "we added the metric"
+        # claim was hollow -- the numbers never reached a report.
+        "v7_extras": roll.get("v7_extras") or {},
         "segments_completed": n,
         "segments_scored_by_gates": n_gate,
         "segments_path_excluded_from_gates": n_path,
@@ -1380,6 +1428,8 @@ def write_outputs(out_dir, results, roll, report_md, env=None, cfg=None):
                 f = draw_constellation_inset(frame.copy(), st[0], st[1], st[2], st[3], radius)
                 if len(st) >= 11:
                     f = draw_telemetry_hud(f, st)
+                if len(st) >= 13 and st[11] is not None:
+                    f = draw_goal_sequence(f, st[0], st[1], st[11], st[12], radius and 240 or 240)
                 if f.ndim == 3 and f.shape[2] == 4:
                     f = f[..., :3]
                 writer.append_data(f)

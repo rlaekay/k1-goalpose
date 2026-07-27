@@ -42,7 +42,7 @@ New mechanisms, each independently switchable:
 """
 
 from isaacgym import gymtorch, gymapi
-from isaacgym.torch_utils import torch_rand_float
+from isaacgym.torch_utils import torch_rand_float, get_euler_xyz
 
 assert gymtorch
 
@@ -105,6 +105,7 @@ class GoalPoseV7(GoalPoseV3):
         self.dist_next = torch.zeros(n, dtype=torch.long, device=dev)
         self._init_disturbance_schedule()
         self._init_speed_grid()
+        self._init_arm_script()
         # step() calls _update_goal_state() twice and _resample_goals() once, so an
         # unguarded advance would run the path 3x per control step (i.e. 3x the
         # commanded speed). Advance at most once per common_step_counter tick.
@@ -476,8 +477,130 @@ class GoalPoseV7(GoalPoseV3):
         # whether left/right actually became symmetric. This is the direct
         # readout of armA's "left foot always slightly ahead" observation.
         if hasattr(self, "feet_pos") and self.feet_pos.shape[1] >= 2:
-            fwd = self.feet_pos[:, 0, 0] - self.feet_pos[:, 1, 0]
-            e["feet_fwd_asymmetry"] = float(fwd.mean().item())
+            # Measured in the BASE frame, not the world frame: in world frame a
+            # turning robot makes every left/right difference oscillate with
+            # heading and the mean washes out to zero regardless of the gait.
+            rel = self.feet_pos[:, :2, :] - self.base_pos.unsqueeze(1)
+            _, _, yaw = get_euler_xyz(self.base_quat)
+            cy, sy = torch.cos(yaw), torch.sin(yaw)
+            fx = cy.unsqueeze(1) * rel[:, :, 0] + sy.unsqueeze(1) * rel[:, :, 1]
+            fy = -sy.unsqueeze(1) * rel[:, :, 0] + cy.unsqueeze(1) * rel[:, :, 1]
+            # fore-aft: "left foot always slightly ahead" (armA)
+            e["feet_fwd_asymmetry"] = float((fx[:, 0] - fx[:, 1]).mean().item())
+            # LATERAL: how far the stance sits off the body centreline. The
+            # reviewer's observation -- fore-aft looked fine but the right hip
+            # yaw sat pulled toward the centre -- is invisible to the fore-aft
+            # term above and only shows up here.
+            e["feet_lat_offset"] = float((fy[:, 0] + fy[:, 1]).mean().item() / 2.0)
+            e["feet_width"] = float((fy[:, 0] - fy[:, 1]).abs().mean().item())
+            # per-joint left/right bias: the direct readout for hip yaw
+            for i, nm in enumerate(self.dof_names):
+                if not nm.startswith("Left_"):
+                    continue
+                j = self.dof_names.index("Right_" + nm[len("Left_"):])
+                # Roll/Yaw mirror with a sign flip, Pitch/Knee sign-preserving
+                sgn = -1.0 if ("Roll" in nm or "Yaw" in nm) else 1.0
+                bias = (self.dof_pos[:, i] - sgn * self.dof_pos[:, j]).mean()
+                e["bias_" + nm[len("Left_"):]] = float(bias.item())
+
+
+    # ---- 7. scripted (non-learned) arm DOFs ---------------------------------
+    #
+    # The static arms-down pose already captures the inertia win (I_zz -69%).
+    # What it cannot do is CHANGE with motion state, which is what was asked
+    # for: elbows straightened into a clean, repeatable stance when parked (the
+    # RLKick handoff pose), tucked rearward once moving so the hands cannot
+    # catch on another robot.
+    #
+    # The elbows are revolute in K1_locomotion_armswing.urdf but stay OUT of the
+    # action and observation vectors: they are driven from a closed form, not
+    # learned. That keeps num_actions at 12 and the observation at 54, so E0's
+    # weights still load -- which is the whole reason this is worth doing at all.
+    #
+    # The trigger is NOT a hand-picked speed cut-off. It reuses the exact
+    # "parked" test the reward already uses, so there is one definition of
+    # stopped in the system instead of two that can disagree:
+    #     goal_dist < goal_reach_radius AND |v| < stop_speed AND |w| < stop_ang
+    # On hardware the BT already knows goal_reached, and IMU gives the rest.
+
+    def _init_arm_script(self):
+        a = self.cfg.get("arm_script") or {}
+        self.arm_script_on = bool(a.get("enabled", False))
+        self.leg_dof_idx = None
+        if not self.arm_script_on:
+            return
+        arm_names = a.get("joints", ["Left_Elbow_Pitch", "Right_Elbow_Pitch",
+                                     "Left_Elbow_Yaw", "Right_Elbow_Yaw"])
+        self.arm_dof_idx = torch.tensor(
+            [self.dof_names.index(n) for n in arm_names if n in self.dof_names],
+            dtype=torch.long, device=self.device)
+        self.leg_dof_idx = torch.tensor(
+            [i for i, n in enumerate(self.dof_names) if n not in arm_names],
+            dtype=torch.long, device=self.device)
+        if len(self.leg_dof_idx) != self.num_actions:
+            raise ValueError(
+                "arm_script expects {} leg DOFs to match num_actions={}, got {}. "
+                "Check asset.file points at the armswing URDF.".format(
+                    self.num_actions, self.num_actions, len(self.leg_dof_idx)))
+        self.arm_parked = torch.tensor(
+            [float(a.get("parked", {}).get(n, 0.0)) for n in arm_names],
+            dtype=torch.float, device=self.device)
+        self.arm_moving = torch.tensor(
+            [float(a.get("moving", {}).get(n, 0.0)) for n in arm_names],
+            dtype=torch.float, device=self.device)
+        self.arm_blend = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
+    def _arm_targets(self):
+        """Blend between the parked and moving arm poses.
+
+        Blended rather than switched: a step change in 2.9 kg of arm would kick
+        the base every time the robot starts or stops, which is a disturbance we
+        would then have to learn to reject for no reason.
+        """
+        a = self.cfg.get("arm_script") or {}
+        r = self.cfg["rewards"]
+        parked = ((self.goal_dist < r.get("goal_reach_radius", 0.1))
+                  & (torch.norm(self.root_states[:, 7:9], dim=-1) < r.get("stop_speed_threshold", 0.1))
+                  & (torch.norm(self.root_states[:, 10:13], dim=-1)
+                     < max(r.get("stop_ang_speed_threshold", 0.3), 1e-6)))
+        tau = float(a.get("blend_tau_s", 0.25))
+        alpha = float(min(1.0, self.dt / max(tau, 1e-6)))
+        self.arm_blend += alpha * (torch.where(parked, torch.zeros_like(self.arm_blend),
+                                               torch.ones_like(self.arm_blend)) - self.arm_blend)
+        b = self.arm_blend.unsqueeze(-1)
+        return self.arm_parked.unsqueeze(0) * (1.0 - b) + self.arm_moving.unsqueeze(0) * b
+
+    def _dof_targets_from_actions(self):
+        if not self.arm_script_on:
+            return super()._dof_targets_from_actions()
+        full = self.default_dof_pos.repeat(self.num_envs, 1).clone()
+        scale = self.cfg["control"]["action_scale"]
+        full[:, self.leg_dof_idx] = (self.default_dof_pos[:, self.leg_dof_idx]
+                                     + scale * self.actions)
+        full[:, self.arm_dof_idx] = self._arm_targets()
+        return full
+
+    def _obs_dofs(self, x):
+        return x if not self.arm_script_on else x[:, self.leg_dof_idx]
+
+    def _leg_slice(self, x):
+        """Keep the observation at 54 by hiding the scripted arm DOFs from it.
+
+        Without this, adding four revolute elbows takes dof_pos and dof_vel from
+        12 to 16 each and the observation from 54 to 62 -- which discards every
+        warm start, the exact cost this design exists to avoid.
+        """
+        return x if self.leg_dof_idx is None else x[:, self.leg_dof_idx]
+
+    def _expand_actions(self, dof_targets):
+        """Scatter the 12 learned leg targets and the 4 scripted arm targets
+        into the full num_dofs vector the PD loop expects."""
+        if not self.arm_script_on or self.leg_dof_idx is None:
+            return dof_targets
+        full = self.default_dof_pos.repeat(self.num_envs, 1).clone()
+        full[:, self.leg_dof_idx] = dof_targets[:, :len(self.leg_dof_idx)]
+        full[:, self.arm_dof_idx] = self._arm_targets()
+        return full
 
     # ---- 3. BT-flicker on the perceived goal --------------------------------
 

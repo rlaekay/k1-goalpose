@@ -122,6 +122,7 @@ def main():
     falls = 0
     dwell_seen = 0
     seq_adv = 0
+    arm_blend_lo, arm_blend_hi = 1.0, 0.0
     seq_prev = env.seq_idx.clone() if hasattr(env, "seq_idx") else None
     for i in range(args.steps):
         if model is not None:
@@ -160,6 +161,11 @@ def main():
         if seq_prev is not None:
             seq_adv += int((env.seq_idx > seq_prev).sum().item())
             seq_prev = env.seq_idx.clone()
+
+        if getattr(env, "arm_script_on", False):
+            b = env.arm_blend
+            arm_blend_lo = min(arm_blend_lo, float(b.min().item()))
+            arm_blend_hi = max(arm_blend_hi, float(b.max().item()))
 
         if hasattr(env, "path_dwell_left"):
             dwell_seen += int(((env.path_dwell_left > 0) & env.is_path_env).sum().item())
@@ -240,6 +246,25 @@ def main():
         check("dwell duty cycle is in the configured ballpark",
               observed <= expect * 3.0 + 0.02,
               "observed {:.1%} vs configured ~{:.1%}".format(observed, expect))
+
+    # ---- scripted arms ------------------------------------------------------
+    if getattr(env, "arm_script_on", False):
+        # The entire point of keeping these out of the action/observation
+        # vectors is that E0's weights still load. If the width moved, that
+        # failed and the run would silently start from scratch.
+        check("scripted arms leave the observation at 54", env.num_obs == 54,
+              "num_obs={}".format(env.num_obs))
+        check("scripted arms leave num_actions at 12", env.num_actions == 12,
+              "num_actions={}".format(env.num_actions))
+        check("arm DOFs exist and are excluded from the leg set",
+              len(env.arm_dof_idx) == 4 and len(env.leg_dof_idx) == 12,
+              "{} arm / {} leg of {} dofs".format(
+                  len(env.arm_dof_idx), len(env.leg_dof_idx), env.num_dofs))
+        # A blend that never leaves 0 or 1 means the parked test never flipped,
+        # so the pose is effectively static and the mechanism is inert.
+        check("arm pose actually blends with motion state",
+              arm_blend_lo < 0.5 < arm_blend_hi,
+              "blend spanned [{:.2f}, {:.2f}] over the run".format(arm_blend_lo, arm_blend_hi))
 
     # ---- v8 SmoothTurn ------------------------------------------------------
     if getattr(env, "st_on", False):

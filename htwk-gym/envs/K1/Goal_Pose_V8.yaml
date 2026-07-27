@@ -524,6 +524,21 @@ rewards:
   feet_offset_vel_scale_x: 0.6  # [m/s]
   feet_offset_vel_scale_y: 0.3  # [m/s]
 
+# Scripted (non-learned) elbow DOFs: straighten when parked, tuck the hands
+# rearward once moving. Requires asset.file = K1_locomotion_armswing.urdf, which
+# makes the four elbows revolute; they stay out of the action and observation
+# vectors so num_actions=12 and num_observations=54 are unchanged.
+# Trigger reuses the SAME parked test the reward uses, so "stopped" has one
+# definition in the system rather than two that can drift apart.
+arm_script:
+  enabled: false
+  joints: [Left_Elbow_Pitch, Right_Elbow_Pitch, Left_Elbow_Yaw, Right_Elbow_Yaw]
+  parked: {Left_Elbow_Pitch: 0.0,   Right_Elbow_Pitch: 0.0,
+           Left_Elbow_Yaw:  -0.35,  Right_Elbow_Yaw:   0.35}
+  moving: {Left_Elbow_Pitch: 2.080, Right_Elbow_Pitch: 2.080,
+           Left_Elbow_Yaw:  -1.580, Right_Elbow_Yaw:   1.580}
+  blend_tau_s: 0.25
+
 evaluation:
   # defaults for eval_goal_pose.py (CLI flags override)
   num_envs: 256

@@ -509,13 +509,26 @@ class GoalPose(BaseTask):
             return
         raise NotImplementedError("Goal-position curriculum is not implemented; keep cfg['commands']['curriculum'] = false.")
 
+    def _obs_dofs(self, x):
+        """Which DOFs the observation carries. Identity here; v7 overrides it to
+        hide scripted (non-learned) joints so the observation width is stable."""
+        return x
+
+    def _dof_targets_from_actions(self):
+        """PD position targets for every DOF.
+
+        Extracted so a subclass can drive DOFs the policy does not control
+        (v7's scripted elbows) without duplicating step().
+        """
+        return self.default_dof_pos + self.cfg["control"]["action_scale"] * self.actions
+
     def step(self, actions):
         # pre physics step
         self.actions[:] = torch.clip(actions, -self.cfg["normalization"]["clip_actions"], self.cfg["normalization"]["clip_actions"])
         # snapshot for goal_progress: goals only change after reward computation, so this
         # distance and the post-physics one are guaranteed to be against the same goal
         self.last_goal_dist[:] = self.goal_dist
-        dof_targets = self.default_dof_pos + self.cfg["control"]["action_scale"] * self.actions
+        dof_targets = self._dof_targets_from_actions()
 
         # perform physics step
         self.torques.zero_()
@@ -716,8 +729,8 @@ class GoalPose(BaseTask):
                 noisy_commands * commands_scale,
                 (torch.cos(2 * torch.pi * self.gait_process)).unsqueeze(-1),
                 (torch.sin(2 * torch.pi * self.gait_process)).unsqueeze(-1),
-                apply_randomization(self.dof_pos - self.default_dof_pos, self.cfg["noise"].get("dof_pos")) * self.cfg["normalization"]["dof_pos"],
-                apply_randomization(self.dof_vel, self.cfg["noise"].get("dof_vel")) * self.cfg["normalization"]["dof_vel"],
+                self._obs_dofs(apply_randomization(self.dof_pos - self.default_dof_pos, self.cfg["noise"].get("dof_pos")) * self.cfg["normalization"]["dof_pos"]),
+                self._obs_dofs(apply_randomization(self.dof_vel, self.cfg["noise"].get("dof_vel")) * self.cfg["normalization"]["dof_vel"]),
                 self.actions,
             ),
             dim=-1,

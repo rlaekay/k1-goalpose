@@ -331,7 +331,7 @@
   </link>
   <joint
     name="Left_Elbow_Pitch"
-    type="fixed">
+    type="revolute">
     <origin
       xyz="0 0.044428 0"
       rpy="0.00000 2.08000 0.00000" />
@@ -390,7 +390,7 @@
   </link>
   <joint
     name="Left_Elbow_Yaw"
-    type="fixed">
+    type="revolute">
     <origin
       xyz="0 0.1215 0"
       rpy="0.00000 0.00000 -1.58000" />
@@ -557,7 +557,7 @@
   </link>
   <joint
     name="Right_Elbow_Pitch"
-    type="fixed">
+    type="revolute">
     <origin
       xyz="0 -0.044428 0"
       rpy="0.00000 2.08000 0.00000" />
@@ -616,7 +616,7 @@
   </link>
   <joint
     name="Right_Elbow_Yaw"
-    type="fixed">
+    type="revolute">
     <origin
       xyz="0 -0.1215 0"
       rpy="0.00000 0.00000 1.58000" />
