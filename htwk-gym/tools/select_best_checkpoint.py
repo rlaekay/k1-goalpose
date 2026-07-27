@@ -230,7 +230,27 @@ def main():
         p.error("--stages must be increasing (cheap screening first)")
     include = [int(i) for i in args.include.split(",") if i.strip()]
 
-    config_path = args.config or os.path.join("envs", "{}.yaml".format(args.task))
+    # Default to the RUN'S OWN config, not envs/<task>.yaml.
+    #
+    # The v7 batch (2026-07-27) was silently evaluated wrong because of this:
+    # every arm fell back to envs/K1/Goal_Pose_V7.yaml, which has path mode at
+    # 50% and the full perception-noise stack. E0 and E2 were trained with path
+    # OFF, so 44-46% of their evaluation segments were a task they had never
+    # seen once -- and 90 of E0's 93 falls and 123 of E2's 125 falls were in
+    # exactly those segments. Their headline gates measured the harness, not the
+    # policy. Comparing across arms stayed fair (all four got the identical
+    # task), but comparing any of them to armA-D did not, and neither did
+    # reading a single arm's number as "how good is this policy at its job".
+    #
+    # A single --config still overrides, for the deliberate case of scoring
+    # several runs on one common task.
+    if args.config:
+        config_path = args.config
+    elif len(args.run_dir) == 1 and os.path.exists(os.path.join(args.run_dir[0], "config.yaml")):
+        config_path = os.path.join(args.run_dir[0], "config.yaml")
+        print("config: using the run's own {} (pass --config to override)".format(config_path))
+    else:
+        config_path = os.path.join("envs", "{}.yaml".format(args.task))
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.load(f.read(), Loader=yaml.FullLoader)
     eval_cfg = cfg.setdefault("evaluation", {})

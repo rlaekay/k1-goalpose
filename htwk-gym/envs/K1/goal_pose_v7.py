@@ -87,6 +87,8 @@ class GoalPoseV7(GoalPoseV3):
         # distance can never reach 0 in path mode (the goal is meant to sit
         # lookahead_min ahead), so raw distance is not the tracking error.
         self.path_lag = torch.zeros(n, dtype=torch.float, device=dev)
+        self.path_dwell_left = torch.zeros(n, dtype=torch.long, device=dev)
+        self.path_dwell_next = torch.zeros(n, dtype=torch.long, device=dev)
         self.track_ok_steps = torch.zeros(n, dtype=torch.float, device=dev)
         self.track_steps = torch.zeros(n, dtype=torch.float, device=dev)
         self.grid_on = False
@@ -259,13 +261,44 @@ class GoalPoseV7(GoalPoseV3):
         x1, y1 = self._path_world(u0 + du)
         ds_du = torch.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2).clamp(min=1.0e-4) / du
 
+        # ---- dwell: the carrot periodically STOPS and must be parked on ----
+        # The 2026-07-27 v7 eval showed path training wrecking waypoint accuracy:
+        # waypoint-only position error was 6.3 cm for E0 (no path training) but
+        # 37.9 cm for E1 and 38.7 cm for V7, both path-trained, while their stand
+        # category stayed fine at 5.0 cm. A goal that is ALWAYS lookahead_min
+        # ahead and never reachable teaches "hold station behind the target",
+        # and that habit is exactly wrong for a waypoint, where the job is to
+        # arrive and stop. Mixing the two 50/50 with one reward produced a policy
+        # that did neither.
+        # Dwell removes the conflict instead of trading it off: the carrot pauses
+        # (and releases the minimum-distance floor, or arriving would still be
+        # impossible), so path mode ends in the same "arrive and stop" state that
+        # waypoint mode is entirely about. goal_reached then fires on both.
+        dw = p.get("dwell") or {}
+        if dw.get("enabled", False):
+            self.path_dwell_left = (self.path_dwell_left - 1).clamp(min=0)
+            self.path_dwell_next = self.path_dwell_next - 1
+            fire = (self.path_dwell_next <= 0) & ids
+            if bool(fire.any()):
+                k = int(fire.sum().item())
+                lo, hi = dw.get("duration_s", [1.5, 3.0])
+                self.path_dwell_left[fire] = (torch_rand_float(
+                    lo, hi, (k, 1), device=self.device).squeeze(1) / self.dt).long().clamp(min=1)
+                lo, hi = dw.get("interval_s", [4.0, 10.0])
+                self.path_dwell_next[fire] = torch.randint(
+                    int(lo / self.dt), max(int(lo / self.dt) + 1, int(hi / self.dt)),
+                    (k,), device=self.device)
+        dwelling = self.path_dwell_left > 0
+
         l_min = self.lookahead                                   # per-env, [0.5, 3.0]
+        l_min = torch.where(dwelling, torch.zeros_like(l_min), l_min)
         l_max = torch.clamp(self.lookahead * float(p.get("leash_ratio", 1.6)),
                             max=float(p.get("lookahead_max_m", 3.5)))
         l_max = torch.maximum(l_max, l_min + 0.1)
 
         u_proj = self._project_robot(u0, ds_du)
-        u_paced = u0 + self.path_dir * self.path_speed * self.dt / ds_du
+        pace = torch.where(dwelling, torch.zeros_like(self.path_speed), self.path_speed)
+        u_paced = u0 + self.path_dir * pace * self.dt / ds_du
         # clamp in "progress" coordinates so the sign of path_dir drops out
         d = self.path_dir
         prog = torch.clamp(d * u_paced,

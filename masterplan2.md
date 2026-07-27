@@ -4,6 +4,14 @@
 > 이 문서는 armA/B/C/D + v3 평가 결과로 **버전을 통폐합한 뒤의 단일 아키텍처**를 정의한다.
 > 항목별 사용자 피드백 답변은 [MASTERPLAN_feedback.md](MASTERPLAN_feedback.md)에 있다.
 
+> ## ⚠️ 2026-07-27 갱신 — 이 문서의 §3-2 / §4-1 / §6 일부는 실측으로 정정됐다
+>
+> v7 4개 arm 결과는 [masterplan3.md](masterplan3.md)에 있다. 특히:
+> - **평가가 arm별 config가 아니라 베이스 config로 돌았다** — 이 문서의 v7 게이트 예상치는 무효
+> - **path 학습이 waypoint 정확도를 파괴한다**(6.3 → 37.9 cm). §3-2의 "waypoint 50% 유지로
+>   armB의 정지 능력을 보존한다"는 **틀렸고**, dwell 메커니즘 + path 비중 0.35로 수정됐다
+> - **속도 목표는 달성됐다**(구간최고 median 1.20 m/s)
+
 ---
 
 ## 1. 이번 평가가 확정한 것 두 가지

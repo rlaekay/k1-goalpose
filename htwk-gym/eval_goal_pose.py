@@ -573,17 +573,41 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
     feasible_speed = eval_cfg.get("feasible_speed_mps", 0.6)
     stop_thr = cfg["rewards"].get("stop_speed_threshold", 0.1)
 
-    pos = roll["pos_err"]
-    head_deg = np.degrees(roll["head_err"])
-    speed = roll["speed"]
+    pos_all = roll["pos_err"]
+    head_all = np.degrees(roll["head_err"])
+    speed_all = roll["speed"]
+    cat_all = roll["category"]
+
+    # The position gates are ONLY meaningful on waypoint segments.
+    #
+    # In path mode the goal deliberately sits lookahead_min ahead of the robot
+    # and keeps moving, so "distance to the goal when the segment ended" is a
+    # readout of the lookahead distance, not of tracking error -- it can never
+    # approach zero by construction, and "arrived then left" is 87-100% by
+    # definition because the carrot passes through the 5 cm radius and moves on.
+    # In the 2026-07-27 v7 batch these segments were 44-49% of the sample and
+    # dragged every headline number (E0: 6.5 cm on waypoints, 75 cm on path,
+    # 13.2 cm reported). Path tracking has its own metric -- path_lag and the
+    # commanded-vs-achieved table -- so it is scored there instead.
+    gate_mask = cat_all != CATEGORY_PATH
+    if not gate_mask.any():
+        gate_mask = np.ones_like(cat_all, dtype=bool)
+
+    # Full arrays stay full: every per-category / per-distance / failure-mode
+    # breakdown below indexes them by masks built from the same length, and the
+    # path rows in those tables are still worth reading. Only the GATES are
+    # restricted.
+    pos, head_deg, speed = pos_all, head_all, speed_all
     n = len(pos)
     if n == 0:
         raise RuntimeError("no completed goal segments — duration too short or every env fell")
     falls = int(roll["falls"])
     attempts = n + falls
 
-    pos_med, pos_p90 = _median(pos), _pct(pos, 90)
-    head_med = _median(head_deg)
+    gate_pos, gate_head = pos_all[gate_mask], head_all[gate_mask]
+    n_gate, n_path = int(gate_mask.sum()), int((~gate_mask).sum())
+    pos_med, pos_p90 = _median(gate_pos), _pct(gate_pos, 90)
+    head_med = _median(gate_head)
 
     ok_pos_loose = pos <= g_pos_p90
     ok_head = head_deg <= g_head_med
@@ -602,19 +626,22 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
         "obs_noise": obs_noise,
         "authoritative_gate_evaluation": not exploratory,
         "segments_completed": n,
+        "segments_scored_by_gates": n_gate,
+        "segments_path_excluded_from_gates": n_path,
         "segments_censored_by_episode_end": roll["censored"],
         "falls": falls,
         "fall_rate_per_attempt": falls / attempts if attempts else 0.0,
-        "pos_err_m": {"median": pos_med, "p90": pos_p90, "mean": float(np.mean(pos)), "max": float(np.max(pos))},
-        "heading_err_deg": {"median": head_med, "p90": _pct(head_deg, 90),
-                            "mean": float(np.mean(head_deg)), "max": float(np.max(head_deg))},
+        "pos_err_m": {"median": pos_med, "p90": pos_p90,
+                      "mean": float(np.mean(gate_pos)), "max": float(np.max(gate_pos))},
+        "heading_err_deg": {"median": head_med, "p90": _pct(gate_head, 90),
+                            "mean": float(np.mean(gate_head)), "max": float(np.max(gate_head))},
         "final_speed_mps": {"median": _median(speed), "p90": _pct(speed, 90), "mean": float(np.mean(speed))},
-        "success_rate_strict": _frac((pos <= g_pos_med) & ok_head & ok_stop),
-        "success_rate_loose": _frac(ok_pos_loose & ok_head),
+        "success_rate_strict": _frac((pos[gate_mask] <= g_pos_med) & ok_head[gate_mask] & ok_stop[gate_mask]),
+        "success_rate_loose": _frac(ok_pos_loose[gate_mask] & ok_head[gate_mask]),
         "ci95": {
-            "pos_median": bootstrap_ci(pos, 50.0, seed=seed),
-            "pos_p90": bootstrap_ci(pos, 90.0, seed=seed),
-            "heading_median": bootstrap_ci(head_deg, 50.0, seed=seed),
+            "pos_median": bootstrap_ci(gate_pos, 50.0, seed=seed),
+            "pos_p90": bootstrap_ci(gate_pos, 90.0, seed=seed),
+            "heading_median": bootstrap_ci(gate_head, 50.0, seed=seed),
         },
         "timing": {
             "setup_wall_s": setup_wall_s,
@@ -987,8 +1014,10 @@ def render_report(r):
     md.append("- 벽시계: setup {:.1f}s + rollout {:.1f}s; env당 {:.1f}× real-time, 총 {:.0f} env·s/wall-s".format(
         t["setup_wall_s"], t["rollout_wall_s"], t["single_env_realtime_factor"],
         t["aggregate_env_seconds_per_wall_second"]))
-    md.append("- 완료 구간 {}개 / 낙상 {}회 / 에피소드경계 절단 {}개".format(
-        r["segments_completed"], r["falls"], r["segments_censored_by_episode_end"]))
+    md.append("- 완료 구간 {}개 (게이트 채점 {}개, path {}개는 게이트에서 제외) / 낙상 {}회 / 에피소드경계 절단 {}개".format(
+        r["segments_completed"], r.get("segments_scored_by_gates", r["segments_completed"]),
+        r.get("segments_path_excluded_from_gates", 0),
+        r["falls"], r["segments_censored_by_episode_end"]))
     md.append("")
 
     md.append("## 게이트 참고치 (탐색용 preview — 공식 판정 아님)" if not r["authoritative_gate_evaluation"]

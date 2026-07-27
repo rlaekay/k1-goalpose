@@ -146,8 +146,8 @@ commands:
   # never teach or measure a 1.3 m/s walk. path = a lookahead point that ADVANCES
   # along a curve at a commanded speed, which is what creates a speed demand.
   goal_mode_mixture:
-    waypoint: 0.5
-    path: 0.5
+    waypoint: 0.65
+    path: 0.35
 
   path:
     shapes: [0, 1, 2, 3, 4, 5]  # figure8, circle, spiral, rose/star, wander, serpentine
@@ -158,6 +158,18 @@ commands:
                                  # 0.41 m) where constellation is flat and the
                                  # gradient vanishes.
     leash_ratio: 1.6             # max carrot distance = lookahead_m * this
+
+    # The carrot periodically STOPS, and releases the distance floor while it
+    # does, so the robot must catch it and park on it. Without this, path mode
+    # teaches "hold station behind a target that is never reachable", which the
+    # 2026-07-27 eval showed leaking into waypoint mode: waypoint-only error was
+    # 6.3 cm for the non-path arm vs 37.9/38.7 cm for the two path-trained ones.
+    # With dwell, path mode ENDS in the same arrive-and-stop state that waypoint
+    # mode is about, so the two stop pulling against each other.
+    dwell:
+      enabled: true
+      interval_s: [4.0, 10.0]
+      duration_s: [1.5, 3.0]
     lookahead_max_m: 3.5         # leash: goal never runs further ahead than this
     speed_range_mps: [0.3, 1.6]  # commanded path speed; top end scaled by curriculum
     speed_curriculum: true       # scalar fallback; ignored when speed_grid.enabled
