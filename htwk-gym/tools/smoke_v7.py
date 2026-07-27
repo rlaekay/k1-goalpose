@@ -114,9 +114,10 @@ def main():
     gaps, seg_ticks, rew_bad = [], 0, 0
     goal_step_move = []
     push_f_seen, push_t_seen, push_active_steps = [], [], 0
-    prev_seg = env.goal_segment_id.clone() if hasattr(env, "goal_segment_id") else None
+    has_segment_id = hasattr(env, "goal_segment_id")
+    prev_seg = env.goal_segment_id.clone() if has_segment_id else None
     prev_goal = env.goal_pos_world.clone()
-    path_mask = env.is_path_env.clone()
+    prev_path_mask = env.is_path_env.clone()
 
     falls = 0
     dwell_seen = 0
@@ -132,18 +133,26 @@ def main():
         if not torch.isfinite(rew).all() or not torch.isfinite(obs).all():
             rew_bad += 1
 
-        if hasattr(env, "goal_segment_id"):
-            seg_ticks += int((env.goal_segment_id != prev_seg).sum().item())
-            prev_seg = env.goal_segment_id.clone()
+        if has_segment_id:
+            seg_changed = env.goal_segment_id != prev_seg
+            seg_ticks += int(seg_changed.sum().item())
+        else:
+            seg_changed = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
 
         alive = ~done
+        path_mask = env.is_path_env.clone()
         if path_mask.any():
-            m = path_mask & alive
+            # Only measure steady path-carrot motion. Resets can switch goal mode,
+            # and segment rerolls deliberately teleport/re-anchor the carrot.
+            m = prev_path_mask & path_mask & alive & ~seg_changed
             if bool(m.any()):
                 gaps.append(torch.norm(
                     env.goal_pos_world[m] - env.base_pos[m, :2], dim=-1).cpu().numpy())
                 moved = torch.norm(env.goal_pos_world[m] - prev_goal[m], dim=-1)
                 goal_step_move.append(moved.cpu().numpy())
+        if has_segment_id:
+            prev_seg = env.goal_segment_id.clone()
+        prev_path_mask = path_mask
         prev_goal = env.goal_pos_world.clone()
 
         if hasattr(env, "path_dwell_left"):
