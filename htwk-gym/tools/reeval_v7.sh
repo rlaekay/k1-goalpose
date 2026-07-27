@@ -3,6 +3,14 @@
 #
 #   bash tools/reeval_v7.sh
 #   ARMS="E1_path V7_full" bash tools/reeval_v7.sh
+#   GPUS="0" bash tools/reeval_v7.sh          # force everything onto one GPU
+#
+# Runs arms in parallel, one queue per GPU in $GPUS (default "0 1"): arms are
+# dealt round-robin into as many queues as there are GPUs, and each queue's
+# arms run one after another while the queues themselves run concurrently.
+# 256-env eval is light (~2.6 GB, observed) so two queues fit easily even
+# alongside another user's job; this was serial on a single GPU before, which
+# left the second GPU idle for the whole ~30 min run for no reason.
 #
 # Why: the 2026-07-27 batch was scored against envs/K1/Goal_Pose_V7.yaml instead
 # of each arm's own sweeps/*.yaml, because train_and_eval.sh called
@@ -40,52 +48,108 @@ rm -f /tmp/check_names.$$
 
 RUN_ROOT="${RUN_ROOT:-logs/K1/K1/Goal_Pose_V7}"
 ARMS="${ARMS:-E0_armB_armsdown E1_path E2_robust V7_full}"
-GPU="${GPU:-0}"
-DEV="cuda:$GPU"
+GPUS="${GPUS:-0 1}"
 VIDEO_S="${VIDEO_S:-60}"
 COMMON="${COMMON:-envs/K1/Goal_Pose_V7.yaml}"
 OUT_ROOT="$REPO_ROOT/shared_eval_videos/reeval_$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$OUT_ROOT"
 
-for arm in $ARMS; do
+run_arm() {  # arm gpu
+  local arm=$1 gpu=$2 dev="cuda:$2"
+  local RUN_DIR
   RUN_DIR=$(ls -d "$RUN_ROOT"/*"$arm" 2>/dev/null | head -1)
   if [ -z "$RUN_DIR" ] || [ ! -d "$RUN_DIR" ]; then
     echo "!!! run 디렉토리 없음: $RUN_ROOT/*$arm — 건너뜀" >&2
-    continue
+    return 1
   fi
-  echo ""
-  echo "================ $arm ================"
+  echo "================ $arm (GPU $gpu) ================"
   echo "run: $RUN_DIR"
 
-  # 1) best checkpoint, re-selected on the arm's OWN task
   echo "--- [1/3] 자기 과제로 최적 체크포인트 재선택 + 평가 + 영상 ---"
   python tools/select_best_checkpoint.py \
     --run_dir "$RUN_DIR" --task K1/Goal_Pose_V7 \
-    --sim_device "$DEV" --rl_device "$DEV" \
+    --sim_device "$dev" --rl_device "$dev" \
     --record_video --record_video_s "$VIDEO_S" --link_best
+  local SEL_DIR BEST
   SEL_DIR=$(ls -td "$RUN_DIR"/eval/select_*/ 2>/dev/null | head -1)
   BEST=$(cat "${SEL_DIR}BEST_CHECKPOINT" 2>/dev/null || ls -t "$RUN_DIR"/nn/model_*.pth | head -1)
 
-  D="$OUT_ROOT/${arm}"
+  local D="$OUT_ROOT/${arm}"
   mkdir -p "$D/own_task"
   for f in report.md report.json segments.csv selection.md BEST_CHECKPOINT; do
     [ -f "${SEL_DIR}$f" ] && cp "${SEL_DIR}$f" "$D/own_task/"
   done
   [ -f "${SEL_DIR}winner_video/rollout_env0.mp4" ] && cp "${SEL_DIR}winner_video/rollout_env0.mp4" "$D/own_task/"
 
-  # 2) same winner, scored on the shared v7 task -> cross-arm comparison
   echo "--- [2/3] 공통 v7 과제로 평가 (arm 간 비교용) ---"
   python eval_goal_pose.py --task K1/Goal_Pose_V7 --config "$COMMON" \
-    --checkpoint "$BEST" --sim_device "$DEV" --rl_device "$DEV" \
+    --checkpoint "$BEST" --sim_device "$dev" --rl_device "$dev" \
     --out "$D/common_task"
 
-  # 3) jitter stress
   echo "--- [3/3] stress jitter ---"
   python eval_goal_pose.py --task K1/Goal_Pose_V7 --config "$COMMON" \
-    --checkpoint "$BEST" --sim_device "$DEV" --rl_device "$DEV" \
+    --checkpoint "$BEST" --sim_device "$dev" --rl_device "$dev" \
     --stress jitter --duration_s 60 --out "$D/stress_jitter" || \
     echo "!!! $arm stress 실패 (나머지 결과는 유효)" >&2
+  echo "================ $arm 완료 ================"
+}
+
+# Deal arms round-robin across the GPU list; each GPU's arms run one after
+# another inside that GPU's own background subshell, and the subshells
+# themselves run concurrently. set -e inside a `(...) &` only kills that
+# subshell, not this script, so one GPU's failure doesn't take down the other.
+# Plain indexed arrays only (no associative arrays / declare -A): those need
+# bash 4+, and this needs to work the same whether tested on macOS's bash 3.2
+# or run on the Linux server.
+read -ra GPU_LIST <<< "$GPUS"
+read -ra ARM_LIST <<< "$ARMS"
+NGPU=${#GPU_LIST[@]}
+QUEUES=()
+for ((k = 0; k < NGPU; k++)); do QUEUES[k]=""; done
+i=0
+for arm in "${ARM_LIST[@]}"; do
+  idx=$((i % NGPU))
+  QUEUES[idx]="${QUEUES[idx]} $arm"
+  i=$((i + 1))
 done
+
+echo "GPU 배정:"
+for ((k = 0; k < NGPU; k++)); do
+  [ -n "${QUEUES[k]}" ] && echo "  GPU ${GPU_LIST[k]}:${QUEUES[k]}"
+done
+echo ""
+
+pids=()
+for ((k = 0; k < NGPU; k++)); do
+  [ -n "${QUEUES[k]}" ] || continue
+  gpu="${GPU_LIST[k]}"
+  LOG="$OUT_ROOT/gpu${gpu}.log"
+  (
+    for arm in ${QUEUES[k]}; do
+      run_arm "$arm" "$gpu"
+    done
+  ) > "$LOG" 2>&1 &
+  pids[k]=$!
+  echo "GPU $gpu 큐 시작 (백그라운드, pid $!) — 로그: $LOG"
+done
+
+echo ""
+echo "대기 중... (진행 확인: tail -f $OUT_ROOT/gpu*.log)"
+fail=0
+for ((k = 0; k < NGPU; k++)); do
+  [ -n "${pids[k]:-}" ] || continue
+  if ! wait "${pids[k]}"; then
+    echo "!!! GPU ${GPU_LIST[k]} 큐에서 오류 발생 — $OUT_ROOT/gpu${GPU_LIST[k]}.log 확인" >&2
+    fail=1
+  fi
+done
+for ((k = 0; k < NGPU; k++)); do
+  [ -n "${QUEUES[k]}" ] || continue
+  echo ""
+  echo "----- GPU ${GPU_LIST[k]} 로그 (마지막 20줄) -----"
+  tail -20 "$OUT_ROOT/gpu${GPU_LIST[k]}.log"
+done
+[ "$fail" = "1" ] && echo "" && echo "!!! 일부 arm이 실패했습니다. 위 로그를 확인하십시오." >&2
 
 echo ""
 echo "================ 요약 ================"
