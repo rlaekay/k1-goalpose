@@ -280,6 +280,26 @@ def bootstrap_ci(x, q=50.0, n_boot=600, alpha=0.05, seed=0, max_n=20000):
 # environment / policy setup
 # --------------------------------------------------------------------------
 
+def env_code_sha():
+    """git SHA of the env/ tree, or None outside a repo.
+
+    E1's re-evaluation was destroyed by exactly the gap this closes: the
+    lookahead floor changed what path mode MEANS between training and scoring,
+    so a checkpoint was graded against semantics it had never trained on (path
+    error 24.8 -> 165.9 cm, falls 5 -> 346) and nothing in the output said so.
+    Config drift is visible because config.yaml is saved next to the run; code
+    drift is invisible. Recording the SHA makes it visible.
+    """
+    import subprocess
+    try:
+        root = os.path.dirname(os.path.abspath(__file__))
+        out = subprocess.run(["git", "-C", root, "log", "-1", "--format=%H", "--", "envs"],
+                             capture_output=True, text=True, timeout=10)
+        return (out.stdout or "").strip() or None
+    except Exception:
+        return None
+
+
 def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
                 record_video=False, keep_perturbations=False, no_noise=False,
                 stress=None):
@@ -633,6 +653,7 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
         "perturbations": perturbations,
         "obs_noise": obs_noise,
         "authoritative_gate_evaluation": not exploratory,
+        "env_code_sha": env_code_sha(),
         "segments_completed": n,
         "segments_scored_by_gates": n_gate,
         "segments_path_excluded_from_gates": n_path,
@@ -1413,6 +1434,23 @@ def main():
         if checkpoint is None:
             raise FileNotFoundError("no .pth checkpoint found under logs/")
     print("Evaluating checkpoint: {}".format(checkpoint))
+
+    # Loud warning if the env code moved since this checkpoint was trained.
+    run_dir = os.path.dirname(os.path.dirname(os.path.abspath(checkpoint)))
+    stamp = os.path.join(run_dir, "ENV_CODE_SHA")
+    if os.path.exists(stamp):
+        trained_sha = open(stamp, encoding="utf-8").read().strip()
+        now_sha = env_code_sha()
+        if trained_sha and now_sha and trained_sha != now_sha:
+            print("!" * 70)
+            print("WARNING: envs/ has changed since this checkpoint was trained.")
+            print("  trained under: {}".format(trained_sha[:12]))
+            print("  evaluating as: {}".format(now_sha[:12]))
+            print("  If the change altered what the TASK means (goal semantics,")
+            print("  reward structure, reaching conditions), these numbers score the")
+            print("  policy against a task it never saw. That is what invalidated")
+            print("  E1's re-evaluation on 2026-07-27: path 24.8 -> 165.9 cm.")
+            print("!" * 70)
 
     env = build_env(cfg, args.task)
     device = cfg["basic"]["rl_device"]

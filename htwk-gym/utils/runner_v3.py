@@ -33,6 +33,19 @@ class RunnerV3(Runner):
 
     def train(self):
         self.recorder = Recorder(self.cfg)
+        # Stamp the env-code SHA beside the run. Config drift is already visible
+        # (config.yaml sits next to the checkpoints); code drift is not, and it
+        # silently invalidated E1's re-evaluation on 2026-07-27.
+        try:
+            import subprocess
+            _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            _sha = subprocess.run(["git", "-C", _root, "log", "-1", "--format=%H", "--", "envs"],
+                                  capture_output=True, text=True, timeout=10).stdout.strip()
+            if _sha:
+                with open(os.path.join(self.recorder.dir, "ENV_CODE_SHA"), "w") as _f:
+                    _f.write(_sha + "\n")
+        except Exception:
+            pass
         obs, infos = self.env.reset()
         obs = obs.to(self.device)
         privileged_obs = infos["privileged_obs"].to(self.device)
