@@ -30,6 +30,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Undefined names cost a 100-second GPU run to discover on 2026-07-27
+# (CATEGORY_PATH in summarize()): ast.parse only checks syntax, so a NameError
+# waits until that branch executes. This is instant -- run it before anything.
+if ! python tools/check_names.py >/tmp/check_names.$$ 2>&1; then
+  grep -v "import \*" /tmp/check_names.$$ | grep UNDEFINED && {
+    echo "!!! 정의되지 않은 이름이 있습니다 — 실행을 중단합니다." >&2
+    rm -f /tmp/check_names.$$
+    exit 1
+  }
+fi
+rm -f /tmp/check_names.$$
+
 SESSION="${SESSION:-v7}"
 ITERS="${ITERS:-12000}"
 ENVS="${ENVS:-4096}"

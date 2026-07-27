@@ -1,0 +1,261 @@
+"""Catch undefined names before they reach the GPU.
+
+`python -m py_compile` and `ast.parse` only check syntax, so a NameError sits
+quietly until the code actually executes that branch. That is exactly how
+`CATEGORY_PATH` shipped into eval_goal_pose.summarize() on 2026-07-27: the file
+parsed fine, the smoke path never touched it, and the re-eval died 100 seconds
+into its first candidate on a busy shared server.
+
+This walks each function, collects what is genuinely in scope (module globals,
+imports, parameters, assignments, comprehension targets, walrus, except-as,
+with-as, global/nonlocal declarations, class attributes) and flags loads of
+anything else. Deliberately conservative: it reports only names that resolve
+nowhere, so a hit is almost always real.
+
+Usage:
+    python tools/check_names.py                # every tracked .py
+    python tools/check_names.py eval_goal_pose.py
+"""
+
+import ast
+import builtins
+import os
+import sys
+
+
+BUILTINS = set(dir(builtins)) | {"__file__", "__name__", "__doc__", "__package__"}
+
+
+class ScopeCollector(ast.NodeVisitor):
+    """Names bound anywhere in a function body (Python has no block scope)."""
+
+    def __init__(self):
+        self.bound = set()
+
+    def _bind(self, target):
+        for node in ast.walk(target):
+            if isinstance(node, ast.Name):
+                self.bound.add(node.id)
+            elif isinstance(node, (ast.Starred, ast.Tuple, ast.List)):
+                continue
+
+    def visit_Assign(self, node):
+        for t in node.targets:
+            self._bind(t)
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node):
+        self._bind(node.target)
+        self.generic_visit(node)
+
+    def visit_AugAssign(self, node):
+        self._bind(node.target)
+        self.generic_visit(node)
+
+    def visit_NamedExpr(self, node):       # walrus
+        self._bind(node.target)
+        self.generic_visit(node)
+
+    def visit_For(self, node):
+        self._bind(node.target)
+        self.generic_visit(node)
+
+    visit_AsyncFor = visit_For
+
+    def visit_comprehension(self, node):
+        self._bind(node.target)
+        self.generic_visit(node)
+
+    def visit_withitem(self, node):
+        if node.optional_vars is not None:
+            self._bind(node.optional_vars)
+        self.generic_visit(node)
+
+    def visit_ExceptHandler(self, node):
+        if node.name:
+            self.bound.add(node.name)
+        self.generic_visit(node)
+
+    def visit_Import(self, node):
+        for a in node.names:
+            self.bound.add(a.asname or a.name.split(".")[0])
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node):
+        for a in node.names:
+            self.bound.add(a.asname or a.name)
+        self.generic_visit(node)
+
+    def visit_Global(self, node):
+        self.bound.update(node.names)
+
+    def visit_Nonlocal(self, node):
+        self.bound.update(node.names)
+
+    def visit_FunctionDef(self, node):
+        self.bound.add(node.name)          # nested def is a binding; don't descend
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, node):
+        self.bound.add(node.name)
+
+    def visit_Lambda(self, node):
+        pass                               # handled separately
+
+
+def params_of(node):
+    a = node.args
+    out = [p.arg for p in list(a.posonlyargs) + list(a.args) + list(a.kwonlyargs)]
+    if a.vararg:
+        out.append(a.vararg.arg)
+    if a.kwarg:
+        out.append(a.kwarg.arg)
+    return set(out)
+
+
+def module_globals(tree):
+    g = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            g.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for t in node.targets:
+                for x in ast.walk(t):
+                    if isinstance(x, ast.Name):
+                        g.add(x.id)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            for x in ast.walk(node.target):
+                if isinstance(x, ast.Name):
+                    g.add(x.id)
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                g.add(a.asname or a.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                g.add(a.asname or a.name)
+        elif isinstance(node, (ast.If, ast.Try, ast.For, ast.While, ast.With)):
+            # conditionally-defined module-level names still count as defined
+            for sub in ast.walk(node):
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    g.add(sub.name)
+                elif isinstance(sub, ast.Assign):
+                    for t in sub.targets:
+                        for x in ast.walk(t):
+                            if isinstance(x, ast.Name):
+                                g.add(x.id)
+                elif isinstance(sub, ast.Import):
+                    for a in sub.names:
+                        g.add(a.asname or a.name.split(".")[0])
+                elif isinstance(sub, ast.ImportFrom):
+                    for a in sub.names:
+                        g.add(a.asname or a.name)
+    return g
+
+
+def check(path, star_import_seen=False):
+    src = open(path, encoding="utf-8").read()
+    tree = ast.parse(src)
+    # `from x import *` makes any name potentially defined -- stay silent rather
+    # than emit noise we would learn to ignore.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names):
+            star_import_seen = True
+    g = module_globals(tree) | BUILTINS
+    problems = []
+
+    NESTED = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+
+    def own_nodes(fn):
+        """Nodes belonging to THIS function, not to functions nested in it.
+
+        Without this the parent sees a nested function's locals as undefined
+        (and vice versa), which is pure noise -- a checker that cries wolf is one
+        we stop reading, which defeats the point of having it.
+        """
+        stack = list(fn.body)
+        while stack:
+            node = stack.pop()
+            if isinstance(node, NESTED):
+                continue          # neither yield it nor descend: not our scope
+            yield node
+            for child in ast.iter_child_nodes(node):
+                stack.append(child)
+
+    def nested_of(fn):
+        stack = list(fn.body)
+        while stack:
+            node = stack.pop()
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                yield node
+                continue
+            for child in ast.iter_child_nodes(node):
+                stack.append(child)
+
+    def walk_fn(fn, enclosing):
+        if isinstance(fn, ast.Lambda):
+            scope = enclosing | params_of(fn)
+            body = [fn.body]
+            name = "<lambda>"
+        else:
+            sc = ScopeCollector()
+            for stmt in fn.body:
+                sc.visit(stmt)
+            scope = enclosing | params_of(fn) | sc.bound
+            body = None
+            name = fn.name
+
+        if body is not None:                       # lambda: single expression
+            for node in body:
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                        if sub.id not in scope:
+                            problems.append((sub.lineno, name, sub.id))
+        else:
+            for node in own_nodes(fn):
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                    if node.id not in scope:
+                        problems.append((node.lineno, name, node.id))
+            for child in nested_of(fn):
+                walk_fn(child, scope)               # closures see the enclosing scope
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            walk_fn(node, g)
+        elif isinstance(node, ast.ClassDef):
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    walk_fn(sub, g)
+    return problems, star_import_seen
+
+
+def main():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    targets = sys.argv[1:]
+    if not targets:
+        targets = []
+        for d in (".", "tools", "envs/K1", "utils"):
+            full = os.path.join(root, d)
+            if os.path.isdir(full):
+                targets += [os.path.join(d, f) for f in sorted(os.listdir(full))
+                            if f.endswith(".py")]
+    bad = 0
+    for rel in targets:
+        p = rel if os.path.isabs(rel) else os.path.join(root, rel)
+        if not os.path.exists(p):
+            continue
+        try:
+            problems, star = check(p)
+        except SyntaxError as e:
+            print("SYNTAX  {}:{} {}".format(rel, e.lineno, e.msg))
+            bad += 1
+            continue
+        for lineno, fname, name in problems:
+            note = "  (파일에 `import *`가 있어 오탐일 수 있음)" if star else ""
+            print("UNDEFINED  {}:{}  in {}()  -> {}{}".format(rel, lineno, fname, name, note))
+            bad += 1
+    print("\n{} 개 파일 검사, 문제 {}건".format(len(targets), bad))
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
