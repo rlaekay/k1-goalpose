@@ -4,6 +4,7 @@
 #   bash tools/fetch_results.sh                 # everything new
 #   bash tools/fetch_results.sh E1_path         # just runs matching a pattern
 #   SERVER=192.168.0.42 bash tools/fetch_results.sh
+#   PORT=6666 SERVER=user@1.2.3.4 bash tools/fetch_results.sh  # non-default ssh port
 #   REPORTS_ONLY=1 bash tools/fetch_results.sh  # skip the mp4s (fast)
 #
 # Videos, reports and checkpoints are gitignored on purpose -- they never travel
@@ -17,6 +18,7 @@
 set -euo pipefail
 
 SERVER="${SERVER:-user@user-ESC4000A-E12}"
+PORT="${PORT:-22}"
 REMOTE_DIR="${REMOTE_DIR:-/mnt/DATA/workspace/ws_eungkyu/k1-goalpose/htwk-gym/shared_eval_videos}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCAL_DIR="${LOCAL_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)/K1_walk/v7}"
@@ -34,14 +36,14 @@ FILTER+=(--exclude='*')
 SRC="$SERVER:$REMOTE_DIR/"
 [ -n "$PATTERN" ] && SRC="$SERVER:$REMOTE_DIR/*${PATTERN}*/"
 
-echo "=== $SERVER"
+echo "=== $SERVER (port $PORT)"
 echo "    $REMOTE_DIR"
 echo " -> $LOCAL_DIR"
 [ -n "$PATTERN" ] && echo "    (필터: *${PATTERN}*)"
 echo ""
 
 # shellcheck disable=SC2086
-rsync -avP --prune-empty-dirs "${FILTER[@]}" $SRC "$LOCAL_DIR/"
+rsync -avP --prune-empty-dirs -e "ssh -p $PORT" "${FILTER[@]}" $SRC "$LOCAL_DIR/"
 
 echo ""
 echo "=== 받은 리포트 ==="

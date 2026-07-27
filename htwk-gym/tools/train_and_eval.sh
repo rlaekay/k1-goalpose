@@ -90,9 +90,10 @@ fi
 
 # Ship the video together with the reports that explain it, so the mp4 is never
 # looked at without the numbers next to it.
-for f in "$VIDEO_SRC" "${EVAL_DIR}report.md" "${EVAL_DIR}selection.md" "${EVAL_DIR}BEST_CHECKPOINT"; do
+for f in "$VIDEO_SRC" "${EVAL_DIR}report.md" "${EVAL_DIR}report.json" "${EVAL_DIR}selection.md" "${EVAL_DIR}BEST_CHECKPOINT"; do
   [ -f "$f" ] && cp "$f" "$DEST/"
 done
+[ -f "$DEST/rollout_env0.mp4" ] || echo "!!! 영상이 생성되지 않았습니다 (VIDEO_SRC=$VIDEO_SRC 없음) -- eval 로그에서 record_video 단계 실패 원인 확인 필요" >&2
 
 if [ "$STRESS" = "1" ]; then
   echo "=== 강건성 스트레스 평가 (goal jitter 50Hz) ==="
