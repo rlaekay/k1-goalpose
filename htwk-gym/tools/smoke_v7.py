@@ -119,6 +119,7 @@ def main():
     path_mask = env.is_path_env.clone()
 
     falls = 0
+    dwell_seen = 0
     for i in range(args.steps):
         if model is not None:
             with torch.no_grad():
@@ -144,6 +145,9 @@ def main():
                 moved = torch.norm(env.goal_pos_world[m] - prev_goal[m], dim=-1)
                 goal_step_move.append(moved.cpu().numpy())
         prev_goal = env.goal_pos_world.clone()
+
+        if hasattr(env, "path_dwell_left"):
+            dwell_seen += int(((env.path_dwell_left > 0) & env.is_path_env).sum().item())
 
         f = torch.norm(env.pushing_forces[:, env.base_indice, :], dim=-1)
         t = torch.norm(env.pushing_torques[:, env.base_indice, :], dim=-1)
@@ -172,14 +176,65 @@ def main():
                   observed, cmd_hi, lvl))
 
         g = np.concatenate(gaps)
-        leash = pcfg.get("lookahead_max_m", 3.5)
+        # Leash is now per-env: lookahead * leash_ratio, capped at lookahead_max_m.
+        # The old check compared against lookahead_max_m alone, which is only the
+        # cap and would pass even if the per-env leash were being ignored.
+        la_lo, la_hi = pcfg.get("lookahead_m", [0.5, 3.0])
+        leash = min(la_hi * float(pcfg.get("leash_ratio", 1.6)),
+                    float(pcfg.get("lookahead_max_m", 3.5)))
         check("leash holds the lookahead point",
               np.percentile(g, 99) <= leash * 1.25,
               "gap p50 {:.2f} p99 {:.2f} m, leash {:.2f}".format(
                   np.percentile(g, 50), np.percentile(g, 99), leash))
+
+        # The floor is the fix for the defect that made the goal drift onto the
+        # robot (measured gap median 0.41 m against a configured 0.5 m minimum),
+        # flattening the reward exactly where the robot was. While NOT dwelling
+        # the gap must stay at or above the smallest configured lookahead.
+        dwell_cfg = pcfg.get("dwell") or {}
+        if not dwell_cfg.get("enabled", False):
+            check("lookahead floor holds (goal never drifts onto the robot)",
+                  np.percentile(g, 2) >= la_lo * 0.75,
+                  "gap p2 {:.2f} m vs floor {:.2f} m".format(np.percentile(g, 2), la_lo))
+        else:
+            # With dwell on, the floor is deliberately released while the carrot
+            # is parked, so a low p2 is expected -- that is the whole mechanism.
+            # What must still hold is that the gap is not low ALL the time.
+            frac_below = float((g < la_lo * 0.75).mean())
+            check("dwell releases the floor, but only sometimes",
+                  0.0 < frac_below < 0.6,
+                  "{:.0%} of steps below the floor (expect a minority: dwell only)".format(frac_below))
     elif n_path > 0:
         check("path-mode samples collected", False,
               "no surviving path envs in {} steps -- policy may be falling immediately".format(args.steps))
+
+    # ---- dwell + grid: brand-new machinery, never executed before -----------
+    dwell_cfg = pcfg.get("dwell") or {}
+    if dwell_cfg.get("enabled", False) and n_path > 0:
+        # dwell is the repair for path training wrecking waypoint accuracy
+        # (6.3 cm -> 37.9 cm in the v7 batch). If the carrot never actually
+        # stops, the repair is absent and the next batch reproduces the fault.
+        check("dwell fires (carrot actually stops)", dwell_seen > 0,
+              "{} env-steps spent dwelling out of {}".format(dwell_seen, args.steps * n_path))
+        lo, hi = dwell_cfg.get("interval_s", [4.0, 10.0])
+        dur_lo, dur_hi = dwell_cfg.get("duration_s", [1.5, 3.0])
+        expect = (0.5 * (dur_lo + dur_hi)) / (0.5 * (lo + hi))
+        observed = dwell_seen / float(max(args.steps * n_path, 1))
+        check("dwell duty cycle is in the configured ballpark",
+              observed <= expect * 3.0 + 0.02,
+              "observed {:.1%} vs configured ~{:.1%}".format(observed, expect))
+
+    if getattr(env, "grid_on", False):
+        active = int(env.grid_active.sum().item())
+        total = int(env.grid_active.numel())
+        # Seeded at exactly one cell (slowest, straightest). If it were already
+        # wide open the curriculum would be doing nothing -- which is the
+        # no-curriculum condition Margolis et al. report as a total failure.
+        check("speed grid seeded small", 1 <= active < total,
+              "{}/{} cells active after {} steps".format(active, total, args.steps))
+        print("     grid speeds {} x curvatures {}".format(
+            [round(float(x), 2) for x in env.grid_speeds.tolist()],
+            [round(float(x), 2) for x in env.grid_curvs.tolist()]))
 
     # ---- segment accounting ------------------------------------------------
     if hasattr(env, "goal_segment_id"):
