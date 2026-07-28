@@ -162,6 +162,10 @@ commands:
                                  # well under the curve size: a wide window snaps to
                                  # another lobe of a figure-8/rose and teleports the goal.
     catchup_ratio: 1.5           # carrot may move at most this x max(pace, robot speed)
+    lookahead_scale_frac: 0.6    # lookahead <= this x path_scale. The curves' widest
+                                 # chord is 0.79-2.0 x scale depending on family, so an
+                                 # absolute 3.0 m carrot is unreachable on a small curve
+                                 # and the floor could never be met.
 
     # The carrot periodically STOPS, and releases the distance floor while it
     # does, so the robot must catch it and park on it. Without this, path mode

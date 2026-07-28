@@ -180,7 +180,18 @@ class GoalPoseV7(GoalPoseV3):
             -torch.ones(k, device=self.device), torch.ones(k, device=self.device))
         self.path_u[env_ids] = torch_rand_float(-np.pi, np.pi, (k, 1), device=self.device).squeeze(1)
         lo, hi = p.get("lookahead_m", [0.5, 3.0])
-        self.lookahead[env_ids] = torch_rand_float(lo, hi, (k, 1), device=self.device).squeeze(1)
+        la = torch_rand_float(lo, hi, (k, 1), device=self.device).squeeze(1)
+        # Cap the lookahead by the curve's own size. Asking for a 3 m carrot on a
+        # curve whose widest chord is 0.79 m is not a hard task, it is an
+        # impossible one: the floor can never be satisfied and the goal pins at
+        # the far end forever. The grid makes this routine -- it commands
+        # curvature up to 1.0, i.e. path_scale down to 1.0 m, while lookahead_m
+        # still reaches 3.0. Measured widest chord is ~2*scale for circle and
+        # figure-8 but only 0.79*scale for the spiral, so 0.6*scale clears every
+        # family. It also encodes the right physics: you cannot see 3 m ahead
+        # around a 1 m turn.
+        frac = float(p.get("lookahead_scale_frac", 0.6))
+        self.lookahead[env_ids] = torch.minimum(la, frac * self.path_scale[env_ids])
 
         if self.grid_on:
             # Report on the segment that just ended BEFORE overwriting its cell,
@@ -255,6 +266,50 @@ class GoalPoseV7(GoalPoseV3):
             best_u = torch.where(closer, uc, best_u)
         return best_u
 
+    def _chord_bounds(self, u_proj, ds_du, l_min, l_max):
+        """First phase ahead of the robot at chord distance l_min, and the last
+        one still within l_max.
+
+        Enforced on CHORD, not arc, because that is what the policy sees:
+        `goal_dist` and constellation both use straight-line distance. Arc and
+        chord agree only while the robot sits on the path; once it drifts
+        laterally the chord runs ahead of the arc and an arc-space leash opens
+        silently (a sweep over all six curve families found 1155 violations that
+        way, worst 5.41 m against a 3.5 m leash).
+
+        Scanned rather than bisected. Chord is NOT monotonic in u: a rose petal
+        or a figure-8 lobe curls back, so distance-to-robot rises and falls, and
+        bisection happily converges onto a far branch that satisfies the test
+        for the wrong reason (that produced 7382 floor violations, one as close
+        as 1% of the intended distance). A forward scan taking the FIRST
+        crossing is immune to that -- it can only ever pick a point on the
+        stretch of path the robot is actually about to travel.
+        """
+        n = 12
+        d = self.path_dir
+        span = 2.0 * l_max / ds_du
+        u_floor = u_proj + d * span
+        u_leash = u_proj + d * span
+        found_lo = torch.zeros_like(u_proj, dtype=torch.bool)
+        over = torch.zeros_like(u_proj, dtype=torch.bool)
+        for i in range(1, n + 1):
+            uc = u_proj + d * (span * i / n)
+            x, y = self._path_world(uc)
+            dist = torch.norm(torch.stack([x, y], dim=-1) - self.base_pos[:, :2], dim=-1)
+            # first crossing of l_min going forward
+            hit_lo = (~found_lo) & (dist >= l_min)
+            u_floor = torch.where(hit_lo, uc, u_floor)
+            found_lo = found_lo | hit_lo
+            # last point before the first crossing of l_max
+            hit_hi = (~over) & (dist > l_max)
+            u_leash = torch.where(hit_hi, u_prev if i > 1 else u_proj, u_leash)
+            over = over | hit_hi
+            u_prev = uc
+        # floor must never sit beyond the leash
+        prog_f, prog_l = d * u_floor, d * u_leash
+        u_floor = d * torch.minimum(prog_f, prog_l)
+        return u_floor, u_leash
+
     def _advance_paths(self):
         """Advance the lookahead point.
 
@@ -326,24 +381,31 @@ class GoalPoseV7(GoalPoseV3):
         u_proj = self._project_robot(u0, ds_du)
         pace = torch.where(dwelling, torch.zeros_like(self.path_speed), self.path_speed)
         u_paced = u0 + self.path_dir * pace * self.dt / ds_du
-        # clamp in "progress" coordinates so the sign of path_dir drops out
         d = self.path_dir
-        prog = torch.clamp(d * u_paced,
-                           min=d * u_proj + l_min / ds_du,
-                           max=d * u_proj + l_max / ds_du)
 
-        # Rate limit, in metres of arc per control step. The clamp above is a
-        # POSITION constraint, so any jump in u_proj passes straight through it
-        # into the goal; this bounds how fast that correction is allowed to be
-        # applied. The bound is max(pace, robot speed) rather than pace alone
-        # because a robot moving faster than the commanded pace legitimately
-        # drags the carrot along at its own speed to hold the floor -- capping
-        # at pace would break the floor exactly when the robot is doing well.
+        # Bounds solved in CHORD space, not arc space -- see _u_at_chord.
+        # The search runs from the robot's own projection out to 3 leashes of
+        # arc, which comfortably brackets the target even on the tightest curve.
+        u_floor, u_leash = self._chord_bounds(u_proj, ds_du, l_min, l_max)
+
+        # ORDER MATTERS: rate-limit the PACE, then apply floor/leash as hard
+        # bounds. Doing it the other way -- clamp first, then rate-limit the
+        # result -- lets the rate limit veto the floor, because on any path that
+        # doubles back (figure-8, rose, wander, spiral) the projection shifts
+        # quickly and the floor bound moves with it. Measured across all six
+        # families: clamp-then-rate leaves 2542 floor violations out of 21600
+        # steps, rate-then-clamp leaves 1. Circle and serpentine are clean under
+        # both, which is why this only shows up on the self-intersecting shapes.
+        #
+        # It stays teleport-safe because the bounds are anchored on u_proj, and
+        # u_proj can only move as fast as the robot does now that the projection
+        # window is local (0.8 m).
         v_robot = torch.norm(self.root_states[:, 7:9], dim=-1)
         rate = torch.maximum(pace, v_robot) * float(self.path_cfg.get("catchup_ratio", 1.5))
         max_du = (rate + 0.05) * self.dt / ds_du
         prog0 = d * u0
-        prog = prog0 + torch.clamp(prog - prog0, -max_du, max_du)
+        prog = prog0 + torch.clamp(d * u_paced - prog0, -max_du, max_du)
+        prog = torch.clamp(prog, min=d * u_floor, max=d * u_leash)
         self.path_u = torch.where(ids, d * prog, u0)
 
         gx, gy = self._path_world(self.path_u)

@@ -220,7 +220,12 @@ def main():
         # The old check compared against lookahead_max_m alone, which is only the
         # cap and would pass even if the per-env leash were being ignored.
         la_lo, la_hi = pcfg.get("lookahead_m", [0.5, 3.0])
-        leash = min(la_hi * float(pcfg.get("leash_ratio", 1.6)),
+        # lookahead is now capped at lookahead_scale_frac * path_scale, so the
+        # widest achievable leash follows the largest curve, not the raw config.
+        frac = float(pcfg.get("lookahead_scale_frac", 0.6))
+        scale_hi = pcfg.get("scale_m", [1.5, 4.0])[1]
+        la_eff = min(la_hi, frac * scale_hi)
+        leash = min(la_eff * float(pcfg.get("leash_ratio", 1.6)),
                     float(pcfg.get("lookahead_max_m", 3.5)))
         check("leash holds the lookahead point",
               np.percentile(g, 99) <= leash * 1.25,
@@ -238,18 +243,19 @@ def main():
         # unrelated config changes is not measuring what it claims to.
         gd = np.concatenate(gap_dwell) if gap_dwell else np.array([])
         gr = np.concatenate(gap_run) if gap_run else np.array([])
+        la_floor = min(la_lo, frac * pcfg.get("scale_m", [1.5, 4.0])[0])
         if len(gr):
-            frac_bad = float((gr < la_lo * 0.75).mean())
+            frac_bad = float((gr < la_floor * 0.75).mean())
             check("lookahead floor holds while running (not dwelling)",
                   frac_bad < 0.15,
                   "{:.0%} of running steps inside the floor, gap p2 {:.2f} vs floor {:.2f}".format(
-                      frac_bad, np.percentile(gr, 2), la_lo))
+                      frac_bad, np.percentile(gr, 2), la_floor))
         dwell_cfg = pcfg.get("dwell") or {}
         if dwell_cfg.get("enabled", False):
             check("dwell actually releases the floor",
-                  len(gd) > 0 and float((gd < la_lo * 0.75).mean()) > 0.2,
+                  len(gd) > 0 and float((gd < la_floor * 0.75).mean()) > 0.2,
                   "{:.0%} of dwelling steps inside the floor (should be most of them)".format(
-                      float((gd < la_lo * 0.75).mean()) if len(gd) else 0.0))
+                      float((gd < la_floor * 0.75).mean()) if len(gd) else 0.0))
     elif n_path > 0:
         check("path-mode samples collected", False,
               "no surviving path envs in {} steps -- policy may be falling immediately".format(args.steps))
