@@ -105,6 +105,7 @@ render() {
   local idx=0 arm own common stress state elapsed est stage_left min_remaining
   local previous_arm_end
 
+  now="$(date +%s)"
   if [ -z "$OUT_ROOT" ]; then
     OUT_ROOT="$(latest_out)"
   fi
@@ -134,7 +135,7 @@ render() {
   fi
   if command -v nvidia-smi >/dev/null 2>&1; then
     nvidia-smi -i "$GPU" --query-gpu=utilization.gpu,memory.used,memory.total \
-      --format=csv,noheader,nounits 2>/dev/null | awk -F, '{printf "GPU %s: %s%% util, %s / %s MiB\\n", "'"$GPU"'", $1, $2, $3}' || true
+      --format=csv,noheader,nounits 2>/dev/null | awk -F, '{printf "GPU %s: %s%% util, %s / %s MiB\n", "'"$GPU"'", $1, $2, $3}' || true
   fi
   echo ""
   printf '%-22s %-10s %-9s %s\n' "arm" "state" "runtime" "detail"
