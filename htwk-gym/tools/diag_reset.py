@@ -12,10 +12,18 @@ check_termination ORs three things together:
     velocity |root twist|^2 > terminate_vel      <- an exploding asset lands here
     height   base height below terminate_height  <- a genuine fall lands here
 
-So this steps the env with the same warm-start policy smoke uses, evaluates each
-clause separately every step, and reports the split plus the worst contact force
-per rigid body. A self-collision the URDF did not have before shows up as the
-velocity clause firing on step 1 with a named body carrying the force.
+step() calls _check_termination() -- which reads root_states/base_pos/contact_forces
+to decide reset_buf -- and THEN calls _reset_idx(reset_buf.nonzero()), which
+teleports exactly those envs back to spawn. Reading root_states/base_pos again
+after env.step() returns therefore sees the FRESH spawn state for every env that
+terminated, not the state that triggered the termination -- the velocity and
+height clauses silently under-report to zero this way (confirmed: 444,180 N on
+left_hand_link on step 1, with velocity/height both reporting 0/51200).
+
+So this monkeypatches _check_termination to snapshot the three clause booleans
+the instant they are computed, before _reset_idx can touch anything. The
+booleans themselves are fresh tensors from a `>` comparison, not views into
+root_states, so they survive the reset that follows in the same step().
 
 Usage:
     python tools/diag_reset.py --config sweeps/G3_full.yaml --task K1/Goal_Pose_V7 \\
@@ -83,6 +91,28 @@ def main():
         cfg["rewards"]["terminate_vel"], cfg["rewards"]["terminate_height"],
         cfg["rewards"]["terminate_contacts_on"]))
 
+    orig_check = env._check_termination
+    diag = {"c": None, "vb": None, "hb": None, "v2": None, "h": None}
+
+    def hooked_check():
+        # Replicate goal_pose._check_termination's three clauses on the SAME
+        # pre-reset tensors it reads, and stash them, then defer to the real
+        # implementation so behavior (including any subclass override) is
+        # unchanged.
+        v2 = env.root_states[:, 7:13].square().sum(dim=-1)
+        h = env.base_pos[:, 2] - env.terrain.terrain_heights(env.base_pos)
+        c = torch.zeros_like(v2, dtype=torch.bool)
+        if len(env.termination_contact_indices) > 0:
+            c = torch.any(torch.norm(
+                env.contact_forces[:, env.termination_contact_indices, :], dim=-1) > 1.0, dim=1)
+        diag["c"] = c
+        diag["vb"] = v2 > cfg["rewards"]["terminate_vel"]
+        diag["hb"] = h < cfg["rewards"]["terminate_height"]
+        diag["v2"], diag["h"] = v2, h
+        orig_check()
+
+    env._check_termination = hooked_check
+
     obs, _ = env.reset()
     n_contact = n_vel = n_height = n_timeout = 0
     first_step_resets = 0
@@ -95,24 +125,19 @@ def main():
                 act = policy.act(obs.to(cfg["basic"]["rl_device"])).loc.to(dev)
         else:
             act = torch.zeros(env.num_envs, env.num_actions, device=dev)
+        # worst_force must be sampled BEFORE step(), which is when contact_forces
+        # holds the value that triggered this step's termination decision -- by
+        # the time step() returns, envs that got reset already show fresh (near
+        # zero) contact forces for the next physics tick.
+        worst_force = torch.maximum(worst_force,
+                                    torch.norm(env.contact_forces, dim=-1).max(dim=0).values)
         obs, _, _, _ = env.step(act)
 
-        # Re-evaluate each clause on the post-step state, independently.
-        v2 = env.root_states[:, 7:13].square().sum(dim=-1)
-        h = env.base_pos[:, 2] - env.terrain.terrain_heights(env.base_pos)
-        c = torch.zeros_like(v2, dtype=torch.bool)
-        if len(env.termination_contact_indices) > 0:
-            c = torch.any(torch.norm(
-                env.contact_forces[:, env.termination_contact_indices, :], dim=-1) > 1.0, dim=1)
-        vb = v2 > cfg["rewards"]["terminate_vel"]
-        hb = h < cfg["rewards"]["terminate_height"]
-
+        c, vb, hb, v2, h = diag["c"], diag["vb"], diag["hb"], diag["v2"], diag["h"]
         n_contact += int(c.sum()); n_vel += int(vb.sum()); n_height += int(hb.sum())
         n_timeout += int(env.time_out_buf.sum())
         if t == 0:
             first_step_resets = int((c | vb | hb).sum())
-        worst_force = torch.maximum(worst_force,
-                                    torch.norm(env.contact_forces, dim=-1).max(dim=0).values)
         if bool(vb.any()):
             vel_at_reset.append(float(v2[vb].max()))
         if bool(hb.any()):
