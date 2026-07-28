@@ -254,7 +254,7 @@ def main():
         print("python train_v7.py --task={task} --config {cfg} --headless True "
               "--checkpoint {ckpt} --num_envs {ne} --max_iterations {mi} "
               "--sim_device {dev} --rl_device {dev}\n".format(
-                  cfg=path, ckpt=ckpt, ne=args.num_envs,
+                  task=task, cfg=path, ckpt=ckpt, ne=args.num_envs,
                   mi=args.max_iterations, dev=dev))
 
 

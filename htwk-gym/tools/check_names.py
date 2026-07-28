@@ -152,6 +152,55 @@ def module_globals(tree):
     return g
 
 
+def check_format_calls(tree):
+    """`"{a} {b}".format(a=1)` -- a KeyError that only fires when the line runs.
+
+    check_names catches undefined NAMES; this catches undefined format
+    PLACEHOLDERS, which is a different failure with the same shape. It cost an
+    overnight G-batch launch on 2026-07-27: make_v7_arms printed a command with
+    {task} but never passed task=, so config generation died and the smoke gate
+    correctly refused to train anything.
+
+    Only checks all-keyword .format() on a literal string -- the case where the
+    answer is unambiguous. Positional or *args/**kwargs forms are skipped rather
+    than guessed at.
+    """
+    import string
+    problems = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "format"):
+            continue
+        # the literal may be a chain of implicitly-concatenated strings
+        target = node.func.value
+        if isinstance(target, ast.Constant) and isinstance(target.value, str):
+            template = target.value
+        elif isinstance(target, ast.BinOp) and isinstance(target.op, ast.Add):
+            parts = [n.value for n in ast.walk(target)
+                     if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+            template = "".join(parts)
+        else:
+            continue
+        if node.args or any(k.arg is None for k in node.keywords):
+            continue                      # positional or **kwargs: cannot judge
+        if not node.keywords:
+            continue
+        given = {k.arg for k in node.keywords}
+        needed = set()
+        try:
+            for _, field, _, _ in string.Formatter().parse(template):
+                if field:
+                    needed.add(field.split(".")[0].split("[")[0])
+        except ValueError:
+            continue
+        if not needed:
+            continue
+        missing = {f for f in needed if f and not f.isdigit()} - given
+        if missing:
+            problems.append((node.lineno, sorted(missing)))
+    return problems
+
+
 def check(path, star_import_seen=False):
     src = open(path, encoding="utf-8").read()
     tree = ast.parse(src)
@@ -249,6 +298,9 @@ def main():
             print("SYNTAX  {}:{} {}".format(rel, e.lineno, e.msg))
             bad += 1
             continue
+        for lineno, fields in check_format_calls(ast.parse(open(p, encoding="utf-8").read())):
+            print("FORMAT     {}:{}  .format() 인자 누락 -> {}".format(rel, lineno, ", ".join(fields)))
+            bad += 1
         for lineno, fname, name in problems:
             note = "  (파일에 `import *`가 있어 오탐일 수 있음)" if star else ""
             print("UNDEFINED  {}:{}  in {}()  -> {}{}".format(rel, lineno, fname, name, note))
