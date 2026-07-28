@@ -213,7 +213,10 @@ def set_dotted(cfg, dotted, value):
     node[keys[-1]] = value
 
 
-ALL_ARMS = dict(**ARMS, **F_ARMS)
+# V8_ARMS (G4_smoothturn) was missing from this merge, so --only G4_smoothturn
+# raised KeyError before it ever reached the per-arm is_v8 branch below --
+# G4 has never successfully generated a config, let alone run its smoke test.
+ALL_ARMS = dict(**ARMS, **F_ARMS, **V8_ARMS)
 
 # GPU 0 / GPU 1 split. F-batch: F1+F2 share GPU 0 (lighter, no disturbance),
 # F3 gets GPU 1 to itself (disturbance + higher flicker rate is the heavier one).
