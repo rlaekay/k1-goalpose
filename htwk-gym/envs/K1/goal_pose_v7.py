@@ -216,8 +216,14 @@ class GoalPoseV7(GoalPoseV3):
         rather than globally, because a global nearest-point search on a
         self-intersecting curve like a figure-8 can snap to the wrong lobe.
         """
-        span = float(self.path_cfg.get("lookahead_max_m", 3.5))
-        probes = torch.linspace(-1.2 * span, 0.2 * span, 9, device=self.device)
+        # Window must be genuinely LOCAL. It used to span +-1.2 * lookahead_max
+        # (~4.9 m) while the curves themselves are only 1-4 m across, so on a
+        # figure-8 or a 5-petal rose the nearest probe could snap to a different
+        # lobe between steps -- the projection jumped, the floor clamp followed
+        # it, and the carrot teleported (smoke measured a p99 goal speed of
+        # 20.3 m/s against a 0.82 m/s ceiling). Keep it under half a leash.
+        span = float(self.path_cfg.get("project_window_m", 0.8))
+        probes = torch.linspace(-span, 0.25 * span, 9, device=self.device)
         best_u = u_goal.clone()
         best_d = torch.full_like(u_goal, float("inf"))
         for off in probes:
@@ -305,6 +311,19 @@ class GoalPoseV7(GoalPoseV3):
         prog = torch.clamp(d * u_paced,
                            min=d * u_proj + l_min / ds_du,
                            max=d * u_proj + l_max / ds_du)
+
+        # Rate limit, in metres of arc per control step. The clamp above is a
+        # POSITION constraint, so any jump in u_proj passes straight through it
+        # into the goal; this bounds how fast that correction is allowed to be
+        # applied. The bound is max(pace, robot speed) rather than pace alone
+        # because a robot moving faster than the commanded pace legitimately
+        # drags the carrot along at its own speed to hold the floor -- capping
+        # at pace would break the floor exactly when the robot is doing well.
+        v_robot = torch.norm(self.root_states[:, 7:9], dim=-1)
+        rate = torch.maximum(pace, v_robot) * float(self.path_cfg.get("catchup_ratio", 1.5))
+        max_du = (rate + 0.05) * self.dt / ds_du
+        prog0 = d * u0
+        prog = prog0 + torch.clamp(prog - prog0, -max_du, max_du)
         self.path_u = torch.where(ids, d * prog, u0)
 
         gx, gy = self._path_world(self.path_u)

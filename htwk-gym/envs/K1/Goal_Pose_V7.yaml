@@ -158,6 +158,10 @@ commands:
                                  # 0.41 m) where constellation is flat and the
                                  # gradient vanishes.
     leash_ratio: 1.6             # max carrot distance = lookahead_m * this
+    project_window_m: 0.8        # robot->path projection search window [m]. Must stay
+                                 # well under the curve size: a wide window snaps to
+                                 # another lobe of a figure-8/rose and teleports the goal.
+    catchup_ratio: 1.5           # carrot may move at most this x max(pace, robot speed)
 
     # The carrot periodically STOPS, and releases the distance floor while it
     # does, so the robot must catch it and park on it. Without this, path mode
