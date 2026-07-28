@@ -421,9 +421,11 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     instrumented = hasattr(env, "goal_start_pos") and hasattr(env, "goal_start_step")
     has_segment_id = hasattr(env, "goal_segment_id")
     has_path_speed = hasattr(env, "path_speed")
+    has_path_lag = hasattr(env, "path_lag")
 
     keys = ("pos_err", "head_err", "speed", "category", "start_dist", "duration_s",
-            "min_dist", "along", "cross", "peak_speed", "mean_speed", "cmd_speed")
+            "min_dist", "along", "cross", "peak_speed", "mean_speed", "cmd_speed",
+            "path_lag")
     seg = {k: [] for k in keys}
     # Whole-rollout body-speed histogram, over every env and every control step.
     # The per-segment "final_speed" only says how well it stops; this says how
@@ -508,6 +510,7 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
         # path_speed is re-rolled at the segment boundary, so the commanded speed
         # that the finished segment was actually run under is the PREVIOUS value.
         prev_cmd_speed = env.path_speed.clone() if has_path_speed else None
+        prev_path_lag = env.path_lag.clone() if has_path_lag else None
         prev_goal_dist = env.goal_dist.clone()
         prev_len = env.episode_length_buf.clone()
         if instrumented:
@@ -565,6 +568,12 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
                 seg["cmd_speed"].extend(prev_cmd_speed[ids].cpu().tolist())
             else:
                 seg["cmd_speed"].extend([float("nan")] * len(ids))
+            if has_path_lag and instrumented:
+                nan = torch.full_like(prev_path_lag[ids], float("nan"))
+                lag = torch.where(prev_category[ids] == CATEGORY_PATH, prev_path_lag[ids], nan)
+                seg["path_lag"].extend(lag.cpu().tolist())
+            else:
+                seg["path_lag"].extend([float("nan")] * len(ids))
 
             if instrumented:
                 approach = goal_xy - prev_start_pos[ids]
@@ -674,6 +683,8 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
     head_all = np.degrees(roll["head_err"])
     speed_all = roll["speed"]
     cat_all = roll["category"]
+    path_mask = cat_all == CATEGORY_PATH
+    waypoint_mask = ~path_mask
 
     # The position gates are ONLY meaningful on waypoint segments.
     #
@@ -686,9 +697,11 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
     # dragged every headline number (E0: 6.5 cm on waypoints, 75 cm on path,
     # 13.2 cm reported). Path tracking has its own metric -- path_lag and the
     # commanded-vs-achieved table -- so it is scored there instead.
-    gate_mask = cat_all != CATEGORY_PATH
+    gate_mask = waypoint_mask.copy()
+    gate_scope = "waypoint_only"
     if not gate_mask.any():
         gate_mask = np.ones_like(cat_all, dtype=bool)
+        gate_scope = "all_segments_no_waypoints"
 
     # Full arrays stay full: every per-category / per-distance / failure-mode
     # breakdown below indexes them by masks built from the same length, and the
@@ -728,7 +741,10 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
         # claim was hollow -- the numbers never reached a report.
         "v7_extras": roll.get("v7_extras") or {},
         "segments_completed": n,
+        "segments_waypoint": int(waypoint_mask.sum()),
+        "segments_path": int(path_mask.sum()),
         "segments_scored_by_gates": n_gate,
+        "gate_scope": gate_scope,
         "segments_path_excluded_from_gates": n_path,
         "segments_censored_by_episode_end": roll["censored"],
         "falls": falls,
@@ -774,21 +790,25 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
     # is the important split: identical final error, opposite fixes.
     min_d = roll["min_dist"]
     ever_arrived = min_d <= g_pos_med
-    mode = np.full(n, "", dtype=object)
-    mode[:] = "never_arrived"
-    mode[~ok_pos_loose & ever_arrived] = "arrived_then_left"
-    mode[ok_pos_loose & ~ok_head] = "heading_only"
-    mode[ok_pos_loose & ok_head & ~ok_stop] = "not_stopped"
-    mode[ok_pos_loose & ok_head & ok_stop] = "ok"
+    mode = np.full(n, "excluded_path", dtype=object)
+    mode[gate_mask] = "never_arrived"
+    mode[gate_mask & ~ok_pos_loose & ever_arrived] = "arrived_then_left"
+    mode[gate_mask & ok_pos_loose & ~ok_head] = "heading_only"
+    mode[gate_mask & ok_pos_loose & ok_head & ~ok_stop] = "not_stopped"
+    mode[gate_mask & ok_pos_loose & ok_head & ok_stop] = "ok"
     results["failure_modes"] = {
-        name: {"count": int(np.sum(mode == name)), "share": float(np.mean(mode == name))}
+        name: {
+            "count": int(np.sum(mode[gate_mask] == name)),
+            "share": float(np.mean(mode[gate_mask] == name)) if gate_mask.any() else float("nan"),
+        }
         for name in ("ok", "not_stopped", "heading_only", "arrived_then_left", "never_arrived")
     }
-    results["closest_approach_m"] = {"median": _median(min_d), "p90": _pct(min_d, 90)}
+    results["failure_modes_scope"] = gate_scope
+    results["closest_approach_m"] = {"median": _median(min_d[gate_mask]), "p90": _pct(min_d[gate_mask], 90)}
 
     # ---- along/cross-track split ----------------------------------------
     along, cross = roll["along"], roll["cross"]
-    finite = np.isfinite(along)
+    finite = np.isfinite(along) & gate_mask
     if finite.any():
         a = along[finite]
         results["approach_error_m"] = {
@@ -809,6 +829,7 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
     dur = roll["duration_s"]
     start_d = roll["start_dist"]
     feas_ok = np.isfinite(dur) & np.isfinite(start_d) & (dur > 0)
+    feas_ok = feas_ok & gate_mask
     if feas_ok.any():
         required = np.full(n, np.nan)
         required[feas_ok] = start_d[feas_ok] / dur[feas_ok]
@@ -895,22 +916,75 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
                 })
             results["speed_tracking"] = {"bins": rows, "n": int(ok.sum())}
 
+    # ---- path tracking ------------------------------------------------------
+    # Path mode is not a waypoint task: the carrot is supposed to stay ahead of
+    # the robot. Raw distance-to-goal is therefore a lookahead/gap readout, not a
+    # "did we arrive?" error. Score it with lag behind the lookahead floor and
+    # commanded-vs-achieved speed instead.
+    lag = roll.get("path_lag")
+    results["path_tracking"] = None
+    if lag is not None and path_mask.any():
+        p_cfg = cfg.get("commands", {}).get("path", {}) or {}
+        keep = float(p_cfg.get("keepup_gap_m", 2.0))
+        p_lag = lag[path_mask]
+        finite_lag = np.isfinite(p_lag)
+        if finite_lag.any():
+            p_lag = p_lag[finite_lag]
+            p_mean_speed = roll["mean_speed"][path_mask][finite_lag]
+            p_peak_speed = roll["peak_speed"][path_mask][finite_lag]
+            p_cmd = roll["cmd_speed"][path_mask][finite_lag]
+            cmd_ok = np.isfinite(p_cmd) & (p_cmd > 0)
+            results["path_tracking"] = {
+                "n": int(len(p_lag)),
+                "lag_median": _median(p_lag),
+                "lag_p90": _pct(p_lag, 90),
+                "lag_mean": float(np.mean(p_lag)),
+                "lag_max": float(np.max(p_lag)),
+                "keepup_threshold_m": keep,
+                "keepup_share": _frac(p_lag < keep),
+                "mean_speed_median": _median(p_mean_speed),
+                "peak_speed_p90": _pct(p_peak_speed, 90),
+                "cmd_speed_median": _median(p_cmd[cmd_ok]),
+                "tracking_ratio_median": (
+                    _median(p_mean_speed[cmd_ok] / np.maximum(p_cmd[cmd_ok], 1e-9))
+                    if cmd_ok.any() else float("nan")
+                ),
+                "raw_goal_dist_median": _median(pos[path_mask]),
+                "raw_goal_dist_p90": _pct(pos[path_mask], 90),
+            }
+
     # ---- per goal category ----------------------------------------------
     cats = roll["category"]
     per_cat = {}
     for c in sorted(set(cats.tolist())):
         m = cats == c
-        per_cat[CATEGORY_NAMES.get(c, str(c))] = {
+        name = CATEGORY_NAMES.get(c, str(c))
+        entry = {
             "n": int(np.sum(m)),
             "share": float(np.mean(m)),
             "pos_median": _median(pos[m]),
             "pos_p90": _pct(pos[m], 90),
             "heading_median": _median(head_deg[m]),
             "speed_median": _median(speed[m]),
-            "success_rate_strict": _frac((pos[m] <= g_pos_med) & ok_head[m] & ok_stop[m]),
-            "arrived_then_left_share": _frac(mode[m] == "arrived_then_left"),
-            "never_arrived_share": _frac(mode[m] == "never_arrived"),
+            "metric_kind": "path_tracking" if int(c) == CATEGORY_PATH else "waypoint_pose",
         }
+        if int(c) == CATEGORY_PATH:
+            lag_c = roll["path_lag"][m]
+            finite_lag_c = np.isfinite(lag_c)
+            entry.update({
+                "path_lag_median": _median(lag_c[finite_lag_c]),
+                "path_lag_p90": _pct(lag_c[finite_lag_c], 90),
+                "success_rate_strict": None,
+                "arrived_then_left_share": None,
+                "never_arrived_share": None,
+            })
+        else:
+            entry.update({
+                "success_rate_strict": _frac((pos[m] <= g_pos_med) & ok_head[m] & ok_stop[m]),
+                "arrived_then_left_share": _frac(mode[m] == "arrived_then_left"),
+                "never_arrived_share": _frac(mode[m] == "never_arrived"),
+            })
+        per_cat[name] = entry
     results["per_category"] = per_cat
 
     # ---- per start distance ---------------------------------------------
@@ -993,7 +1067,8 @@ def recommend(r, cfg):
                 feas["infeasible_share"] * 100, feas["feasible_speed_mps"], feas["required_speed_p90"],
                 feas["infeasible_subset"]["pos_median"] * 100, feas["feasible_subset"]["pos_median"] * 100))
 
-    failing = {k: v["share"] for k, v in fm.items() if k != "ok"}
+    failing = {k: v["share"] for k, v in fm.items()
+               if k != "ok" and np.isfinite(v.get("share", float("nan")))}
     dominant = max(failing, key=failing.get) if failing else None
 
     if dominant == "never_arrived" and failing["never_arrived"] > 0.15:
@@ -1054,7 +1129,9 @@ def recommend(r, cfg):
                            ap["along_median"], (1 - ap["overshoot_share"]) * 100))
 
     pc = r.get("per_category") or {}
-    ranked = [(k, v) for k, v in pc.items() if v["n"] >= 30 and np.isfinite(v["pos_median"])]
+    ranked = [(k, v) for k, v in pc.items()
+              if v.get("metric_kind") == "waypoint_pose"
+              and v["n"] >= 30 and np.isfinite(v["pos_median"])]
     if len(ranked) >= 2:
         ranked.sort(key=lambda kv: kv[1]["pos_median"])
         best, worst = ranked[0], ranked[-1]
@@ -1116,9 +1193,9 @@ def render_report(r):
     md.append("- 벽시계: setup {:.1f}s + rollout {:.1f}s; env당 {:.1f}× real-time, 총 {:.0f} env·s/wall-s".format(
         t["setup_wall_s"], t["rollout_wall_s"], t["single_env_realtime_factor"],
         t["aggregate_env_seconds_per_wall_second"]))
-    md.append("- 완료 구간 {}개 (게이트 채점 {}개, path {}개는 게이트에서 제외) / 낙상 {}회 / 에피소드경계 절단 {}개".format(
-        r["segments_completed"], r.get("segments_scored_by_gates", r["segments_completed"]),
-        r.get("segments_path_excluded_from_gates", 0),
+    md.append("- 완료 구간 {}개 (waypoint {}개, path {}개; 게이트 채점 {}개) / 낙상 {}회 / 에피소드경계 절단 {}개".format(
+        r["segments_completed"], r.get("segments_waypoint", r["segments_completed"]),
+        r.get("segments_path", 0), r.get("segments_scored_by_gates", r["segments_completed"]),
         r["falls"], r["segments_censored_by_episode_end"]))
     md.append("")
 
@@ -1149,6 +1226,11 @@ def render_report(r):
     else:
         md.append("**탐색 결과: {} (표본/조건이 표준 프로토콜이 아니므로 공식 판정 아님)**".format(
             "모든 수치 기준 충족" if r["all_gates_pass"] else "미충족 수치 있음"))
+    if r.get("segments_path", 0):
+        md.append("")
+        md.append("> 참고: 위 게이트는 **waypoint 구간만** 채점한다. path 구간은 목표가 계속 앞서가는 "
+                  "moving-carrot 과제라 final position error가 도착 오차가 아니며, 아래 `path 추종` "
+                  "섹션의 lag/speed 지표로 따로 본다.")
     md.append("")
 
     bs = r.get("body_speed")
@@ -1208,6 +1290,28 @@ def render_report(r):
                       "`commands.path.speed_range_mps` 상단을 더 올려 한계를 찾을 것.")
         md.append("")
 
+    pt = r.get("path_tracking")
+    if pt:
+        md.append("## path 추종")
+        md.append("")
+        md.append("path mode에서는 목표가 lookahead로 앞서가는 것이 정상이다. 따라서 raw goal distance는 "
+                  "도착 오차가 아니라 carrot과의 간격이고, 여기서는 `path_lag = max(gap - lookahead_min, 0)`를 본다.")
+        md.append("")
+        md += _table(
+            ["지표", "값"],
+            [["path 구간 수", pt["n"]],
+             ["path_lag median", "{:.1f} cm".format(pt["lag_median"] * 100)],
+             ["path_lag p90", "{:.1f} cm".format(pt["lag_p90"] * 100)],
+             ["path_lag max", "{:.1f} cm".format(pt["lag_max"] * 100)],
+             ["keepup 기준", "{:.1f} m".format(pt["keepup_threshold_m"])],
+             ["keepup 비율", "{:.1f}%".format(pt["keepup_share"] * 100)],
+             ["명령속도 median", "{:.2f} m/s".format(pt["cmd_speed_median"])],
+             ["실제 평균속도 median", "{:.2f} m/s".format(pt["mean_speed_median"])],
+             ["구간 최고속도 p90", "{:.2f} m/s".format(pt["peak_speed_p90"])],
+             ["추종비 median", "{:.2f}".format(pt["tracking_ratio_median"])],
+             ["raw goal distance median", "{:.1f} cm (참고용)".format(pt["raw_goal_dist_median"] * 100)]])
+        md.append("")
+
     feas = r.get("feasibility")
     if feas:
         md.append("## 과제 실현가능성 점검")
@@ -1241,8 +1345,9 @@ def render_report(r):
     fm = r["failure_modes"]
     md.append("## 실패 모드 분해")
     md.append("")
-    md.append("최종 오차가 같아도 원인이 다르면 처방이 반대다. `도달후이탈`은 멈추게 만들어야 하고, "
-              "`미도달`은 더 가게 만들어야 한다.")
+    md.append("최종 오차가 같아도 원인이 다르면 처방이 반대다. 이 표는 **게이트와 같은 scope**"
+              "(`{}`)에서 계산한다. path 구간은 도착/이탈 개념이 맞지 않아 제외된다.".format(
+                  r.get("failure_modes_scope", "waypoint_only")))
     md.append("")
     labels = {
         "ok": "성공 (위치·heading·정지 모두 충족)",
@@ -1269,11 +1374,19 @@ def render_report(r):
         md.append("## 목표 유형별")
         md.append("")
         md += _table(
-            ["유형", "n", "비중", "위치 median", "위치 p90", "heading median", "성공률(엄격)", "도달후이탈"],
+            ["유형", "n", "비중", "주 지표", "p90", "heading median", "성공률(엄격)", "도달후이탈"],
             [[name, v["n"], "{:.0f}%".format(v["share"] * 100),
-              "{:.1f} cm".format(v["pos_median"] * 100), "{:.1f} cm".format(v["pos_p90"] * 100),
-              "{:.1f}°".format(v["heading_median"]), "{:.0f}%".format(v["success_rate_strict"] * 100),
-              "{:.0f}%".format(v["arrived_then_left_share"] * 100)]
+              ("path_lag {:.1f} cm".format(v["path_lag_median"] * 100)
+               if v.get("metric_kind") == "path_tracking"
+               else "{:.1f} cm".format(v["pos_median"] * 100)),
+              ("{:.1f} cm".format(v["path_lag_p90"] * 100)
+               if v.get("metric_kind") == "path_tracking"
+               else "{:.1f} cm".format(v["pos_p90"] * 100)),
+              "{:.1f}°".format(v["heading_median"]),
+              ("—" if v.get("success_rate_strict") is None
+               else "{:.0f}%".format(v["success_rate_strict"] * 100)),
+              ("—" if v.get("arrived_then_left_share") is None
+               else "{:.0f}%".format(v["arrived_then_left_share"] * 100))]
              for name, v in sorted(pc.items(), key=lambda kv: -kv[1]["pos_median"])])
         md.append("")
 
@@ -1422,11 +1535,12 @@ def write_outputs(out_dir, results, roll, report_md, env=None, cfg=None):
         w = csv.writer(f)
         w.writerow(["pos_err_m", "heading_err_deg", "final_speed_mps", "category",
                     "start_dist_m", "duration_s", "min_dist_m", "along_err_m", "cross_err_m",
-                    "peak_speed_mps", "mean_speed_mps", "cmd_speed_mps"])
+                    "peak_speed_mps", "mean_speed_mps", "cmd_speed_mps", "path_lag_m"])
         rows = zip(roll["pos_err"], np.degrees(roll["head_err"]), roll["speed"],
                    roll["category"], roll["start_dist"], roll["duration_s"],
                    roll["min_dist"], roll["along"], roll["cross"],
-                   roll["peak_speed"], roll["mean_speed"], roll["cmd_speed"])
+                   roll["peak_speed"], roll["mean_speed"], roll["cmd_speed"],
+                   roll["path_lag"])
         for row in rows:
             w.writerow([CATEGORY_NAMES.get(int(c), c) if i == 3 else "{:.4f}".format(c)
                         for i, c in enumerate(row)])

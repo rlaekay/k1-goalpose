@@ -51,7 +51,7 @@ ARMS="${ARMS:-E0_armB_armsdown E1_path E2_robust V7_full}"
 GPUS="${GPUS:-0 1}"
 VIDEO_S="${VIDEO_S:-60}"
 COMMON="${COMMON:-envs/K1/Goal_Pose_V7.yaml}"
-OUT_ROOT="$REPO_ROOT/shared_eval_videos/reeval_$(date +%Y%m%d-%H%M%S)"
+OUT_ROOT="${OUT_ROOT:-$REPO_ROOT/shared_eval_videos/reeval_$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$OUT_ROOT"
 
 run_arm() {  # arm gpu
