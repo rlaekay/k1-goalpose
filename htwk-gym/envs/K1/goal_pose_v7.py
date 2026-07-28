@@ -21,9 +21,11 @@ reduces exactly to armB.
 
 New mechanisms, each independently switchable:
 
-  1. path goal mode -- a lookahead point that ADVANCES along a parametric path
-     (figure-8 / circle / spiral / rose / random walk) at a commanded speed,
-     leashed so it never runs more than `lookahead_max_m` ahead of the robot.
+  1. path goal mode -- the goal is a VIRTUAL LEADER: a pose (x, y, heading)
+     carrying a twist (v, omega = v * kappa), integrated forward every control
+     step, with kappa following a per-env curvature program (figure-8 / circle /
+     spiral / rose / wander / serpentine). It is floored so it stays a genuine
+     lookahead and leashed so it never runs more than `lookahead_max_m` ahead.
      A stationary goal can be reached by any speed > 0; a receding one can only
      be held by matching its speed. This is what creates the speed demand.
   2. speed curriculum -- raises the commanded path speed while the robot keeps
@@ -75,11 +77,10 @@ class GoalPoseV7(GoalPoseV3):
         n, dev = self.num_envs, self.device
         self.is_path_env = torch.zeros(n, dtype=torch.bool, device=dev)
         self.path_shape = torch.zeros(n, dtype=torch.long, device=dev)
-        self.path_scale = torch.ones(n, dtype=torch.float, device=dev)
-        self.path_origin = torch.zeros(n, 2, dtype=torch.float, device=dev)
-        self.path_rot = torch.zeros(n, dtype=torch.float, device=dev)
-        self.path_dir = torch.ones(n, dtype=torch.float, device=dev)
-        self.path_u = torch.zeros(n, dtype=torch.float, device=dev)
+        self.path_scale = torch.ones(n, dtype=torch.float, device=dev)   # turn radius, 1/kappa
+        self.path_dir = torch.ones(n, dtype=torch.float, device=dev)     # sign of kappa: L/R turn
+        self.path_head = torch.zeros(n, dtype=torch.float, device=dev)   # leader heading, world
+        self.path_phi = torch.zeros(n, dtype=torch.float, device=dev)    # curvature-program phase
         self.path_speed = torch.zeros(n, dtype=torch.float, device=dev)
         self.lookahead = torch.zeros(n, dtype=torch.float, device=dev)
         # tracking error against the carrot, and the per-segment counters the
@@ -113,56 +114,39 @@ class GoalPoseV7(GoalPoseV3):
 
     # ---- 1. path goal mode --------------------------------------------------
 
-    def _path_point(self, u):
-        """Closed-form curve families, evaluated per env at phase u.
+    def _curvature(self):
+        """kappa(phi) for each shape family, in units of 1/path_scale.
 
-        Shapes: 0 figure-8 (Gerono lemniscate), 1 circle, 2 spiral, 3 rose/star,
-        4 smooth pseudo-random wander (sum of two incommensurate harmonics).
-        Returned in the path's own frame; caller applies scale/rotation/origin.
+        The old design parametrised each curve in closed form and then tried to
+        constrain the carrot's DISTANCE to the robot. Those live in two
+        different spaces, and every teleport bug came from the conversion:
+        the rate limit was applied to the phase step du, but phase -> world goes
+        through ds_du, which varies along the curve, so bounding du did not
+        bound the world-space step at all. That is the whole story behind the
+        20.3 / 14.5 m/s carrots -- not the projection, not the bisection.
+
+        So the curve is no longer parametrised. The goal is a virtual leader
+        with a pose and a twist, integrated forward, and every constraint is a
+        world-space distance. There is no second space left to disagree with.
+        The shape families survive as curvature PROGRAMS, which is what they
+        always were geometrically:
+
+          0 figure-8    kappa flips smoothly, net turning zero over a period
+          1 circle      kappa constant
+          2 spiral      |kappa| grows then unwinds
+          3 rose/star   kappa alternates fast -> petals
+          4 wander      two incommensurate harmonics
+          5 serpentine  near-square wave: steady pace, reversing yaw
         """
-        s = self.path_shape
-        x = torch.zeros_like(u)
-        y = torch.zeros_like(u)
-
-        m = s == 0                                        # figure-8
-        x = torch.where(m, torch.sin(u), x)
-        y = torch.where(m, torch.sin(u) * torch.cos(u), y)
-
-        m = s == 1                                        # circle
-        x = torch.where(m, torch.cos(u), x)
-        y = torch.where(m, torch.sin(u), y)
-
-        m = s == 2                                        # spiral (radius grows then unwinds)
-        r = 0.35 + 0.65 * (0.5 - 0.5 * torch.cos(u * 0.25))
-        x = torch.where(m, r * torch.cos(u), x)
-        y = torch.where(m, r * torch.sin(u), y)
-
-        m = s == 3                                        # 5-petal rose = star-like
-        rr = torch.cos(2.5 * u)
-        x = torch.where(m, rr * torch.cos(u), x)
-        y = torch.where(m, rr * torch.sin(u), y)
-
-        m = s == 4                                        # pseudo-random wander
-        x = torch.where(m, torch.sin(u) + 0.5 * torch.sin(2.3 * u + 1.1), x)
-        y = torch.where(m, torch.cos(0.7 * u) + 0.5 * torch.sin(1.7 * u), y)
-
-        # 5 serpentine: translation advances monotonically while curvature flips
-        # sign every half period. The canonical translation/rotation coupling
-        # test -- the robot must keep a steady forward pace while yaw rate
-        # reverses, which is precisely the regime where the two interfere.
-        m = s == 5
-        x = torch.where(m, 0.45 * u, x)
-        y = torch.where(m, torch.sin(u), y)
-        return x, y
-
-    def _path_world(self, u):
-        x, y = self._path_point(u)
-        x = x * self.path_scale
-        y = y * self.path_scale
-        c, s = torch.cos(self.path_rot), torch.sin(self.path_rot)
-        wx = self.path_origin[:, 0] + c * x - s * y
-        wy = self.path_origin[:, 1] + s * x + c * y
-        return wx, wy
+        s, phi = self.path_shape, self.path_phi
+        f = torch.ones_like(phi)
+        f = torch.where(s == 0, torch.cos(phi), f)
+        # s == 1 keeps f = 1
+        f = torch.where(s == 2, 0.35 + 0.65 * (0.5 - 0.5 * torch.cos(0.25 * phi)), f)
+        f = torch.where(s == 3, torch.cos(2.5 * phi), f)
+        f = torch.where(s == 4, 0.6 * torch.sin(phi) + 0.4 * torch.sin(1.7 * phi + 1.1), f)
+        f = torch.where(s == 5, torch.tanh(3.0 * torch.sin(phi)), f)
+        return self.path_dir * f / self.path_scale.clamp(min=0.2)
 
     def _reroll_paths(self, env_ids):
         if len(env_ids) == 0:
@@ -174,24 +158,12 @@ class GoalPoseV7(GoalPoseV3):
         self.path_shape[env_ids] = torch.tensor(shapes, device=self.device, dtype=torch.long)[pick]
         lo, hi = p.get("scale_m", [1.5, 4.0])
         self.path_scale[env_ids] = torch_rand_float(lo, hi, (k, 1), device=self.device).squeeze(1)
-        self.path_rot[env_ids] = torch_rand_float(-np.pi, np.pi, (k, 1), device=self.device).squeeze(1)
         self.path_dir[env_ids] = torch.where(
             torch.rand(k, device=self.device) < 0.5,
             -torch.ones(k, device=self.device), torch.ones(k, device=self.device))
-        self.path_u[env_ids] = torch_rand_float(-np.pi, np.pi, (k, 1), device=self.device).squeeze(1)
+        self.path_phi[env_ids] = torch_rand_float(-np.pi, np.pi, (k, 1), device=self.device).squeeze(1)
         lo, hi = p.get("lookahead_m", [0.5, 3.0])
         la = torch_rand_float(lo, hi, (k, 1), device=self.device).squeeze(1)
-        # Cap the lookahead by the curve's own size. Asking for a 3 m carrot on a
-        # curve whose widest chord is 0.79 m is not a hard task, it is an
-        # impossible one: the floor can never be satisfied and the goal pins at
-        # the far end forever. The grid makes this routine -- it commands
-        # curvature up to 1.0, i.e. path_scale down to 1.0 m, while lookahead_m
-        # still reaches 3.0. Measured widest chord is ~2*scale for circle and
-        # figure-8 but only 0.79*scale for the spiral, so 0.6*scale clears every
-        # family. It also encodes the right physics: you cannot see 3 m ahead
-        # around a 1 m turn.
-        frac = float(p.get("lookahead_scale_frac", 0.6))
-        self.lookahead[env_ids] = torch.minimum(la, frac * self.path_scale[env_ids])
 
         if self.grid_on:
             # Report on the segment that just ended BEFORE overwriting its cell,
@@ -201,33 +173,41 @@ class GoalPoseV7(GoalPoseV3):
             self.env_cell[env_ids] = flat
             jitter = torch_rand_float(0.85, 1.15, (k, 1), device=self.device).squeeze(1)
             self.path_speed[env_ids] = self.grid_speeds[si] * jitter
-            # kappa ~ 1/scale for these curve families, so curvature is commanded
-            # through the path size. This is what couples yaw rate to speed:
-            # omega = v * kappa, i.e. the grid axis pair IS (v_x, omega_z).
+            # path_scale IS the turn radius, so curvature is commanded directly.
+            # This is what couples yaw rate to speed: the leader turns by
+            # kappa * ds each step, i.e. omega = v * kappa, so the grid axis pair
+            # IS (v_x, omega_z).
             self.path_scale[env_ids] = 1.0 / self.grid_curvs[ci].clamp(min=1e-3)
         else:
             # commanded path speed, scaled by the scalar curriculum level
             smin, smax = p.get("speed_range_mps", [0.3, 1.6])
             top = smin + (smax - smin) * self.speed_level
             self.path_speed[env_ids] = torch_rand_float(smin, max(smin + 1e-3, top), (k, 1), device=self.device).squeeze(1)
+
+        # Cap the lookahead by the turn radius -- AFTER the grid has had its say.
+        # This ran before the grid branch, so a grid segment at kappa = 1.0
+        # (radius 1.0 m) kept a cap computed from the discarded random scale of
+        # up to 4.0 m, i.e. a 2.4 m carrot around a 1 m turn. The floor is then
+        # unsatisfiable, the carrot pins at full leash, and the speed demand the
+        # whole mode exists to create quietly disappears. The physical statement
+        # is simply: you cannot see 3 m ahead around a 1 m turn.
+        frac = float(p.get("lookahead_scale_frac", 0.6))
+        self.lookahead[env_ids] = torch.minimum(la, frac * self.path_scale[env_ids])
         self.track_ok_steps[env_ids] = 0.0
         self.track_steps[env_ids] = 0.0
         self.path_lag[env_ids] = 0.0
-        # Anchor the path on the robot, then step the carrot forward by l_min so
-        # it STARTS at the floor. Anchoring it on the robot and letting the floor
-        # clamp pull it out does not work now that the carrot is rate limited:
-        # climbing 0.5-3.0 m at max(pace, v)*1.5 takes 50-119 control steps, and
-        # for that whole stretch the goal sits inside the floor -- which is the
-        # flat-gradient state the floor exists to prevent.
-        wx, wy = self._path_world(self.path_u)
-        self.path_origin[env_ids, 0] += self.base_pos[env_ids, 0] - wx[env_ids]
-        self.path_origin[env_ids, 1] += self.base_pos[env_ids, 1] - wy[env_ids]
-        du = 1.0e-3
-        x0, y0 = self._path_world(self.path_u)
-        x1, y1 = self._path_world(self.path_u + du)
-        ds_du = torch.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2).clamp(min=1.0e-4) / du
-        self.path_u[env_ids] = (self.path_u[env_ids]
-                                + self.path_dir[env_ids] * self.lookahead[env_ids] / ds_du[env_ids])
+        # Place the leader exactly on the floor, l_min ahead of the robot, facing
+        # away from it. It must START at the floor: climbing 0.5-3.0 m at the
+        # rate limit takes 50-119 control steps, and for that whole stretch the
+        # goal would sit inside the floor -- the flat-gradient state the floor
+        # exists to prevent. With a leader this is one line instead of an
+        # origin-shift plus an arc-length step.
+        head = torch_rand_float(-np.pi, np.pi, (k, 1), device=self.device).squeeze(1)
+        self.path_head[env_ids] = head
+        la = self.lookahead[env_ids]
+        self.goal_pos_world[env_ids, 0] = self.base_pos[env_ids, 0] + la * torch.cos(head)
+        self.goal_pos_world[env_ids, 1] = self.base_pos[env_ids, 1] + la * torch.sin(head)
+        self.goal_heading_world[env_ids] = head
 
         # Stagger the first disturbance-style dwell. Leaving the counter at zero
         # made every path env dwell on step 1, which is why the measured duty
@@ -238,142 +218,59 @@ class GoalPoseV7(GoalPoseV3):
             1, max(2, int(hi / self.dt)), (k,), device=self.device)
         self.path_dwell_left[env_ids] = 0
 
-    def _project_robot(self, u_goal, ds_du):
-        """Arc-length phase of the point on the path nearest the robot.
-
-        Needed for a real lookahead: "0.5-3.0 m ahead" is only meaningful
-        relative to where the robot IS on the path, not relative to where the
-        goal happened to drift to. Searched locally (a window behind the goal)
-        rather than globally, because a global nearest-point search on a
-        self-intersecting curve like a figure-8 can snap to the wrong lobe.
-        """
-        # Window must be genuinely LOCAL. It used to span +-1.2 * lookahead_max
-        # (~4.9 m) while the curves themselves are only 1-4 m across, so on a
-        # figure-8 or a 5-petal rose the nearest probe could snap to a different
-        # lobe between steps -- the projection jumped, the floor clamp followed
-        # it, and the carrot teleported (smoke measured a p99 goal speed of
-        # 20.3 m/s against a 0.82 m/s ceiling). Keep it under half a leash.
-        span = float(self.path_cfg.get("project_window_m", 0.8))
-        probes = torch.linspace(-span, 0.25 * span, 9, device=self.device)
-        best_u = u_goal.clone()
-        best_d = torch.full_like(u_goal, float("inf"))
-        for off in probes:
-            uc = u_goal + self.path_dir * off / ds_du
-            xc, yc = self._path_world(uc)
-            d = torch.norm(torch.stack([xc, yc], dim=-1) - self.base_pos[:, :2], dim=-1)
-            closer = d < best_d
-            best_d = torch.where(closer, d, best_d)
-            best_u = torch.where(closer, uc, best_u)
-        return best_u
-
-    def _chord_bounds(self, u_proj, ds_du, l_min, l_max):
-        """Phases at chord distance l_min and l_max from the robot.
-
-        CHORD, not arc, because that is what the policy sees -- goal_dist and
-        constellation are both straight-line. The two agree only while the robot
-        is on the path; once it drifts laterally an arc-space leash opens
-        silently (measured: 1155 violations, worst 5.41 m against 3.5 m).
-
-        Coarse scan for the bracket, then bisect INSIDE it. The scan is needed
-        because chord is not monotonic in u -- a rose petal or figure-8 lobe
-        curls back, so plain bisection lands on a far branch that satisfies the
-        test for the wrong reason. But the scan alone quantises each bound to
-        span/n (~0.58 m at the widest leash), and since the bound moves as the
-        robot moves, that quantum shows up as the goal jumping a whole cell:
-        0.58 m in one control step is 29 m/s. Refining within the bracket keeps
-        the first-crossing semantics and removes the staircase.
-
-        If no crossing exists, the floor defaults to u_proj -- "do not push" --
-        rather than to the far end of the search. Defaulting far turns an
-        unsatisfiable floor into a forward teleport.
-        """
-        n, refine = 12, 4
-        d = self.path_dir
-        span = 2.0 * l_max / ds_du
-
-        def chord(u):
-            x, y = self._path_world(u)
-            return torch.norm(torch.stack([x, y], dim=-1) - self.base_pos[:, :2], dim=-1)
-
-        u_leash = u_proj + d * span
-        got_lo = torch.zeros_like(u_proj, dtype=torch.bool)
-        got_hi = torch.zeros_like(u_proj, dtype=torch.bool)
-        lo_a, lo_b = u_proj.clone(), u_proj.clone()
-        hi_a, hi_b = u_proj.clone(), u_proj.clone()
-        prev = u_proj.clone()
-        for i in range(1, n + 1):
-            uc = u_proj + d * (span * i / n)
-            dist = chord(uc)
-            hit_lo = (~got_lo) & (dist >= l_min)
-            lo_a = torch.where(hit_lo, prev, lo_a)
-            lo_b = torch.where(hit_lo, uc, lo_b)
-            got_lo = got_lo | hit_lo
-            hit_hi = (~got_hi) & (dist > l_max)
-            hi_a = torch.where(hit_hi, prev, hi_a)
-            hi_b = torch.where(hit_hi, uc, hi_b)
-            got_hi = got_hi | hit_hi
-            prev = uc
-
-        for _ in range(refine):
-            m = 0.5 * (lo_a + lo_b)
-            far = chord(m) >= l_min
-            lo_b = torch.where(far, m, lo_b)
-            lo_a = torch.where(far, lo_a, m)
-            m = 0.5 * (hi_a + hi_b)
-            over = chord(m) > l_max
-            hi_b = torch.where(over, m, hi_b)
-            hi_a = torch.where(over, hi_a, m)
-
-        u_floor = torch.where(got_lo, lo_b, u_proj)
-        u_leash = torch.where(got_hi, hi_a, u_leash)
-        u_floor = d * torch.minimum(d * u_floor, d * u_leash)
-        return u_floor, u_leash
-
     def _advance_paths(self):
-        """Advance the lookahead point.
+        """Integrate the virtual leader one control step.
 
-        Three constraints act at once, and each fixes a different failure:
+        The goal is a pose (x, y, heading) carrying a twist (v, omega=v*kappa).
+        That twist pair IS the curriculum grid's two axes, so the coupling
+        Margolis et al. (RSS 2022) curriculum over is expressed directly rather
+        than encoded through a curve's size.
 
-          pace   u advances at path_speed              -> creates the speed demand.
-                 A goal that only sits `L` ahead of the robot moves at whatever
-                 speed the robot chooses, so pure pursuit alone demands nothing.
-          floor  goal stays >= lookahead_min ahead     -> keeps it a LOOKAHEAD.
-                 Without this the goal drifts onto the robot (measured: gap
-                 median 0.41 m, below the configured 0.5 m minimum), and there
-                 constellation = exp(-w d^2) ~ 1 with gradient ~ 0 -- the reward
-                 goes flat exactly where the robot is.
-          leash  goal stays <= lookahead_max ahead     -> keeps the gradient alive
+        Three constraints act, and each fixes a different failure:
+
+          pace   the leader advances at path_speed  -> creates the SPEED DEMAND.
+                 A goal that merely sits `L` ahead moves at whatever speed the
+                 robot picks, so pure pursuit alone demands nothing. This is the
+                 masterplan's core claim: a stationary goal is reachable at any
+                 speed, a receding one only at ITS speed.
+          floor  gap >= lookahead                   -> keeps it a LOOKAHEAD.
+                 Without it the goal drifts onto the robot (measured gap median
+                 0.41 m against a 0.5 m minimum) and constellation
+                 exp(-w d_con) ~ 1 with gradient ~ 0 -- the reward goes flat
+                 exactly where the robot is.
+          leash  gap <= lookahead * leash_ratio     -> keeps the gradient alive
                  when the robot cannot keep up, instead of handing it a target
                  that recedes forever.
 
-        The floor also means a robot faster than path_speed drags the carrot
-        along faster than commanded, so path_speed is a floor on pace rather
-        than a ceiling -- which is what lets the achieved-speed distribution
-        reveal the physical limit instead of the commanded one.
+        All three are world-space distances now, measured the same way the
+        reward measures them (goal_dist and constellation are both straight
+        line). The old code enforced them on the curve phase u and converted
+        through ds_du, which is exactly where the teleports came from.
+
+        ONE hard invariant: the leader's world-space step is clamped LAST, so
+        goal speed can never exceed the rate limit. Floor and leash are soft --
+        a brief floor miss only flattens the gradient while the carrot catches
+        up and is self-correcting, whereas a teleporting goal is a
+        discontinuity the policy cannot track and corrupts what the value
+        function is fitted to.
         """
         ids = self.is_path_env
         if not bool(ids.any()) or self._path_advanced_at == self.common_step_counter:
             return
         self._path_advanced_at = self.common_step_counter
         p = self.path_cfg
-        du = 1.0e-3
-        u0 = self.path_u
-        x0, y0 = self._path_world(u0)
-        x1, y1 = self._path_world(u0 + du)
-        ds_du = torch.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2).clamp(min=1.0e-4) / du
 
         # ---- dwell: the carrot periodically STOPS and must be parked on ----
         # The 2026-07-27 v7 eval showed path training wrecking waypoint accuracy:
         # waypoint-only position error was 6.3 cm for E0 (no path training) but
         # 37.9 cm for E1 and 38.7 cm for V7, both path-trained, while their stand
-        # category stayed fine at 5.0 cm. A goal that is ALWAYS lookahead_min
-        # ahead and never reachable teaches "hold station behind the target",
-        # and that habit is exactly wrong for a waypoint, where the job is to
-        # arrive and stop. Mixing the two 50/50 with one reward produced a policy
-        # that did neither.
-        # Dwell removes the conflict instead of trading it off: the carrot pauses
-        # (and releases the minimum-distance floor, or arriving would still be
-        # impossible), so path mode ends in the same "arrive and stop" state that
+        # category stayed fine at 5.0 cm. A goal that is ALWAYS lookahead ahead
+        # and never reachable teaches "hold station behind the target", and that
+        # habit is exactly wrong for a waypoint, where the job is to arrive and
+        # stop. Mixing the two 50/50 under one reward produced a policy that did
+        # neither. Dwell removes the conflict instead of trading it off: the
+        # carrot pauses and releases the floor (or arriving would still be
+        # impossible), so path mode ends in the same "arrive and stop" state
         # waypoint mode is entirely about. goal_reached then fires on both.
         dw = p.get("dwell") or {}
         if dw.get("enabled", False):
@@ -391,51 +288,69 @@ class GoalPoseV7(GoalPoseV3):
                     (k,), device=self.device)
         dwelling = self.path_dwell_left > 0
 
-        l_min = self.lookahead                                   # per-env, [0.5, 3.0]
-        l_min = torch.where(dwelling, torch.zeros_like(l_min), l_min)
+        l_min = torch.where(dwelling, torch.zeros_like(self.lookahead), self.lookahead)
         l_max = torch.clamp(self.lookahead * float(p.get("leash_ratio", 1.6)),
                             max=float(p.get("lookahead_max_m", 3.5)))
         l_max = torch.maximum(l_max, l_min + 0.1)
 
-        u_proj = self._project_robot(u0, ds_du)
         pace = torch.where(dwelling, torch.zeros_like(self.path_speed), self.path_speed)
-        u_paced = u0 + self.path_dir * pace * self.dt / ds_du
-        d = self.path_dir
 
-        # Bounds solved in CHORD space, not arc space -- see _u_at_chord.
-        # The search runs from the robot's own projection out to 3 leashes of
-        # arc, which comfortably brackets the target even on the tightest curve.
-        u_floor, u_leash = self._chord_bounds(u_proj, ds_du, l_min, l_max)
+        # Heading first: the leader turns, then advances along where it now
+        # points. Curvature is per unit ARC, so the yaw increment is kappa * ds
+        # -- omega = v * kappa falls out without being written separately.
+        kappa = self._curvature()
+        rx, ry = self.base_pos[:, 0], self.base_pos[:, 1]
+        gx, gy = self.goal_pos_world[:, 0], self.goal_pos_world[:, 1]
 
-        # ORDER: clamp to the bounds, then rate-limit LAST so goal speed is a
-        # hard guarantee. The two cannot both be exact -- measured over 21600
-        # steps with dwell transitions included:
-        #     rate limit last  -> goal peaks at 1.61 m/s, floor missed on 11%
-        #                         of steady-state steps
-        #     bounds last      -> floor missed less, but the goal peaks at 190 m/s
-        # Speed wins. A teleporting goal is a discontinuity the policy cannot
-        # track and it corrupts what the value function is fitted to; a
-        # transient floor miss only means the reward gradient is briefly flat
-        # while the carrot catches up, and it is self-correcting. So the floor
-        # is a soft target and the speed bound is hard.
+        step = pace * self.dt                                    # nominal advance
+        head = self.path_head + kappa * step
+        cx, cy = torch.cos(head), torch.sin(head)
+
+        def gap_after(s):
+            return torch.sqrt((gx + s * cx - rx) ** 2 + (gy + s * cy - ry) ** 2)
+
+        # floor: push out by the shortfall. leash: pull back by the excess.
+        # Both are corrections along the leader's own heading, which is the
+        # direction that changes the gap fastest in the lookahead regime.
+        step = step + (l_min - gap_after(step)).clamp(min=0.0)
+        step = step - (gap_after(step) - l_max).clamp(min=0.0)
+
+        # HARD invariant, applied last: |world step| <= rate * dt, bounding the
+        # goal's d(pose)/dt directly since that is how speed is measured.
+        #
+        # The budget tracks max(pace, robot speed) because at the floor a robot
+        # running faster than the pace legitimately drags the carrot along at
+        # its own speed -- that is what lets the achieved-speed distribution
+        # reveal the physical limit rather than the commanded one.
+        #
+        # But robot speed is clamped to this env's COMMANDED pace before it
+        # enters the budget, so the bound is analytic: rate <= path_speed *
+        # catchup_ratio + 0.05, whatever the robot does. Without the clamp a
+        # fallen robot flung by a collision impulse hands the carrot its own
+        # spike -- a 10 m/s launch buys a 15 m/s carrot, which is exactly the
+        # shape of the teleports that kept coming back. A robot faster than
+        # 1.5x pace simply catches the carrot; goal_reached fires, the
+        # curriculum sees the keepup and raises the pace. That is the loop
+        # working, not a failure to model.
         v_robot = torch.norm(self.root_states[:, 7:9], dim=-1)
-        rate = torch.maximum(pace, v_robot) * float(self.path_cfg.get("catchup_ratio", 1.5))
-        max_du = (rate + 0.05) * self.dt / ds_du
-        prog = torch.clamp(d * u_paced, min=d * u_floor, max=d * u_leash)
-        prog0 = d * u0
-        prog = prog0 + torch.clamp(prog - prog0, -max_du, max_du)
-        self.path_u = torch.where(ids, d * prog, u0)
+        drag = torch.minimum(v_robot, self.path_speed)
+        rate = torch.maximum(pace, drag) * float(p.get("catchup_ratio", 1.5)) + 0.05
+        step = torch.clamp(step, -rate * self.dt, rate * self.dt)
 
-        gx, gy = self._path_world(self.path_u)
-        gx1, gy1 = self._path_world(self.path_u + self.path_dir * du)
-        tangent = torch.atan2(gy1 - gy, gx1 - gx)
+        self.path_head = torch.where(ids, head, self.path_head)
+        self.path_phi = torch.where(ids, self.path_phi + step / self.path_scale.clamp(min=0.2),
+                                    self.path_phi)
+        gx, gy = gx + step * cx, gy + step * cy
         self.goal_pos_world[:, 0] = torch.where(ids, gx, self.goal_pos_world[:, 0])
         self.goal_pos_world[:, 1] = torch.where(ids, gy, self.goal_pos_world[:, 1])
-        self.goal_heading_world = torch.where(ids, tangent, self.goal_heading_world)
+        # The leader's own heading IS the goal heading -- no tangent to
+        # differentiate, so no finite-difference noise when the step is tiny
+        # (during dwell the old code divided a ~0 displacement to get a tangent).
+        self.goal_heading_world = torch.where(ids, head, self.goal_heading_world)
 
-        # How far the robot has fallen behind its own projection-based carrot.
-        # This, not the raw goal distance, is the tracking error: the goal is
-        # SUPPOSED to sit l_min ahead, so distance alone can never reach zero.
+        # How far the robot has fallen behind the carrot. This, not the raw goal
+        # distance, is the tracking error: the goal is SUPPOSED to sit l_min
+        # ahead, so distance alone can never reach zero.
         gap_now = torch.norm(torch.stack([gx, gy], dim=-1) - self.base_pos[:, :2], dim=-1)
         self.path_lag = torch.where(ids, (gap_now - l_min).clamp(min=0.0), self.path_lag)
         keep = float(p.get("keepup_gap_m", 2.0))

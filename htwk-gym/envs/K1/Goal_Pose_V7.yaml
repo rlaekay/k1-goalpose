@@ -150,22 +150,29 @@ commands:
     path: 0.35
 
   path:
-    shapes: [0, 1, 2, 3, 4, 5]  # figure8, circle, spiral, rose/star, wander, serpentine
-    scale_m: [1.5, 4.0]          # curve size
+    shapes: [0, 1, 2, 3, 4, 5]  # figure8, circle, spiral, rose/star, wander, serpentine.
+                                 # These are now curvature PROGRAMS kappa(phi) driving a
+                                 # virtual leader, not parametric curves. Same geometry,
+                                 # but the goal has a pose+twist integrated in world
+                                 # space, so every constraint below is a world distance.
+    scale_m: [1.5, 4.0]          # turn radius = 1/kappa
     lookahead_m: [0.5, 3.0]      # MINIMUM carrot distance, per env. Enforced now:
                                  # before, this was sampled and never read, and the
                                  # goal drifted onto the robot (measured gap median
                                  # 0.41 m) where constellation is flat and the
                                  # gradient vanishes.
     leash_ratio: 1.6             # max carrot distance = lookahead_m * this
-    project_window_m: 0.8        # robot->path projection search window [m]. Must stay
-                                 # well under the curve size: a wide window snaps to
-                                 # another lobe of a figure-8/rose and teleports the goal.
-    catchup_ratio: 1.5           # carrot may move at most this x max(pace, robot speed)
-    lookahead_scale_frac: 0.6    # lookahead <= this x path_scale. The curves' widest
-                                 # chord is 0.79-2.0 x scale depending on family, so an
-                                 # absolute 3.0 m carrot is unreachable on a small curve
-                                 # and the floor could never be met.
+    catchup_ratio: 1.5           # HARD invariant: the leader's world-space step is
+                                 # clamped to this x max(pace, robot speed). Floor and
+                                 # leash are soft and yield to it -- a teleporting goal
+                                 # is a discontinuity the policy cannot track, a brief
+                                 # floor miss is self-correcting. (There is no longer a
+                                 # projection window: the old phase-space rate limit went
+                                 # through ds_du and did not bound world speed at all,
+                                 # which is where the 20.3 / 14.5 m/s carrots came from.)
+    lookahead_scale_frac: 0.6    # lookahead <= this x turn radius. You cannot see 3 m
+                                 # ahead around a 1 m turn; without this the floor is
+                                 # unsatisfiable and the carrot pins at full leash.
 
     # The carrot periodically STOPS, and releases the distance floor while it
     # does, so the robot must catch it and park on it. Without this, path mode
@@ -176,8 +183,13 @@ commands:
     # mode is about, so the two stop pulling against each other.
     dwell:
       enabled: true
-      interval_s: [6.0, 14.0]   # duty ~15%: dwell is a periodic event,
-      duration_s: [1.0, 2.0]    # not a third of the run spent parked
+      # Duration is set by physics, not by taste: the carrot parks up to a full
+      # leash (3.5 m) away and the robot closes at 0.3-0.9 m/s, so a 1-2 s pause
+      # left it structurally unreachable -- measured 4% arrival against a 20%
+      # gate. It must also cover deceleration and enough stationary time for
+      # goal_reached (+1/step under 0.1 m AND 0.1 m/s) to actually accumulate.
+      interval_s: [12.0, 24.0]  # duty ~20%, measured 19.5%
+      duration_s: [3.0, 5.0]    # measured 26% of dwelling steps reach the carrot
     lookahead_max_m: 3.5         # leash: goal never runs further ahead than this
     speed_range_mps: [0.3, 1.6]  # commanded path speed; top end scaled by curriculum
     speed_curriculum: true       # scalar fallback; ignored when speed_grid.enabled
@@ -191,7 +203,8 @@ commands:
     # (omega ~ 1/v at the feasibility boundary).
     # On a path omega = v * kappa, so (speed, curvature) IS that grid -- and it
     # trains the translation/rotation coupling explicitly at the same time.
-    # Curvature is commanded via path size: path_scale = 1/kappa.
+    # Curvature is commanded via turn radius: path_scale = 1/kappa, and the
+    # leader's yaw increment is kappa * ds, so omega = v * kappa falls out.
     speed_grid:
       enabled: false             # turn on in the next batch, not mid-flight
       speeds:     [0.3, 0.6, 0.9, 1.2, 1.5, 1.8]
