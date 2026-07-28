@@ -26,16 +26,16 @@ import argparse
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from isaacgym import gymtorch, gymapi   # noqa: F401  (must precede torch)
-
+import isaacgym  # noqa: F401  (must precede torch)
 import numpy as np
 import torch
 import yaml
 
-from envs import get_task_class
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from envs import *  # noqa: F401,F403  (registers task classes)
 from utils.model import ActorCritic
+from utils.runner import get_task_class
 
 
 def main():

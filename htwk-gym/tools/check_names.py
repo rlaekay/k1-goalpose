@@ -201,6 +201,70 @@ def check_format_calls(tree):
     return problems
 
 
+def check_imports(path, root):
+    """`from utils.runner import get_task_class` -- but is it actually there?
+
+    check_names validates names WITHIN a file and check_format_calls validates
+    format placeholders; neither looks across module boundaries, so a plausible
+    but wrong import sails through both. tools/diag_reset.py shipped with
+    `from envs import get_task_class` (it lives in utils.runner) and the failure
+    surfaced only after Isaac Gym had finished loading on the training server --
+    the second time an import-level mistake cost a full GPU round trip.
+
+    Only local modules are checked: if the module resolves to a file under the
+    repo it is parsed and its module-level names compared, otherwise it is a
+    stdlib or site-packages import and left alone. A target containing
+    `from x import *` is skipped, since anything could be re-exported.
+    """
+    problems = []
+    try:
+        tree = ast.parse(open(path, encoding="utf-8").read())
+    except SyntaxError:
+        return problems
+    cache = {}
+
+    def resolve(mod):
+        if mod in cache:
+            return cache[mod]
+        rel = mod.replace(".", os.sep)
+        for cand in (os.path.join(root, rel + ".py"),
+                     os.path.join(root, rel, "__init__.py")):
+            if os.path.exists(cand):
+                try:
+                    t = ast.parse(open(cand, encoding="utf-8").read())
+                except SyntaxError:
+                    cache[mod] = None
+                    return None
+                if any(isinstance(n, ast.ImportFrom)
+                       and any(a.name == "*" for a in n.names) for n in ast.walk(t)):
+                    cache[mod] = None          # re-exports unknowable
+                    return None
+                names = module_globals(t)
+                # submodules are importable by name too
+                pkg = os.path.join(root, rel)
+                if os.path.isdir(pkg):
+                    names |= {x[:-3] for x in os.listdir(pkg) if x.endswith(".py")}
+                    names |= {x for x in os.listdir(pkg)
+                              if os.path.isdir(os.path.join(pkg, x))}
+                cache[mod] = names
+                return names
+        cache[mod] = None
+        return None
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom) or node.level:
+            continue
+        if not node.module or any(a.name == "*" for a in node.names):
+            continue
+        names = resolve(node.module)
+        if names is None:
+            continue
+        for a in node.names:
+            if a.name not in names:
+                problems.append((node.lineno, node.module, a.name))
+    return problems
+
+
 def check(path, star_import_seen=False):
     src = open(path, encoding="utf-8").read()
     tree = ast.parse(src)
@@ -298,6 +362,9 @@ def main():
             print("SYNTAX  {}:{} {}".format(rel, e.lineno, e.msg))
             bad += 1
             continue
+        for lineno, mod, name in check_imports(p, root):
+            print("IMPORT     {}:{}  '{}' 안에 '{}' 없음".format(rel, lineno, mod, name))
+            bad += 1
         for lineno, fields in check_format_calls(ast.parse(open(p, encoding="utf-8").read())):
             print("FORMAT     {}:{}  .format() 인자 누락 -> {}".format(rel, lineno, ", ".join(fields)))
             bad += 1
