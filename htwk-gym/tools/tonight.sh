@@ -68,8 +68,10 @@ fi
 say "이름 검사 통과"
 
 # ---- 3) arm별 config 생성 + 스모크 -----------------------------------------
-ARMS="G1_speed G2_robust G3_full G4_smoothturn"
-say "=== config 생성 + 스모크 (4종) ==="
+# 통과한 arm만 먼저 띄우고 싶을 때:  ARMS="G1_speed G2_robust" bash tools/tonight.sh
+ARMS="${ARMS:-G1_speed G2_robust G3_full G4_smoothturn}"
+NARMS=$(echo $ARMS | wc -w)
+say "=== config 생성 + 스모크 (${NARMS}종: $ARMS) ==="
 for arm in $ARMS; do
   task="K1/Goal_Pose_V7"
   [ "$arm" = "G4_smoothturn" ] && task="K1/Goal_Pose_V8"
@@ -89,7 +91,7 @@ for arm in $ARMS; do
     exit 1
   fi
 done
-say "스모크 4종 전부 통과"
+say "스모크 ${NARMS}종 전부 통과"
 
 # ---- 4) tmux 세션 실행 ------------------------------------------------------
 if tmux has-session -t "$SESSION" 2>/dev/null; then
@@ -123,11 +125,14 @@ bash tools/train_and_eval.sh cuda:$gpu cuda:$gpu -- \
   say "  launched $name on GPU $gpu"
 }
 
-say "=== G 배치 실행 ==="
-launch G1_speed      0
-launch G2_robust     0
-launch G3_full       1
-launch G4_smoothturn 1
+# GPU 라운드로빈. 4종이면 2/2로 갈리고, 2종이면 카드 하나씩 잡는다 --
+# 통과한 둘만 돌릴 때 굳이 한 장에 몰아 넣어 서로 느려질 이유가 없다.
+say "=== 배치 실행 (${NARMS}종) ==="
+i=0
+for arm in $ARMS; do
+  launch "$arm" $((i % 2))
+  i=$((i + 1))
+done
 
 # ---- 5) 기동 확인 ----------------------------------------------------------
 say "기동 확인 중 (120s)..."
