@@ -94,10 +94,15 @@ done
 say "스모크 ${NARMS}종 전부 통과"
 
 # ---- 4) tmux 세션 실행 ------------------------------------------------------
-if tmux has-session -t "$SESSION" 2>/dev/null; then
-  say "!!! tmux 세션 '$SESSION'이 이미 있다. 지우려면: tmux kill-session -t $SESSION"
-  exit 1
-fi
+# launch()는 세션이 이미 있으면 창을 추가하도록 되어 있다 (아래) -- G1/G2를
+# 먼저 세션 'g'로 띄워둔 뒤 G3만 따로 통과시켜 재실행하는 것이 정상 경로이므로,
+# 세션 존재 자체가 아니라 "이번에 띄우려는 arm의 창이 이미 있는지"만 막는다.
+for arm in $ARMS; do
+  if tmux has-session -t "$SESSION" 2>/dev/null && tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$arm"; then
+    say "!!! tmux 창 '$SESSION:$arm'이 이미 있다. 지우려면: tmux kill-window -t $SESSION:$arm"
+    exit 1
+  fi
+done
 
 # tmux 창은 실행 셸이 아니라 tmux SERVER의 환경을 물려받는다. 그 서버는 conda
 # 활성화보다 먼저 떠 있어서, 그냥 띄우면 isaacgym이 libpython3.8.so.1.0을 못 찾는다.
