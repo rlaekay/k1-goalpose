@@ -62,10 +62,10 @@ run_arm() {  # arm gpu
     echo "!!! run 디렉토리 없음: $RUN_ROOT/*$arm — 건너뜀" >&2
     return 1
   fi
-  echo "================ $arm (GPU $gpu) ================"
+  echo "[$(date '+%F %T')] ================= $arm (GPU $gpu) ================"
   echo "run: $RUN_DIR"
 
-  echo "--- [1/3] 자기 과제로 최적 체크포인트 재선택 + 평가 + 영상 ---"
+  echo "[$(date '+%F %T')] --- [1/3] 자기 과제로 최적 체크포인트 재선택 + 평가 + 영상 ---"
   python tools/select_best_checkpoint.py \
     --run_dir "$RUN_DIR" --task K1/Goal_Pose_V7 \
     --sim_device "$dev" --rl_device "$dev" \
@@ -81,17 +81,17 @@ run_arm() {  # arm gpu
   done
   [ -f "${SEL_DIR}winner_video/rollout_env0.mp4" ] && cp "${SEL_DIR}winner_video/rollout_env0.mp4" "$D/own_task/"
 
-  echo "--- [2/3] 공통 v7 과제로 평가 (arm 간 비교용) ---"
+  echo "[$(date '+%F %T')] --- [2/3] 공통 v7 과제로 평가 (arm 간 비교용) ---"
   python eval_goal_pose.py --task K1/Goal_Pose_V7 --config "$COMMON" \
     --checkpoint "$BEST" --sim_device "$dev" --rl_device "$dev" \
     --out "$D/common_task"
 
-  echo "--- [3/3] stress jitter ---"
+  echo "[$(date '+%F %T')] --- [3/3] stress jitter ---"
   python eval_goal_pose.py --task K1/Goal_Pose_V7 --config "$COMMON" \
     --checkpoint "$BEST" --sim_device "$dev" --rl_device "$dev" \
     --stress jitter --duration_s 60 --out "$D/stress_jitter" || \
     echo "!!! $arm stress 실패 (나머지 결과는 유효)" >&2
-  echo "================ $arm 완료 ================"
+  echo "[$(date '+%F %T')] ================= $arm 완료 ================"
 }
 
 # Deal arms round-robin across the GPU list; each GPU's arms run one after

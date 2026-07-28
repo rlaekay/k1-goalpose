@@ -72,6 +72,9 @@ else
 fi
 
 mkdir -p "$OUT_ROOT"
+# Persistent start marker for the read-only live monitor.  It is not inside a
+# run/checkpoint directory, so it cannot affect selection or evaluation.
+date '+%F %T' > "$OUT_ROOT/STARTED_AT"
 
 CMD="$ENV_PRELUDE cd '$REPO_ROOT' && ARMS='$ARMS' GPUS='$GPUS' VIDEO_S='$VIDEO_S' RUN_ROOT='$RUN_ROOT' OUT_ROOT='$OUT_ROOT' bash tools/reeval_v7.sh; exec bash"
 tmux new-session -d -s "$SESSION" -n reeval_e "$CMD"
