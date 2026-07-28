@@ -267,47 +267,66 @@ class GoalPoseV7(GoalPoseV3):
         return best_u
 
     def _chord_bounds(self, u_proj, ds_du, l_min, l_max):
-        """First phase ahead of the robot at chord distance l_min, and the last
-        one still within l_max.
+        """Phases at chord distance l_min and l_max from the robot.
 
-        Enforced on CHORD, not arc, because that is what the policy sees:
-        `goal_dist` and constellation both use straight-line distance. Arc and
-        chord agree only while the robot sits on the path; once it drifts
-        laterally the chord runs ahead of the arc and an arc-space leash opens
-        silently (a sweep over all six curve families found 1155 violations that
-        way, worst 5.41 m against a 3.5 m leash).
+        CHORD, not arc, because that is what the policy sees -- goal_dist and
+        constellation are both straight-line. The two agree only while the robot
+        is on the path; once it drifts laterally an arc-space leash opens
+        silently (measured: 1155 violations, worst 5.41 m against 3.5 m).
 
-        Scanned rather than bisected. Chord is NOT monotonic in u: a rose petal
-        or a figure-8 lobe curls back, so distance-to-robot rises and falls, and
-        bisection happily converges onto a far branch that satisfies the test
-        for the wrong reason (that produced 7382 floor violations, one as close
-        as 1% of the intended distance). A forward scan taking the FIRST
-        crossing is immune to that -- it can only ever pick a point on the
-        stretch of path the robot is actually about to travel.
+        Coarse scan for the bracket, then bisect INSIDE it. The scan is needed
+        because chord is not monotonic in u -- a rose petal or figure-8 lobe
+        curls back, so plain bisection lands on a far branch that satisfies the
+        test for the wrong reason. But the scan alone quantises each bound to
+        span/n (~0.58 m at the widest leash), and since the bound moves as the
+        robot moves, that quantum shows up as the goal jumping a whole cell:
+        0.58 m in one control step is 29 m/s. Refining within the bracket keeps
+        the first-crossing semantics and removes the staircase.
+
+        If no crossing exists, the floor defaults to u_proj -- "do not push" --
+        rather than to the far end of the search. Defaulting far turns an
+        unsatisfiable floor into a forward teleport.
         """
-        n = 12
+        n, refine = 12, 4
         d = self.path_dir
         span = 2.0 * l_max / ds_du
-        u_floor = u_proj + d * span
+
+        def chord(u):
+            x, y = self._path_world(u)
+            return torch.norm(torch.stack([x, y], dim=-1) - self.base_pos[:, :2], dim=-1)
+
         u_leash = u_proj + d * span
-        found_lo = torch.zeros_like(u_proj, dtype=torch.bool)
-        over = torch.zeros_like(u_proj, dtype=torch.bool)
+        got_lo = torch.zeros_like(u_proj, dtype=torch.bool)
+        got_hi = torch.zeros_like(u_proj, dtype=torch.bool)
+        lo_a, lo_b = u_proj.clone(), u_proj.clone()
+        hi_a, hi_b = u_proj.clone(), u_proj.clone()
+        prev = u_proj.clone()
         for i in range(1, n + 1):
             uc = u_proj + d * (span * i / n)
-            x, y = self._path_world(uc)
-            dist = torch.norm(torch.stack([x, y], dim=-1) - self.base_pos[:, :2], dim=-1)
-            # first crossing of l_min going forward
-            hit_lo = (~found_lo) & (dist >= l_min)
-            u_floor = torch.where(hit_lo, uc, u_floor)
-            found_lo = found_lo | hit_lo
-            # last point before the first crossing of l_max
-            hit_hi = (~over) & (dist > l_max)
-            u_leash = torch.where(hit_hi, u_prev if i > 1 else u_proj, u_leash)
-            over = over | hit_hi
-            u_prev = uc
-        # floor must never sit beyond the leash
-        prog_f, prog_l = d * u_floor, d * u_leash
-        u_floor = d * torch.minimum(prog_f, prog_l)
+            dist = chord(uc)
+            hit_lo = (~got_lo) & (dist >= l_min)
+            lo_a = torch.where(hit_lo, prev, lo_a)
+            lo_b = torch.where(hit_lo, uc, lo_b)
+            got_lo = got_lo | hit_lo
+            hit_hi = (~got_hi) & (dist > l_max)
+            hi_a = torch.where(hit_hi, prev, hi_a)
+            hi_b = torch.where(hit_hi, uc, hi_b)
+            got_hi = got_hi | hit_hi
+            prev = uc
+
+        for _ in range(refine):
+            m = 0.5 * (lo_a + lo_b)
+            far = chord(m) >= l_min
+            lo_b = torch.where(far, m, lo_b)
+            lo_a = torch.where(far, lo_a, m)
+            m = 0.5 * (hi_a + hi_b)
+            over = chord(m) > l_max
+            hi_b = torch.where(over, m, hi_b)
+            hi_a = torch.where(over, hi_a, m)
+
+        u_floor = torch.where(got_lo, lo_b, u_proj)
+        u_leash = torch.where(got_hi, hi_a, u_leash)
+        u_floor = d * torch.minimum(d * u_floor, d * u_leash)
         return u_floor, u_leash
 
     def _advance_paths(self):
@@ -388,24 +407,23 @@ class GoalPoseV7(GoalPoseV3):
         # arc, which comfortably brackets the target even on the tightest curve.
         u_floor, u_leash = self._chord_bounds(u_proj, ds_du, l_min, l_max)
 
-        # ORDER MATTERS: rate-limit the PACE, then apply floor/leash as hard
-        # bounds. Doing it the other way -- clamp first, then rate-limit the
-        # result -- lets the rate limit veto the floor, because on any path that
-        # doubles back (figure-8, rose, wander, spiral) the projection shifts
-        # quickly and the floor bound moves with it. Measured across all six
-        # families: clamp-then-rate leaves 2542 floor violations out of 21600
-        # steps, rate-then-clamp leaves 1. Circle and serpentine are clean under
-        # both, which is why this only shows up on the self-intersecting shapes.
-        #
-        # It stays teleport-safe because the bounds are anchored on u_proj, and
-        # u_proj can only move as fast as the robot does now that the projection
-        # window is local (0.8 m).
+        # ORDER: clamp to the bounds, then rate-limit LAST so goal speed is a
+        # hard guarantee. The two cannot both be exact -- measured over 21600
+        # steps with dwell transitions included:
+        #     rate limit last  -> goal peaks at 1.61 m/s, floor missed on 11%
+        #                         of steady-state steps
+        #     bounds last      -> floor missed less, but the goal peaks at 190 m/s
+        # Speed wins. A teleporting goal is a discontinuity the policy cannot
+        # track and it corrupts what the value function is fitted to; a
+        # transient floor miss only means the reward gradient is briefly flat
+        # while the carrot catches up, and it is self-correcting. So the floor
+        # is a soft target and the speed bound is hard.
         v_robot = torch.norm(self.root_states[:, 7:9], dim=-1)
         rate = torch.maximum(pace, v_robot) * float(self.path_cfg.get("catchup_ratio", 1.5))
         max_du = (rate + 0.05) * self.dt / ds_du
+        prog = torch.clamp(d * u_paced, min=d * u_floor, max=d * u_leash)
         prog0 = d * u0
-        prog = prog0 + torch.clamp(d * u_paced - prog0, -max_du, max_du)
-        prog = torch.clamp(prog, min=d * u_floor, max=d * u_leash)
+        prog = prog0 + torch.clamp(prog - prog0, -max_du, max_du)
         self.path_u = torch.where(ids, d * prog, u0)
 
         gx, gy = self._path_world(self.path_u)
