@@ -104,7 +104,14 @@ def main():
     check("observation width unchanged (54)", env.num_obs == 54, "num_obs={}".format(env.num_obs))
     check("obs finite after reset", bool(torch.isfinite(obs).all()))
     urdf = cfg["asset"]["file"]
-    check("using the arms-down URDF", "armsdown" in urdf, urdf)
+    # The thing to catch is a silent fall back to the stock arms-OUT URDF, which
+    # widens the ego footprint and changes the yaw inertia the warm start was
+    # trained under. armswing is the same arms-down geometry with the elbows made
+    # revolute so they can be scripted, so it is equally valid -- asserting
+    # "armsdown" in the name failed G3_full for using exactly the asset its whole
+    # arm is about.
+    check("using an arms-down URDF (armsdown or armswing)",
+          ("armsdown" in urdf) or ("armswing" in urdf), urdf)
 
     pcfg = cfg["commands"].get("path", {})
     share = cfg["commands"].get("goal_mode_mixture", {}).get("path", 0.0)
