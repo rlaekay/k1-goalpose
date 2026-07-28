@@ -249,6 +249,23 @@ class GoalPoseV8(GoalPoseV7):
         # sequential envs are exempt from waypoint/path mode entirely
         self.is_path_env[env_ids] = self.is_path_env[env_ids] & ~pick
 
+        # _resample_goals decides "does this env need a fresh sequence" purely
+        # from seq_goals being all-zero -- but this reset teleports the robot to
+        # a NEW spawn point and never touched seq_goals, so an env re-picked as
+        # sequential after its first life kept the WORLD-FRAME targets from
+        # wherever it was standing the first time it got assigned one. Measured
+        # via diag_seq.py: goal_dist at reset p50 4.48 m (vs. the ~1.5-2.0 m hop
+        # the sampler actually asks for), 279 resets in 300 steps concentrated
+        # on sequential envs (168 velocity + 111 height, 0 timeout -- ordinary
+        # falling, not running out of time), and is_seq_env collapsing from
+        # 51% to 0% because every re-pick just resumes chasing the same stale,
+        # now-arbitrary-distance target until it falls again. Zeroing seq_goals
+        # here makes the "needs a fresh sequence" sentinel true again exactly
+        # when it should be -- on every reset, not only the very first one.
+        self.seq_goals[env_ids] = 0.0
+        self.seq_idx[env_ids] = 0
+        self.seq_banked[env_ids] = 0.0
+
     def _resample_goals(self):
         super()._resample_goals()
         if not self.st_on:
