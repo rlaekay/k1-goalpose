@@ -154,10 +154,35 @@ class GoalPoseV8(GoalPoseV7):
                 & (w < float(st.get("stop_w", 0.1))))
         return direct | stop
 
-    def _advance_sequence(self):
+    def _advance_sequence(self, skip=None):
+        """`skip` excludes envs whose sequence was JUST sampled this same call
+        to _resample_goals (see the `need` branch there).
+
+        self.goal_dist/self.heading_error are only refreshed by
+        _update_goal_state(), which runs AFTER _resample_goals() returns. A
+        freshly sampled sequence's goal[0] is therefore checked against
+        whatever goal_dist happened to be left over from BEFORE this reset --
+        at construction or right after a reroll that is exactly 0.0, since
+        those buffers start life as torch.zeros(...) and nothing has computed
+        a real distance for the new target yet. `_reached()`'s direct switch
+        is `d < eps_xy=0.10 m`, so d=0.0 trivially satisfies it: every env
+        getting its first-ever sequence "reached" goal 0 for free, with zero
+        real navigation. Measured directly: diag_seq.py showed seq_idx=1 for
+        131 of 268 resets while its own step-by-step bank counter read 0 for
+        the entire 300-step run -- because the free bank happened inside
+        env.reset(), before the counting loop even started.
+        (The OTHER place a fresh sequence gets sampled -- done_seq, below,
+        when a robot finishes all 4 goals -- is not vulnerable: its
+        _advance_sequence() call already finished its real, legitimate hit
+        check for the goal that just got reached before resampling, and the
+        new chain isn't checked again until next step, by which point
+        _update_goal_state() has already refreshed goal_dist correctly.)
+        """
         if not bool(self.is_seq_env.any()):
             return
         hit = self._reached() & self.is_seq_env & (self.seq_idx < self.seq_len)
+        if skip is not None:
+            hit = hit & ~skip
         if bool(hit.any()):
             self.seq_idx[hit] += 1
             self.seq_banked[hit] += 1.0
@@ -275,7 +300,7 @@ class GoalPoseV8(GoalPoseV7):
         ids = need.nonzero(as_tuple=False).flatten()
         if len(ids) > 0:
             self._sample_sequence(ids)
-        self._advance_sequence()
+        self._advance_sequence(skip=need)
         if bool(self.is_seq_env.any()):
             self.goal_category[self.is_seq_env] = CATEGORY_SEQ
             self.gait_frequency[self.is_seq_env] = self.gait_frequency[self.is_seq_env].clamp(min=1.8)
