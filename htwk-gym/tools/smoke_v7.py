@@ -96,7 +96,11 @@ def main():
         print("     driving with ZERO actions (robot will fall often; segment-rate check relaxed)")
 
     # ---- asset / layout: must not have moved, or warm start is dead ---------
-    check("URDF loads, 12 actuated DOFs", env.num_dofs == 12, "num_dofs={}".format(env.num_dofs))
+    # 12 legs, plus the scripted elbows when the armswing URDF is in play. This
+    # asserted a bare 12 and so failed G3_full for being correct.
+    n_arm = len(getattr(env, "arm_dof_idx", [])) if getattr(env, "arm_script_on", False) else 0
+    check("URDF loads {} actuated DOFs".format(12 + n_arm), env.num_dofs == 12 + n_arm,
+          "num_dofs={} (12 leg + {} scripted arm)".format(env.num_dofs, n_arm))
     check("observation width unchanged (54)", env.num_obs == 54, "num_obs={}".format(env.num_obs))
     check("obs finite after reset", bool(torch.isfinite(obs).all()))
     urdf = cfg["asset"]["file"]

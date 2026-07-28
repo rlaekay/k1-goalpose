@@ -82,17 +82,39 @@ class GoalPoseV3(GoalPose):
 
     # ---- 3. mirror maps for RunnerV3's symmetry loss ------------------------
     def _build_mirror_maps(self):
-        num_dofs = len(self.dof_names)
+        # Build over the DOFs the POLICY sees, not every DOF in the URDF. With
+        # the armswing asset the robot has 16 joints but the observation and the
+        # action vector still carry 12: v7 scripts the four elbows and slices
+        # them out to keep num_obs at 54 so warm starts survive.
+        #
+        # Indexing this by the full DOF count wrote 16 entries into 12-wide obs
+        # blocks -- dof_pos spilled over dof_vel, and the actions block ran off
+        # the end of a 54-long list for a bare IndexError. The permutation was
+        # also expressed in full-URDF indices, which do not address a 12-wide
+        # action tensor at all. Both were silent until an armswing arm ran.
+        #
+        # Read arm_script from the config rather than from self.leg_dof_idx:
+        # _init_arm_script has not run yet at this point in __init__.
+        arm_cfg = self.cfg.get("arm_script") or {}
+        scripted = set(arm_cfg.get("joints", []) or []) if arm_cfg.get("enabled", False) else set()
+        obs_dof_names = [n for n in self.dof_names if n not in scripted]
+        if len(obs_dof_names) != self.num_actions:
+            raise ValueError(
+                "mirror maps expect {} observed DOFs to match num_actions={}, got {} "
+                "(dof_names={}, scripted={})".format(
+                    self.num_actions, self.num_actions, len(obs_dof_names),
+                    self.dof_names, sorted(scripted)))
+        num_dofs = len(obs_dof_names)
         dof_perm = [0] * num_dofs
         dof_sign = [1.0] * num_dofs
-        for i, name in enumerate(self.dof_names):
+        for i, name in enumerate(obs_dof_names):
             if name.startswith("Left_"):
                 partner = "Right_" + name[len("Left_"):]
             elif name.startswith("Right_"):
                 partner = "Left_" + name[len("Right_"):]
             else:
                 partner = name
-            dof_perm[i] = self.dof_names.index(partner)
+            dof_perm[i] = obs_dof_names.index(partner)
             # URDF limit tables confirm: Roll/Yaw joints mirror with a sign flip
             # (e.g. Left_Hip_Roll [-0.4,1.57] vs Right_Hip_Roll [-1.57,0.4]),
             # Pitch/Knee joints mirror sign-preserving.

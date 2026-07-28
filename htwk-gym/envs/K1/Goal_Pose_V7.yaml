@@ -95,8 +95,20 @@ init_state:
   default_joint_angles: {"Hip_Pitch": -0.2, "Knee_Pitch": 0.4, "Ankle_Pitch": -0.25, "default": 0.} # target angles when action = 0.0
 
 control:
-  stiffness: {"Hip": 100., "Knee": 100., "Ankle": 50.} # [N*m/rad]
-  damping: {"Hip": 2., "Knee": 2., "Ankle": 1.} # [N*m*s/rad]
+  # "Elbow" is inert unless the URDF actually exposes elbow DOFs: the lookup
+  # walks the robot's real joints and matches these keys as substrings, and the
+  # arms-down URDF has the elbows as type="fixed" with collapse_fixed_joints.
+  # It is only live for the armswing URDF (arm_script.enabled), where its
+  # absence aborted env creation outright -- goal_pose._create_envs raises on
+  # any joint with no gain rather than guessing one.
+  # Sized from the joint, not copied from a leg: distal mass past Elbow_Pitch is
+  # 0.93 kg at ~0.10 m, so gravity asks for at most 0.9 N*m against a 10 N*m
+  # limit, and 30 N*m/rad holds that to 1.7 deg. Damping 1.0 is very near
+  # critical for the 0.0093 kg*m^2 seen there (2*sqrt(k*I) = 1.06). These are
+  # SCRIPTED joints, so ringing is pure disturbance injected into the torso --
+  # there is no policy on the other end to damp it out.
+  stiffness: {"Hip": 100., "Knee": 100., "Ankle": 50., "Elbow": 30.} # [N*m/rad]
+  damping: {"Hip": 2., "Knee": 2., "Ankle": 1., "Elbow": 1.} # [N*m*s/rad]
   action_scale: 1.
   decimation: 10
 
