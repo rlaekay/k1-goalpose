@@ -172,8 +172,8 @@ commands:
     # mode is about, so the two stop pulling against each other.
     dwell:
       enabled: true
-      interval_s: [4.0, 10.0]
-      duration_s: [1.5, 3.0]
+      interval_s: [6.0, 14.0]   # duty ~15%: dwell is a periodic event,
+      duration_s: [1.0, 2.0]    # not a third of the run spent parked
     lookahead_max_m: 3.5         # leash: goal never runs further ahead than this
     speed_range_mps: [0.3, 1.6]  # commanded path speed; top end scaled by curriculum
     speed_curriculum: true       # scalar fallback; ignored when speed_grid.enabled
@@ -509,6 +509,8 @@ arm_script:
 evaluation:
   # defaults for eval_goal_pose.py (CLI flags override)
   num_envs: 256
+  speed_window_s: 0.2       # d(pose)/dt 창 [s]. 한 걸음(약 0.45 s)보다 짧게
+                            # 잡아 이동속도는 남기고 보행 흔들림만 평균낸다.
   duration_s: 120.
   # Sustained walking speed treated as achievable when checking whether a goal was
   # reachable at all in the time before the next resample (start_dist / segment_s).

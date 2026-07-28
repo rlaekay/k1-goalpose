@@ -202,10 +202,30 @@ class GoalPoseV7(GoalPoseV3):
         self.track_ok_steps[env_ids] = 0.0
         self.track_steps[env_ids] = 0.0
         self.path_lag[env_ids] = 0.0
-        # anchor the path so the lookahead point starts just ahead of the robot
+        # Anchor the path on the robot, then step the carrot forward by l_min so
+        # it STARTS at the floor. Anchoring it on the robot and letting the floor
+        # clamp pull it out does not work now that the carrot is rate limited:
+        # climbing 0.5-3.0 m at max(pace, v)*1.5 takes 50-119 control steps, and
+        # for that whole stretch the goal sits inside the floor -- which is the
+        # flat-gradient state the floor exists to prevent.
         wx, wy = self._path_world(self.path_u)
         self.path_origin[env_ids, 0] += self.base_pos[env_ids, 0] - wx[env_ids]
         self.path_origin[env_ids, 1] += self.base_pos[env_ids, 1] - wy[env_ids]
+        du = 1.0e-3
+        x0, y0 = self._path_world(self.path_u)
+        x1, y1 = self._path_world(self.path_u + du)
+        ds_du = torch.sqrt((x1 - x0) ** 2 + (y1 - y0) ** 2).clamp(min=1.0e-4) / du
+        self.path_u[env_ids] = (self.path_u[env_ids]
+                                + self.path_dir[env_ids] * self.lookahead[env_ids] / ds_du[env_ids])
+
+        # Stagger the first disturbance-style dwell. Leaving the counter at zero
+        # made every path env dwell on step 1, which is why the measured duty
+        # cycle (43.7%) ran well above the configured one (32%).
+        dw = p.get("dwell") or {}
+        lo, hi = dw.get("interval_s", [4.0, 10.0])
+        self.path_dwell_next[env_ids] = torch.randint(
+            1, max(2, int(hi / self.dt)), (k,), device=self.device)
+        self.path_dwell_left[env_ids] = 0
 
     def _project_robot(self, u_goal, ds_du):
         """Arc-length phase of the point on the path nearest the robot.

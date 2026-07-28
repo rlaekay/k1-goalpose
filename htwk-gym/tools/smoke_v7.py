@@ -112,6 +112,7 @@ def main():
 
     # ---- run ---------------------------------------------------------------
     gaps, seg_ticks, rew_bad = [], 0, 0
+    gap_dwell, gap_run = [], []
     goal_step_move = []
     push_f_seen, push_t_seen, push_active_steps = [], [], 0
     has_segment_id = hasattr(env, "goal_segment_id")
@@ -154,6 +155,13 @@ def main():
                     env.goal_pos_world[m] - env.base_pos[m, :2], dim=-1).cpu().numpy())
                 moved = torch.norm(env.goal_pos_world[m] - prev_goal[m], dim=-1)
                 goal_step_move.append(moved.cpu().numpy())
+                if hasattr(env, "path_dwell_left"):
+                    dw_m = env.path_dwell_left[m] > 0
+                    gsel = torch.norm(env.goal_pos_world[m] - env.base_pos[m, :2], dim=-1)
+                    if bool(dw_m.any()):
+                        gap_dwell.append(gsel[dw_m].cpu().numpy())
+                    if bool((~dw_m).any()):
+                        gap_run.append(gsel[~dw_m].cpu().numpy())
         if has_segment_id:
             prev_seg = env.goal_segment_id.clone()
         prev_path_mask = path_mask
@@ -223,19 +231,25 @@ def main():
         # robot (measured gap median 0.41 m against a configured 0.5 m minimum),
         # flattening the reward exactly where the robot was. While NOT dwelling
         # the gap must stay at or above the smallest configured lookahead.
+        # Split by dwell state instead of thresholding a pooled fraction. Pooling
+        # conflates "the floor is broken" with "the carrot is parked, which
+        # releases the floor on purpose", and the pooled number then moves
+        # whenever the dwell duty cycle is retuned -- a check that shifts under
+        # unrelated config changes is not measuring what it claims to.
+        gd = np.concatenate(gap_dwell) if gap_dwell else np.array([])
+        gr = np.concatenate(gap_run) if gap_run else np.array([])
+        if len(gr):
+            frac_bad = float((gr < la_lo * 0.75).mean())
+            check("lookahead floor holds while running (not dwelling)",
+                  frac_bad < 0.15,
+                  "{:.0%} of running steps inside the floor, gap p2 {:.2f} vs floor {:.2f}".format(
+                      frac_bad, np.percentile(gr, 2), la_lo))
         dwell_cfg = pcfg.get("dwell") or {}
-        if not dwell_cfg.get("enabled", False):
-            check("lookahead floor holds (goal never drifts onto the robot)",
-                  np.percentile(g, 2) >= la_lo * 0.75,
-                  "gap p2 {:.2f} m vs floor {:.2f} m".format(np.percentile(g, 2), la_lo))
-        else:
-            # With dwell on, the floor is deliberately released while the carrot
-            # is parked, so a low p2 is expected -- that is the whole mechanism.
-            # What must still hold is that the gap is not low ALL the time.
-            frac_below = float((g < la_lo * 0.75).mean())
-            check("dwell releases the floor, but only sometimes",
-                  0.0 < frac_below < 0.6,
-                  "{:.0%} of steps below the floor (expect a minority: dwell only)".format(frac_below))
+        if dwell_cfg.get("enabled", False):
+            check("dwell actually releases the floor",
+                  len(gd) > 0 and float((gd < la_lo * 0.75).mean()) > 0.2,
+                  "{:.0%} of dwelling steps inside the floor (should be most of them)".format(
+                      float((gd < la_lo * 0.75).mean()) if len(gd) else 0.0))
     elif n_path > 0:
         check("path-mode samples collected", False,
               "no surviving path envs in {} steps -- policy may be falling immediately".format(args.steps))

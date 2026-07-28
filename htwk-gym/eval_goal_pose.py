@@ -409,7 +409,8 @@ def load_policy(checkpoint, env, device, model=None, verbose=True):
 # --------------------------------------------------------------------------
 
 def rollout(env, model, total_steps, device, stochastic=False, record_video=False,
-            record_video_s=8.0, progress_every=500, progress_prefix="  ", stress=None):
+            record_video_s=8.0, progress_every=500, progress_prefix="  ", stress=None,
+            cfg_speed_window_s=0.2):
     """Roll the policy and collect one record per completed goal segment.
 
     Per segment we keep not just the final error but the provenance needed to
@@ -440,6 +441,17 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     video_done = not record_video
     overlay_states = []
 
+    # ---- speed is measured as d(pose)/dt, not as the trunk's instantaneous
+    # linear velocity. root_states[:, 7:9] is the BASE LINK's velocity, which
+    # carries the per-step sway of the gait: the trunk surges and yaws within
+    # every stride even when the robot is travelling at a constant speed, so its
+    # p99 and max report the sway, not the travel. The goal is an SE(2) pose, so
+    # the honest speed is how fast that pose changes -- differenced over a short
+    # window so one stride's oscillation averages out.
+    pose_win = max(1, int(round(float(cfg_speed_window_s) / env.dt)))
+    pose_hist = torch.zeros(pose_win + 1, env.num_envs, 3, device=env.device)
+    pose_fill = 0
+
     # closest approach to the goal currently being pursued, per env
     min_dist = torch.full((env.num_envs,), float("inf"), device=env.device)
     # peak and accumulated body speed within the segment currently in progress
@@ -460,14 +472,27 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
         # goal_dist still refers to the segment in progress; fold it in before the
         # step can replace the goal.
         torch.minimum(min_dist, env.goal_dist, out=min_dist)
-        cur_speed = torch.norm(env.root_states[:, 7:9], dim=-1)
+        _, _, _yaw = get_euler_xyz(env.base_quat)
+        pose_hist[pose_fill % (pose_win + 1), :, 0] = env.base_pos[:, 0]
+        pose_hist[pose_fill % (pose_win + 1), :, 1] = env.base_pos[:, 1]
+        pose_hist[pose_fill % (pose_win + 1), :, 2] = wrap(_yaw)
+        pose_fill += 1
+        if pose_fill > pose_win:
+            new = pose_hist[(pose_fill - 1) % (pose_win + 1)]
+            old = pose_hist[(pose_fill - 1 - pose_win) % (pose_win + 1)]
+            dxy = new[:, :2] - old[:, :2]
+            cur_speed = torch.norm(dxy, dim=-1) / (pose_win * env.dt)
+            cur_yawrate = wrap(new[:, 2] - old[:, 2]).abs() / (pose_win * env.dt)
+        else:
+            cur_speed = torch.zeros(env.num_envs, device=env.device)
+            cur_yawrate = torch.zeros(env.num_envs, device=env.device)
         torch.maximum(peak_speed, cur_speed, out=peak_speed)
         sum_speed += cur_speed
         n_speed += 1.0
         np.add.at(speed_hist,
                   np.clip((cur_speed.cpu().numpy() / speed_hist_max * len(speed_hist)).astype(int),
                           0, len(speed_hist) - 1), 1)
-        cur_omega = torch.norm(env.base_ang_vel, dim=-1)
+        cur_omega = cur_yawrate
         np.add.at(angvel_hist,
                   np.clip((cur_omega.cpu().numpy() / angvel_hist_max * len(angvel_hist)).astype(int),
                           0, len(angvel_hist) - 1), 1)
@@ -1131,8 +1156,12 @@ def render_report(r):
         md.append("## 몸통 속도 (body velocity)")
         md.append("")
         md.append("위의 오차 지표는 전부 '거리'다. 속도를 따로 보지 않으면 **느린 정책**과 "
-                  "**빠르게 갈 이유가 없었던 정책**을 구분할 수 없다. 아래는 전 env·전 스텝의 "
-                  "|v_xy| 분포다.")
+                  "**빠르게 갈 이유가 없었던 정책**을 구분할 수 없다.")
+        md.append("")
+        md.append("**정의**: 몸통 링크의 순간 선속도가 아니라 **pose(x, y, θ)의 시간미분**이다. "
+                  "목표가 SE(2) pose이므로 그 pose가 얼마나 빨리 변하는지가 정직한 속도이고, "
+                  "0.2 s 창으로 차분해 **한 걸음 안의 몸통 흔들림이 평균화**된다. "
+                  "순간 선속도로 재면 p99·최대가 이동속도가 아니라 보행 중 흔들림을 보고한다.")
         md.append("")
         md += _table(
             ["지표", "값"],
@@ -1509,7 +1538,8 @@ def main():
     setup_wall_s = time.perf_counter() - eval_started
     roll = rollout(env, model, int(duration_s / env.dt), device,
                    stochastic=args.stochastic, record_video=args.record_video,
-                   record_video_s=args.record_video_s, stress=args.stress)
+                   record_video_s=args.record_video_s, stress=args.stress,
+                   cfg_speed_window_s=cfg.get("evaluation", {}).get("speed_window_s", 0.2))
 
     if args.stress:
         results, report_md = summarize_stress(

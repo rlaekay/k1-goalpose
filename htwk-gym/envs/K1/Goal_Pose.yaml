@@ -375,6 +375,8 @@ rewards:
 evaluation:
   # defaults for eval_goal_pose.py (CLI flags override)
   num_envs: 256
+  speed_window_s: 0.2       # d(pose)/dt 창 [s]. 한 걸음(약 0.45 s)보다 짧게
+                            # 잡아 이동속도는 남기고 보행 흔들림만 평균낸다.
   duration_s: 120.
   # Sustained walking speed treated as achievable when checking whether a goal was
   # reachable at all in the time before the next resample (start_dist / segment_s).
