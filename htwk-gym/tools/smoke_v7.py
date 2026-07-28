@@ -135,9 +135,22 @@ def main():
     share = cfg["commands"].get("goal_mode_mixture", {}).get("path", 0.0)
     n_path = int(env.is_path_env.sum().item())
     frac = n_path / float(env.num_envs)
+    # GoalPoseV8._reset_idx draws is_seq_env independently over the SAME pool
+    # and then does `is_path_env &= ~is_seq_env` ("sequential envs are exempt
+    # from waypoint/path mode entirely") -- so when SmoothTurn is on, path's
+    # OWN share is only realized among the envs sequential mode didn't already
+    # take. Comparing raw n_path/num_envs against the unadjusted 0.35 failed
+    # G4_smoothturn for behaving exactly as v8's _reset_idx is written to:
+    # configured 0.35, observed 0.19 (49 envs) is 0.35 * (1 - 0.50) almost to
+    # the digit, not a broken draw.
+    st_share = float(cfg["commands"].get("smooth_turn", {}).get("share", 0.0)) \
+        if getattr(env, "st_on", False) else 0.0
+    expect = share * (1.0 - st_share)
     check("path-mode share matches config",
-          abs(frac - share) < 0.12 or share == 0.0,
-          "configured {:.2f}, got {:.2f} ({} envs)".format(share, frac, n_path))
+          abs(frac - expect) < 0.12 or share == 0.0,
+          "configured {:.2f}{}, got {:.2f} ({} envs)".format(
+              share, " x (1-{:.2f} seq)={:.2f}".format(st_share, expect) if st_share else "",
+              frac, n_path))
 
     # ---- run ---------------------------------------------------------------
     gaps, seg_ticks, rew_bad = [], 0, 0
