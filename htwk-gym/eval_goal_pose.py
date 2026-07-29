@@ -3315,6 +3315,51 @@ def write_outputs(out_dir, results, roll, report_md, env=None, cfg=None):
             "perspective path/goal/force overlays" if perspective else "constellation inset", video_path))
 
 
+def _artifact_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_eval_completion_marker(out_dir, completion_token=None, include_video=False):
+    """Atomically attest that every generated artifact was closed completely.
+
+    Isaac Gym's native camera teardown can signal after Python has finished the
+    evaluation.  A caller may distinguish that teardown-only failure from an
+    interrupted write only when this marker, hashes and a decodable video all
+    agree.  The marker is deliberately the final filesystem mutation in main.
+    """
+    artifacts = {}
+    names = ["report.json", "report.md", "segments.csv"]
+    if include_video:
+        names.append("rollout_env0.mp4")
+    for name in names:
+        path = os.path.join(out_dir, name)
+        if os.path.isfile(path):
+            artifacts[name] = {
+                "bytes": os.path.getsize(path),
+                "sha256": _artifact_sha256(path),
+            }
+    if "report.json" not in artifacts:
+        raise RuntimeError("cannot mark incomplete eval without report.json")
+    marker = {
+        "version": 1,
+        "status": "complete",
+        "completion_token": completion_token,
+        "artifacts": artifacts,
+    }
+    target = os.path.join(out_dir, "eval-complete-codex.json")
+    temporary = target + ".tmp-{}".format(os.getpid())
+    with open(temporary, "w", encoding="utf-8") as f:
+        json.dump(marker, f, indent=2, sort_keys=True)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temporary, target)
+
+
 # --------------------------------------------------------------------------
 
 def main():
@@ -3346,7 +3391,18 @@ def main():
                         help="force abrupt robot-local side or rear waypoint goals")
     parser.add_argument("--exploratory", action="store_true", help="label this run as a non-authoritative preview rather than an official gate evaluation")
     parser.add_argument("--out", help="output dir (default: <run_dir>/eval/<timestamp>)")
+    parser.add_argument(
+        "--completion_token",
+        help="caller-generated nonce copied into the atomic completion marker")
     args = parser.parse_args()
+
+    # A reused --out directory must never retain a completion attestation from
+    # an older run if this process fails before producing fresh artifacts.
+    if args.out:
+        try:
+            os.unlink(os.path.join(args.out, "eval-complete-codex.json"))
+        except FileNotFoundError:
+            pass
 
     config_path = args.config or os.path.join("envs", "{}.yaml".format(args.task))
     with open(config_path, "r", encoding="utf-8") as f:
@@ -3418,8 +3474,12 @@ def main():
             json.dump(results, f, indent=2, ensure_ascii=False, default=float)
         with open(os.path.join(out_dir, "report.md"), "w", encoding="utf-8") as f:
             f.write(report_md + "\n")
-        if args.record_video and hasattr(env, "camera_frames") and len(env.camera_frames) > 0:
+        video_ready = (args.record_video and hasattr(env, "camera_frames")
+                       and len(env.camera_frames) > 0)
+        if video_ready:
             write_outputs(out_dir, results, roll, report_md, env=env, cfg=cfg)
+        write_eval_completion_marker(
+            out_dir, args.completion_token, include_video=video_ready)
         print(report_md)
         print("\nwritten: {}".format(out_dir))
         return
@@ -3439,6 +3499,10 @@ def main():
         run_dir = os.path.dirname(os.path.dirname(os.path.abspath(checkpoint)))
         out_dir = os.path.join(run_dir, "eval", time.strftime("%Y-%m-%d-%H-%M-%S"))
     write_outputs(out_dir, results, roll, report_md, env=env if args.record_video else None, cfg=cfg)
+    video_ready = (args.record_video and hasattr(env, "camera_frames")
+                   and len(env.camera_frames) > 0)
+    write_eval_completion_marker(
+        out_dir, args.completion_token, include_video=video_ready)
 
     print("")
     print(report_md)

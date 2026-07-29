@@ -153,12 +153,24 @@ def main():
               bool(torch.allclose(env.mirror_privileged_obs(
                   env.mirror_privileged_obs(probe_p)), probe_p, atol=1e-6)))
 
-    if cfg["randomization"].get("joint_encoder_bias"):
-        check("episode-constant encoder bias sampled",
-              float(env.joint_encoder_bias.abs().max().item()) > 0.0)
-    if cfg["randomization"].get("joint_target_offset"):
-        check("episode-constant motor-target offset sampled",
-              float(env.joint_target_offset.abs().max().item()) > 0.0)
+    encoder_cfg = cfg["randomization"].get("joint_encoder_bias")
+    if encoder_cfg:
+        encoder_active = any(abs(float(x)) > 0.0
+                             for x in encoder_cfg.get("range", [0.0, 0.0]))
+        encoder_max = float(env.joint_encoder_bias.abs().max().item())
+        check("episode-constant encoder bias sampled" if encoder_active
+              else "encoder bias disabled as configured",
+              encoder_max > 0.0 if encoder_active else encoder_max <= 1.0e-9,
+              "max |offset| {:.6f} rad".format(encoder_max))
+    target_cfg = cfg["randomization"].get("joint_target_offset")
+    if target_cfg:
+        target_active = any(abs(float(x)) > 0.0
+                            for x in target_cfg.get("range", [0.0, 0.0]))
+        target_max = float(env.joint_target_offset.abs().max().item())
+        check("episode-constant motor-target offset sampled" if target_active
+              else "motor-target offset disabled as configured",
+              target_max > 0.0 if target_active else target_max <= 1.0e-9,
+              "max |offset| {:.6f} rad".format(target_max))
 
     if hasattr(env, "get_checkpoint_state") and hasattr(env, "load_checkpoint_state"):
         task_state = env.get_checkpoint_state()

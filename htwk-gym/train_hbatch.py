@@ -1,3 +1,5 @@
+import isaacgym  # noqa: F401  (must be imported before torch)
+
 from utils.runner_v3 import RunnerV3
 
 

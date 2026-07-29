@@ -11,7 +11,7 @@ import argparse
 import copy
 import glob
 import os
-import json
+import secrets
 import shutil
 import subprocess
 import sys
@@ -375,47 +375,36 @@ def main():
             video_rc = 0
         if video_rc == 0:
             video_dir = tempfile.mkdtemp(prefix="hbatch-video-smoke-", suffix="-codex")
+            video_token = secrets.token_hex(16)
             video_cmd = [sys.executable, os.path.join(ROOT, "eval_goal_pose.py"),
                          "--task", "K1/Goal_Pose_HBatch", "--config", video_path,
                          "--checkpoint", args.checkpoint, "--sim_device", args.sim_device,
                          "--rl_device", args.rl_device, "--num_envs", "16",
                          "--duration_s", "10", "--keep_perturbations",
                          "--record_video", "--record_video_s", "6",
-                         "--force_visualization_probe", "--out", video_dir]
+                         "--force_visualization_probe", "--out", video_dir,
+                         "--completion_token", video_token]
             try:
-                video_rc = subprocess.call(video_cmd, cwd=ROOT)
+                eval_rc = subprocess.call(video_cmd, cwd=ROOT)
             except Exception as exc:
                 print("FAIL  VIDEO could not run: {}".format(exc), flush=True)
-                video_rc = 1
-            detail = "eval command failed"
+                eval_rc = 1
+            verify_cmd = [
+                sys.executable,
+                os.path.join(ROOT, "tools", "verify_hbatch_video.py"),
+                "--directory", video_dir,
+                "--completion_token", video_token,
+            ]
             try:
+                video_rc = subprocess.call(verify_cmd, cwd=ROOT)
                 artifacts = codex_video_artifacts(video_dir)
-                mp4 = artifacts["rollout_env0.mp4"]
-                report = artifacts["report.json"]
-                if (video_rc == 0 and os.path.exists(mp4) and os.path.getsize(mp4) > 0
-                        and os.path.exists(report)):
-                    with open(report, encoding="utf-8") as f:
-                        data = json.load(f)
-                    disturbance_eval = data.get("disturbance_eval", {})
-                    events = int(disturbance_eval.get("events", 0))
-                    force_frames = int(disturbance_eval.get(
-                        "video_force_active_frames", 0))
-                    arrow_frames = int(disturbance_eval.get(
-                        "video_force_arrow_drawn_frames", 0))
-                    carrot_frames = int(disturbance_eval.get(
-                        "video_path_carrot_drawn_frames", 0))
-                    trace_frames = int(disturbance_eval.get(
-                        "video_path_trace_drawn_frames", 0))
-                    video_rc = 0 if (events > 0 and force_frames > 0
-                                     and arrow_frames > 0 and carrot_frames > 0
-                                     and trace_frames > 0) else 1
-                    detail = ("{} events, {} force-active frames, {} renderer-confirmed "
-                              "red-arrow frames, {} carrot / {} trace frames").format(
-                                  events, force_frames, arrow_frames,
-                                  carrot_frames, trace_frames)
-                else:
+                renamed_ok = all(os.path.isfile(path) and os.path.getsize(path) > 0
+                                 for path in artifacts.values())
+                if not renamed_ok:
                     video_rc = 1
-                    detail = "missing/nonempty mp4 or report"
+                detail = ("eval rc {}; completion marker, hashes, full MP4 decode, "
+                          "renderer counters and -codex artifact rename {}"
+                          .format(eval_rc, "verified" if video_rc == 0 else "failed"))
             except Exception as exc:
                 video_rc = 1
                 detail = "artifact/report inspection failed: {}".format(exc)
