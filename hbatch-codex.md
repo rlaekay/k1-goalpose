@@ -2,6 +2,13 @@
 
 이 문서는 E0/E1/E2/V7과 G1–G4의 모든 결론, 사용자의 하위 질문, H0–H3 정의, 학습/평가 하네스, sim-to-real 조사 결과를 한 곳에 집대성한다.
 
+## Codex 서버 작업 경계
+
+- 서버에서는 사용자 소유 경로 `/mnt/DATA/workspace/ws_eungkyu/k1-goalpose` 안만 조회한다. 다른 사용자의 workspace는 열람하지 않는다.
+- 진단 단계의 서버 작업은 검색·읽기 전용이다. 코드와 문서 수정, 검증, commit/push는 로컬 저장소에서 수행한다.
+- 로컬 수정이 모두 끝난 뒤에만 서버의 사용자 저장소를 동기화하고 최종 smoke/train harness를 실행한다.
+- 서버 비밀번호 같은 인증정보는 문서, 로그, commit 또는 영구 메모리에 저장하지 않는다.
+
 ## 한 줄 결정
 
 **G1@10700의 speed/path 계보를 warm-start로 쓰되, E2/G2처럼 robust 레버를 한꺼번에 세게 넣지 않는다.** 모든 H 버전에 낮은 dose의 외란과 goal jitter를 의무화하고, H1/H2에는 y-axis mirror augmentation+loss, H2에는 가속 lean을 허용하는 순항 전용 안정화, H3에는 gait touchdown 하나만 격리한다.
