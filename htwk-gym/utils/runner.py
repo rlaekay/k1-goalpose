@@ -19,7 +19,7 @@ import torch.nn.functional as F
 # no effect on PhysX. Precision loss is negligible at these network sizes.
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-from utils.model import *
+from utils.model import ActorCritic
 from utils.buffer import ExperienceBuffer
 from utils.utils import discount_values, surrogate_loss
 from utils.recorder import Recorder
@@ -34,7 +34,13 @@ def get_task_class(task_name):
     Searches through all modules in the envs package for classes that match the task name.
     Handles different naming conventions (Base_Walk vs BaseWalk, etc.)
     """
-    # Generate possible class name variations
+    # Generate possible class name variations.  ``str.capitalize`` lowercases
+    # the rest of each token, so Goal_Pose_HBatch historically became
+    # GoalPoseHbatch and could not resolve GoalPoseHBatch.  Keep the legacy
+    # candidates, but also compare a case/underscore-insensitive class key.
+    def class_key(name):
+        return ''.join(char.lower() for char in name if char.isalnum())
+    wanted_key = class_key(task_name)
     possible_names = [task_name]
     
     # Handle underscore to camelCase conversion (Base_Walk -> BaseWalk)
@@ -53,7 +59,8 @@ def get_task_class(task_name):
     try:
         envs_module = importlib.import_module('envs')
         for name, obj in inspect.getmembers(envs_module):
-            if inspect.isclass(obj) and name in possible_names:
+            if (inspect.isclass(obj)
+                    and (name in possible_names or class_key(name) == wanted_key)):
                 return obj
     except Exception as e:
         print(f"Error loading from envs module: {e}")
@@ -69,7 +76,8 @@ def get_task_class(task_name):
         try:
             module = importlib.import_module(path)
             for name, obj in inspect.getmembers(module):
-                if inspect.isclass(obj) and name in possible_names:
+                if (inspect.isclass(obj)
+                        and (name in possible_names or class_key(name) == wanted_key)):
                     return obj
         except ImportError:
             continue

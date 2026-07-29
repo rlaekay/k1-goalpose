@@ -10,3 +10,4 @@ from envs.K1.safe_fall import SafeFall
 from envs.K1.goal_pose_v7 import GoalPoseV7
 
 from envs.K1.goal_pose_v8 import GoalPoseV8
+from envs.K1.goal_pose_hbatch import GoalPoseHBatch

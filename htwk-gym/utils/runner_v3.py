@@ -54,7 +54,9 @@ class RunnerV3(Runner):
         mini_epochs = self.cfg["runner"]["mini_epochs"]
         num_minibatches = self.cfg["runner"].get("num_minibatches", 4)
         sym_coef = self.cfg["algorithm"].get("symmetry_coef", 0.0)
+        mirror_aug_coef = self.cfg["algorithm"].get("mirror_augmentation_coef", 0.0)
         use_symmetry = sym_coef > 0.0 and hasattr(self.env, "mirror_obs")
+        use_mirror_aug = mirror_aug_coef > 0.0 and hasattr(self.env, "mirror_obs")
         batch_size = horizon * self.env.num_envs
         mb_size = batch_size // num_minibatches
 
@@ -83,12 +85,19 @@ class RunnerV3(Runner):
                 old_mu = old_dist.loc.reshape(batch_size, -1)
                 old_sigma = old_dist.scale.reshape(batch_size, -1)
                 old_logprob = old_dist.log_prob(self.buffer["actions"]).sum(dim=-1).reshape(batch_size)
+                if use_mirror_aug:
+                    old_mirror_dist = self.model.act(self.env.mirror_obs(self.buffer["obses"]))
+                    old_mirror_logprob = old_mirror_dist.log_prob(
+                        self.env.mirror_actions(self.buffer["actions"])
+                    ).sum(dim=-1).reshape(batch_size)
 
             obs_b = self.buffer["obses"].reshape(batch_size, -1)
             priv_b = self.buffer["privileged_obses"].reshape(batch_size, -1)
             act_b = self.buffer["actions"].reshape(batch_size, -1)
 
-            stats = {"value_loss": 0.0, "actor_loss": 0.0, "bound_loss": 0.0, "entropy": 0.0, "symmetry_loss": 0.0}
+            stats = {"value_loss": 0.0, "actor_loss": 0.0,
+                     "mirror_actor_loss": 0.0, "bound_loss": 0.0,
+                     "entropy": 0.0, "symmetry_loss": 0.0}
             num_updates = 0
             kl_mean = torch.tensor(0.0, device=self.device)
 
@@ -118,10 +127,31 @@ class RunnerV3(Runner):
 
                     values = self.model.est_value(mb_obs, priv_b[idx])
                     value_loss = F.mse_loss(values, returns_b[idx])
+                    if use_mirror_aug and hasattr(self.env, "mirror_privileged_obs"):
+                        mirror_values = self.model.est_value(
+                            self.env.mirror_obs(mb_obs),
+                            self.env.mirror_privileged_obs(priv_b[idx]),
+                        )
+                        value_loss = 0.5 * (
+                            value_loss + F.mse_loss(mirror_values, returns_b[idx]))
 
                     dist = self.model.act(mb_obs)
                     logprob = dist.log_prob(act_b[idx]).sum(dim=-1)
                     actor_loss = surrogate_loss(old_logprob[idx], logprob, adv_b[idx])
+
+                    mirror_actor_loss = torch.tensor(0.0, device=self.device)
+                    mirrored_dist = None
+                    if use_mirror_aug:
+                        mirrored_dist = self.model.act(self.env.mirror_obs(mb_obs))
+                        mirror_logprob = mirrored_dist.log_prob(
+                            self.env.mirror_actions(act_b[idx])
+                        ).sum(dim=-1)
+                        # A reflected transition has the same reward, done,
+                        # return and advantage.  Its PPO reference probability
+                        # must, however, come from pi_old(Ms) evaluated at Ma;
+                        # reusing the original logprob is mathematically wrong.
+                        mirror_actor_loss = surrogate_loss(
+                            old_mirror_logprob[idx], mirror_logprob, adv_b[idx])
 
                     bound_loss = (
                         torch.clip(dist.loc - 1.0, min=0.0).square().mean()
@@ -132,13 +162,15 @@ class RunnerV3(Runner):
                     loss = (
                         value_loss
                         + actor_loss
+                        + mirror_aug_coef * mirror_actor_loss
                         + self.cfg["algorithm"]["bound_coef"] * bound_loss
                         + self.cfg["algorithm"]["entropy_coef"] * entropy.mean()
                     )
 
                     sym_loss = torch.tensor(0.0, device=self.device)
                     if use_symmetry:
-                        mirrored_dist = self.model.act(self.env.mirror_obs(mb_obs))
+                        if mirrored_dist is None:
+                            mirrored_dist = self.model.act(self.env.mirror_obs(mb_obs))
                         sym_loss = F.mse_loss(mirrored_dist.loc, self.env.mirror_actions(dist.loc))
                         loss = loss + sym_coef * sym_loss
 
@@ -166,6 +198,7 @@ class RunnerV3(Runner):
 
                     stats["value_loss"] += value_loss.item()
                     stats["actor_loss"] += actor_loss.item()
+                    stats["mirror_actor_loss"] += mirror_actor_loss.item()
                     stats["bound_loss"] += bound_loss.item()
                     stats["entropy"] += entropy.mean().item()
                     stats["symmetry_loss"] += sym_loss.item()

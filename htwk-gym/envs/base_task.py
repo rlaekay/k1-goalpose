@@ -132,6 +132,11 @@ class BaseTask:
                 camera_props.use_collision_geometry = False
                 self.camera = self.gym.create_camera_sensor(self.envs[self.cfg["viewer"]["record_env_idx"]], camera_props)
                 self.camera_frames = []
+                # Numeric camera metadata only: no second RGB logger or sensor.
+                # eval_goal_pose projects world markers into the existing RGBA
+                # frames using the exact follow-camera pose and horizontal FOV.
+                self.camera_poses = []
+                self.camera_horizontal_fov = float(camera_props.horizontal_fov)
             idx = self.cfg["viewer"]["record_env_idx"]
             # root_states is (num_envs, 13) for single-actor tasks (K1) and
             # (num_envs, num_actors, 13) for multi-actor ones (T1 + ball)
@@ -142,3 +147,7 @@ class BaseTask:
             self.gym.render_all_camera_sensors(self.sim)
             img = self.gym.get_camera_image(self.sim, self.envs[self.cfg["viewer"]["record_env_idx"]], self.camera, gymapi.IMAGE_COLOR)
             self.camera_frames.append(img.reshape(img.shape[0], -1, 4))
+            self.camera_poses.append((
+                tuple(float(x) for x in (cam_pos.x, cam_pos.y, cam_pos.z)),
+                tuple(float(x) for x in (cam_target.x, cam_target.y, cam_target.z)),
+            ))

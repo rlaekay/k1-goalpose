@@ -286,6 +286,89 @@ def draw_goal_sequence(frame, base_xy, base_yaw, seq, k, size=240, span=3.0):
     return frame
 
 
+def _project_world(point, camera_pose, horizontal_fov_deg, width, height):
+    """Project a world point into the existing follow-camera RGBA image.
+
+    This uses the camera pose that BaseTask passed to set_camera_location, so it
+    avoids the row/column-major ambiguity that repeatedly caused bad overlays
+    when view/projection matrices were interpreted across Isaac Gym versions.
+    """
+    pos, target = (np.asarray(camera_pose[0], dtype=float),
+                   np.asarray(camera_pose[1], dtype=float))
+    forward = target - pos
+    forward /= max(np.linalg.norm(forward), 1.0e-9)
+    right = np.cross(forward, np.asarray([0.0, 0.0, 1.0]))
+    right /= max(np.linalg.norm(right), 1.0e-9)
+    up = np.cross(right, forward)
+    rel = np.asarray(point, dtype=float) - pos
+    depth = float(np.dot(rel, forward))
+    if not np.isfinite(depth) or depth <= 0.05:
+        return None
+    focal = 0.5 * width / np.tan(0.5 * np.radians(horizontal_fov_deg))
+    u = 0.5 * width + focal * float(np.dot(rel, right)) / depth
+    v = 0.5 * height - focal * float(np.dot(rel, up)) / depth
+    if not (np.isfinite(u) and np.isfinite(v)):
+        return None
+    return (u, v)
+
+
+def draw_perspective_scene(frame, st, camera_pose, horizontal_fov_deg, path_trace):
+    """Draw path/carrot/waypoint and a force arrow on the simulator view."""
+    rgb = frame[..., :3]
+    h, w = rgb.shape[:2]
+
+    def project_xy(xy, z=0.04):
+        return _project_world((float(xy[0]), float(xy[1]), float(z)),
+                              camera_pose, horizontal_fov_deg, w, h)
+
+    # A path task has no hidden final goal: goal_pos_world is the moving
+    # lookahead/carrot.  The recent carrot trace is the path actually demanded.
+    if len(st) >= 16 and int(st[15]) == CATEGORY_PATH:
+        last = None
+        for xy in path_trace[-120:]:
+            p = project_xy(xy)
+            if p is not None and last is not None:
+                _draw_line(rgb, last[0], last[1], p[0], p[1], (60, 210, 100))
+            if p is not None:
+                last = p
+        goal_color = (255, 190, 50)
+        label = "PATH CARROT"
+    else:
+        goal_color = (70, 230, 120)
+        label = "WAYPOINT GOAL"
+
+    g = project_xy(st[2], 0.06)
+    gh = project_xy((st[2][0] + 0.35 * np.cos(st[3]),
+                     st[2][1] + 0.35 * np.sin(st[3])), 0.06)
+    if g is not None:
+        _draw_disk(rgb, g[0], g[1], 7, goal_color)
+        if gh is not None:
+            _draw_line(rgb, g[0], g[1], gh[0], gh[1], goal_color)
+        _draw_text(rgb, int(g[0]) + 10, int(g[1]) - 10, label, goal_color, 1)
+
+    # HBatch stores force in ENV_SPACE.  The origin is the selected rigid body
+    # COM and arrow length uses sqrt scaling so both 3 N support and 150 N hits
+    # remain visible without saturating the screen.
+    if len(st) >= 15:
+        force = np.asarray(st[13], dtype=float)
+        origin = np.asarray(st[14], dtype=float)
+        mag = float(np.linalg.norm(force))
+        if mag > 1.0e-3:
+            length = 0.15 + 0.85 * np.sqrt(min(mag, 150.0) / 150.0)
+            end = origin + length * force / mag
+            p0 = _project_world(origin, camera_pose, horizontal_fov_deg, w, h)
+            p1 = _project_world(end, camera_pose, horizontal_fov_deg, w, h)
+            if p0 is not None and p1 is not None:
+                red = (255, 40, 40)
+                _draw_line(rgb, p0[0], p0[1], p1[0], p1[1], red)
+                ang = np.arctan2(p1[1] - p0[1], p1[0] - p0[0])
+                for da in (2.55, -2.55):
+                    _draw_line(rgb, p1[0], p1[1],
+                               p1[0] + 14 * np.cos(ang + da),
+                               p1[1] + 14 * np.sin(ang + da), red)
+    return frame
+
+
 # --------------------------------------------------------------------------
 # statistics helpers
 # --------------------------------------------------------------------------
@@ -342,7 +425,7 @@ def env_code_sha():
 
 def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
                 record_video=False, keep_perturbations=False, no_noise=False,
-                stress=None):
+                stress=None, goal_pattern=None):
     """Apply the standard evaluation conditions to a task config, in place."""
     cfg["basic"]["task"] = task
     cfg["basic"]["headless"] = True
@@ -362,6 +445,14 @@ def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
         # would not be comparable to the armA-D numbers.
         if isinstance(cfg["randomization"].get("disturbance"), dict):
             cfg["randomization"]["disturbance"]["enabled"] = False
+    else:
+        # Training ramps disturbance probability in gradually.  A fresh eval
+        # process starts common_step_counter at zero, so retaining that ramp
+        # would accidentally score an almost disturbance-free run.  Stress
+        # evaluation instead exercises the configured terminal distribution.
+        disturbance = cfg["randomization"].get("disturbance")
+        if isinstance(disturbance, dict) and disturbance.get("enabled", False):
+            disturbance["ramp_steps"] = 1
     if no_noise:
         cfg["noise"] = {}
 
@@ -380,6 +471,18 @@ def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
             c["goal_categories"]["enabled"] = False   # else 30% of draws are zero-distance
         if isinstance(c.get("goal_mode_mixture"), dict):
             c["goal_mode_mixture"] = {"waypoint": 1.0, "path": 0.0}  # jitter is a waypoint stress
+    if goal_pattern:
+        cfg.setdefault("evaluation", {})["goal_pattern"] = goal_pattern
+        c = cfg["commands"]
+        if isinstance(c.get("goal_categories"), dict):
+            c["goal_categories"]["enabled"] = False
+        if isinstance(c.get("goal_mode_mixture"), dict):
+            c["goal_mode_mixture"] = {"waypoint": 1.0, "path": 0.0}
+        c["goal_dtheta"] = [0.0, 0.0]
+        if goal_pattern == "lateral":
+            c["goal_dx"], c["goal_dy"] = [0.0, 0.0], [-2.0, 2.0]
+        elif goal_pattern == "reverse":
+            c["goal_dx"], c["goal_dy"] = [-2.0, -1.0], [0.0, 0.0]
     return cfg
 
 
@@ -425,7 +528,8 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
 
     keys = ("pos_err", "head_err", "speed", "category", "start_dist", "duration_s",
             "min_dist", "along", "cross", "peak_speed", "mean_speed", "cmd_speed",
-            "path_lag")
+            "path_lag", "time_to_0p5_s", "time_to_0p8_s", "time_to_1p0_s",
+            "min_speed_first_2s", "initial_goal_bearing_rad", "switch_gait_phase")
     seg = {k: [] for k in keys}
     # Whole-rollout body-speed histogram, over every env and every control step.
     # The per-segment "final_speed" only says how well it stops; this says how
@@ -437,6 +541,27 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     angvel_hist = np.zeros(400, dtype=np.int64)  # 0..8 rad/s
     angvel_hist_max = 8.0
     upright_steps = 0
+    # Phase-conditioned stability metrics distinguish useful acceleration lean
+    # from the steady high-speed wobble H2 is meant to remove.
+    stability_hist = {
+        "accel_pitch_deg": np.zeros(180, dtype=np.int64),
+        "cruise_pitch_deg": np.zeros(180, dtype=np.int64),
+        "cruise_roll_deg": np.zeros(180, dtype=np.int64),
+        "cruise_ang_xy": np.zeros(400, dtype=np.int64),
+        "cruise_z_vel": np.zeros(300, dtype=np.int64),
+    }
+    stability_counts = {"valid": 0, "accel": 0, "cruise": 0}
+    mirror_error_hist = np.zeros(400, dtype=np.int64)  # RMS action error, 0..2
+    mirror_error_hist_max = 2.0
+    eval_accel_filtered = torch.zeros(env.num_envs, 3, device=env.device)
+    force_prev_active = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    force_events = force_active_steps = force_context_falls = 0
+    force_records = {
+        key: [] for key in (
+            "kind", "path", "duration_observed_s", "impulse_ns",
+            "torque_impulse_nms", "max_tilt_deg", "speed_loss_mps",
+            "recovery_eligible", "recovery_90_s", "survived_2s", "survived_5s")
+    }
     fall_ctx = {k: [] for k in ("category", "goal_dist", "t_into_segment", "start_dist")}
     falls = 0
     censored = 0
@@ -464,6 +589,60 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     obs, _ = env.reset()
     obs = obs.to(device)
 
+    # Per-segment transient response.  These make abrupt lateral/reverse goals
+    # and acceleration regressions measurable instead of relying on a final
+    # speed snapshot after the transient has already ended.
+    response_elapsed = torch.zeros(env.num_envs, device=env.device)
+    response_min_speed_2s = torch.full(
+        (env.num_envs,), float("inf"), device=env.device)
+    response_t05 = torch.full((env.num_envs,), float("nan"), device=env.device)
+    response_t08 = torch.full((env.num_envs,), float("nan"), device=env.device)
+    response_t10 = torch.full((env.num_envs,), float("nan"), device=env.device)
+    response_initial_bearing = torch.atan2(env.goal_rel_pos[:, 1], env.goal_rel_pos[:, 0])
+    response_initial_phase = env.gait_process.clone()
+
+    # One disturbance can be followed for five seconds because the H configs'
+    # minimum inter-event interval is six seconds.  Keep the tracker generic;
+    # overlapping events would simply replace an env's unfinished record and
+    # are rejected by the event-count/record-count mismatch in the report.
+    force_live = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    force_start_step = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    force_end_step = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    force_baseline_speed = torch.zeros(env.num_envs, device=env.device)
+    force_min_speed = torch.zeros(env.num_envs, device=env.device)
+    force_kind = torch.zeros(env.num_envs, dtype=torch.int8, device=env.device)
+    force_path = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    force_impulse = torch.zeros(env.num_envs, device=env.device)
+    force_torque_impulse = torch.zeros(env.num_envs, device=env.device)
+    force_max_tilt = torch.zeros(env.num_envs, device=env.device)
+    force_ended = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    force_recovery = torch.full((env.num_envs,), float("nan"), device=env.device)
+
+    def close_force_records(mask, age_s):
+        ids = mask.nonzero(as_tuple=False).flatten()
+        if len(ids) == 0:
+            return
+        for idx in ids.tolist():
+            age = float(age_s[idx].item())
+            baseline = float(force_baseline_speed[idx].item())
+            minimum = float(force_min_speed[idx].item())
+            relevant_recovery = bool(force_path[idx].item()) and baseline >= 0.5
+            recovery = float(force_recovery[idx].item()) if relevant_recovery else float("nan")
+            force_records["kind"].append(int(force_kind[idx].item()))
+            force_records["path"].append(bool(force_path[idx].item()))
+            force_records["duration_observed_s"].append(min(age, 5.0))
+            force_records["impulse_ns"].append(float(force_impulse[idx].item()))
+            force_records["torque_impulse_nms"].append(float(force_torque_impulse[idx].item()))
+            force_records["max_tilt_deg"].append(float(force_max_tilt[idx].item()))
+            force_records["speed_loss_mps"].append(max(0.0, baseline - minimum))
+            force_records["recovery_eligible"].append(relevant_recovery)
+            force_records["recovery_90_s"].append(recovery)
+            force_records["survived_2s"].append(age >= 2.0)
+            force_records["survived_5s"].append(age >= 5.0)
+        force_live[ids] = False
+        force_ended[ids] = False
+        force_recovery[ids] = float("nan")
+
     # CUDA work is asynchronous. Synchronize only at the timing boundaries so
     # rollout_wall_s measures completed simulation/inference work without adding
     # a device-wide barrier to every control step.
@@ -479,24 +658,45 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
         pose_hist[pose_fill % (pose_win + 1), :, 1] = env.base_pos[:, 1]
         pose_hist[pose_fill % (pose_win + 1), :, 2] = wrap(_yaw)
         pose_fill += 1
+        # A window that STRADDLES A RESET differences the spawn pose against the
+        # pre-reset pose, so the teleport is reported as travel. Measured on the
+        # E/G batches: peak_speed reached 203 m/s and 15.7-17.6% of every run's
+        # segments were contaminated -- a count that tracked
+        # segments_censored_by_episode_end (761-767) almost exactly. That is the
+        # metric this whole batch existed to move, so it silently invalidated the
+        # headline result. episode_length_buf is zeroed by _reset_idx, so it
+        # counts steps since spawn exactly; require a full window of them.
+        speed_valid = env.episode_length_buf >= pose_win
         if pose_fill > pose_win:
             new = pose_hist[(pose_fill - 1) % (pose_win + 1)]
             old = pose_hist[(pose_fill - 1 - pose_win) % (pose_win + 1)]
             dxy = new[:, :2] - old[:, :2]
             cur_speed = torch.norm(dxy, dim=-1) / (pose_win * env.dt)
             cur_yawrate = wrap(new[:, 2] - old[:, 2]).abs() / (pose_win * env.dt)
+            cur_speed = torch.where(speed_valid, cur_speed, torch.zeros_like(cur_speed))
+            cur_yawrate = torch.where(speed_valid, cur_yawrate, torch.zeros_like(cur_yawrate))
         else:
+            speed_valid = torch.zeros_like(speed_valid)
             cur_speed = torch.zeros(env.num_envs, device=env.device)
             cur_yawrate = torch.zeros(env.num_envs, device=env.device)
         torch.maximum(peak_speed, cur_speed, out=peak_speed)
+        # Excluded from the mean as well, not just zeroed: a zeroed sample still
+        # drags the average down by ~pose_win steps after every reset.
         sum_speed += cur_speed
-        n_speed += 1.0
+        n_speed += speed_valid.float()
+        # Histogram only the valid samples. Feeding the masked zeros in would put
+        # a spike at 0 m/s worth ~pose_win steps per reset, which then moves the
+        # median and the "fraction of time above 0.5/1.0 m/s" lines.
+        valid_np = speed_valid.cpu().numpy()
         np.add.at(speed_hist,
-                  np.clip((cur_speed.cpu().numpy() / speed_hist_max * len(speed_hist)).astype(int),
+                  np.clip((cur_speed.cpu().numpy()[valid_np] / speed_hist_max * len(speed_hist)).astype(int),
                           0, len(speed_hist) - 1), 1)
-        cur_omega = cur_yawrate
+        # Stress stability needs roll/pitch motion too.  The historical harness
+        # used pose-difference yaw rate and labelled it |omega|, silently hiding
+        # exactly the high-speed torso wobble under investigation.
+        cur_omega = torch.norm(env.base_ang_vel, dim=-1)
         np.add.at(angvel_hist,
-                  np.clip((cur_omega.cpu().numpy() / angvel_hist_max * len(angvel_hist)).astype(int),
+                  np.clip((cur_omega.cpu().numpy()[valid_np] / angvel_hist_max * len(angvel_hist)).astype(int),
                           0, len(angvel_hist) - 1), 1)
         # projected_gravity z near -1 == upright; > -0.7 is ~45 deg off vertical
         upright_steps += int((env.projected_gravity[:, 2] < -0.7).sum().item())
@@ -513,6 +713,10 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
         prev_path_lag = env.path_lag.clone() if has_path_lag else None
         prev_goal_dist = env.goal_dist.clone()
         prev_len = env.episode_length_buf.clone()
+        prev_filtered_lin_vel = env.filtered_lin_vel.clone()
+        force_before = force_prev_active.clone()
+        prev_force_serial = (env.dist_event_serial.clone()
+                             if hasattr(env, "dist_event_serial") else None)
         if instrumented:
             prev_category = env.goal_category.clone()
             prev_start_pos = env.goal_start_pos.clone()
@@ -521,6 +725,19 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
         with torch.no_grad():
             dist = model.act(obs)
             act = dist.sample() if stochastic else dist.loc
+            if (step_i % 10 == 0 and hasattr(env, "mirror_obs")
+                    and hasattr(env, "mirror_actions")):
+                mirrored_mu = model.act(env.mirror_obs(obs)).loc
+                equivariant_mu = env.mirror_actions(dist.loc)
+                mirror_error = torch.sqrt(torch.square(
+                    mirrored_mu - equivariant_mu).mean(dim=-1))
+                err = mirror_error.detach().cpu().numpy()
+                np.add.at(
+                    mirror_error_hist,
+                    np.clip((err / mirror_error_hist_max * len(mirror_error_hist)).astype(int),
+                            0, len(mirror_error_hist) - 1),
+                    1,
+                )
         obs, _, done, infos = env.step(act.to(env.device))
         obs = obs.to(device)
 
@@ -529,6 +746,113 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
         n_fell = int(fell.sum().item())
         falls += n_fell
         censored += int((done & timeouts).sum().item())
+
+        # ---- acceleration / cruise separation -----------------------------
+        reset_guard = float(env.cfg.get("evaluation", {}).get("reset_guard_s", 0.25))
+        valid_phase = (~done) & (env.episode_length_buf.float() * env.dt >= reset_guard)
+        # Match H2's phase detector: differentiate the existing low-pass body
+        # velocity rather than one-step trunk velocity contaminated by gait sway.
+        acc_instant = (env.filtered_lin_vel - prev_filtered_lin_vel) / env.dt
+        eval_accel_filtered = 0.10 * acc_instant + 0.90 * eval_accel_filtered
+        eval_accel_filtered[done] = 0.0
+        acc_body = eval_accel_filtered
+        acc_xy = torch.norm(acc_body[:, :2], dim=-1)
+        speed_now = torch.norm(env.filtered_lin_vel[:, :2], dim=-1)
+        accel_thr = float(env.cfg.get("evaluation", {}).get("steady_accel_threshold_mps2", 0.3))
+        fast_thr = float(env.cfg.get("evaluation", {}).get("high_speed_threshold_mps", 0.8))
+        accel_phase = valid_phase & (speed_now > 0.3) & (acc_body[:, 0] > accel_thr)
+        cruise_phase = valid_phase & (speed_now >= fast_thr) & (acc_xy <= accel_thr)
+        gx, gy, gz = env.projected_gravity.unbind(dim=-1)
+        pitch_deg = torch.rad2deg(torch.atan2(-gx, -gz).abs())
+        roll_deg = torch.rad2deg(torch.atan2(gy, -gz).abs())
+
+        def add_hist(name, values, mask, maximum):
+            arr = values[mask].detach().cpu().numpy()
+            if len(arr):
+                idx = np.clip((arr / maximum * len(stability_hist[name])).astype(int),
+                              0, len(stability_hist[name]) - 1)
+                np.add.at(stability_hist[name], idx, 1)
+
+        add_hist("accel_pitch_deg", pitch_deg, accel_phase, 90.0)
+        add_hist("cruise_pitch_deg", pitch_deg, cruise_phase, 90.0)
+        add_hist("cruise_roll_deg", roll_deg, cruise_phase, 90.0)
+        add_hist("cruise_ang_xy", torch.norm(env.base_ang_vel[:, :2], dim=-1), cruise_phase, 8.0)
+        add_hist("cruise_z_vel", env.base_lin_vel[:, 2].abs(), cruise_phase, 3.0)
+        stability_counts["valid"] += int(valid_phase.sum().item())
+        stability_counts["accel"] += int(accel_phase.sum().item())
+        stability_counts["cruise"] += int(cruise_phase.sum().item())
+
+        # Disturbance exposure and fall counts are separate from clean gates.
+        # A clean 0-fall report can never be cited as force robustness again.
+        if hasattr(env, "pushing_forces"):
+            force_norm = torch.norm(env.pushing_forces, dim=-1).amax(dim=-1)
+            torque_norm = torch.norm(env.pushing_torques, dim=-1).amax(dim=-1)
+            force_now = force_norm > 1.0e-3
+            rising = force_now & ~force_before
+            event_edge = ((env.dist_event_serial != prev_force_serial)
+                          if prev_force_serial is not None else rising)
+            force_events += int(event_edge.sum().item())
+            force_active_steps += int(force_now.sum().item())
+            force_context_falls += int((fell & (force_before | force_now)).sum().item())
+
+            if bool(event_edge.any()):
+                # H intervals are intentionally longer than the five-second
+                # outcome window.  A rising edge while one is still live is a
+                # config error; leave the older record live so the count
+                # mismatch is visible rather than silently overwriting it.
+                start = event_edge & ~force_live
+                force_live[start] = True
+                force_start_step[start] = step_i
+                force_baseline_speed[start] = torch.norm(
+                    prev_filtered_lin_vel[start, :2], dim=-1)
+                force_min_speed[start] = speed_now[start]
+                force_path[start] = getattr(
+                    env, "is_path_env",
+                    torch.zeros(env.num_envs, dtype=torch.bool, device=env.device))[start]
+                if hasattr(env, "dist_last_event_kind"):
+                    force_kind[start] = env.dist_last_event_kind[start]
+                elif hasattr(env, "dist_event_kind"):
+                    force_kind[start] = env.dist_event_kind[start]
+                else:
+                    force_kind[start] = 0
+                force_impulse[start] = 0.0
+                force_torque_impulse[start] = 0.0
+                vanished = start & ~force_now
+                if bool(vanished.any()) and hasattr(env, "dist_last_expected_impulse"):
+                    # A collision can trigger termination and be cleared by
+                    # _reset_idx inside the same env.step.  Its monotonic event
+                    # serial still exposes it; retain the sampled impulse rather
+                    # than reporting a physically impossible zero-strength fall.
+                    force_impulse[vanished] = env.dist_last_expected_impulse[vanished]
+                    force_torque_impulse[vanished] = (
+                        env.dist_last_expected_torque_impulse[vanished])
+                force_max_tilt[start] = 0.0
+                force_ended[start] = False
+                force_recovery[start] = float("nan")
+
+            active_record = force_live
+            force_impulse[active_record] += force_norm[active_record] * env.dt
+            force_torque_impulse[active_record] += torque_norm[active_record] * env.dt
+            not_recovered = active_record & torch.isnan(force_recovery)
+            force_min_speed[not_recovered] = torch.minimum(
+                force_min_speed[not_recovered], speed_now[not_recovered])
+            tilt_deg = torch.rad2deg(torch.acos(
+                (-env.projected_gravity[:, 2]).clamp(-1.0, 1.0)))
+            force_max_tilt[active_record] = torch.maximum(
+                force_max_tilt[active_record], tilt_deg[active_record])
+
+            ended_now = active_record & force_before & ~force_now & ~force_ended
+            force_ended[ended_now] = True
+            force_end_step[ended_now] = step_i
+            recovery_now = (active_record & force_ended & torch.isnan(force_recovery)
+                            & force_path & (force_baseline_speed >= 0.5)
+                            & (speed_now >= 0.9 * force_baseline_speed))
+            force_recovery[recovery_now] = (
+                step_i - force_end_step[recovery_now]).float() * env.dt
+
+            age_s = (step_i - force_start_step + 1).float() * env.dt
+            close_force_records((active_record & (age_s >= 5.0)) | (active_record & fell), age_s)
+            force_prev_active = force_now & ~done
 
         if n_fell and instrumented:
             fids = fell.nonzero(as_tuple=False).flatten()
@@ -550,6 +874,19 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
             # Goals are redrawn every control step, so a "segment" is one step
             # long and every per-segment statistic is meaningless. Skip them.
             completed = completed & False
+
+        # Transient speed response belongs to the segment that was active when
+        # this action was chosen.  Update it before closing a changed segment,
+        # then reset from the newly sampled goal below.
+        response_valid = ~done
+        response_elapsed[response_valid] += env.dt
+        within_2s = response_valid & (response_elapsed <= 2.0)
+        response_min_speed_2s[within_2s] = torch.minimum(
+            response_min_speed_2s[within_2s], speed_now[within_2s])
+        for threshold, target in ((0.5, response_t05), (0.8, response_t08), (1.0, response_t10)):
+            reached = response_valid & torch.isnan(target) & (speed_now >= threshold)
+            target[reached] = response_elapsed[reached]
+
         if completed.any():
             ids = completed.nonzero(as_tuple=False).flatten()
             final_xy = env.base_pos[ids, :2]
@@ -574,6 +911,13 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
                 seg["path_lag"].extend(lag.cpu().tolist())
             else:
                 seg["path_lag"].extend([float("nan")] * len(ids))
+            seg["time_to_0p5_s"].extend(response_t05[ids].cpu().tolist())
+            seg["time_to_0p8_s"].extend(response_t08[ids].cpu().tolist())
+            seg["time_to_1p0_s"].extend(response_t10[ids].cpu().tolist())
+            seg["min_speed_first_2s"].extend(response_min_speed_2s[ids].cpu().tolist())
+            seg["initial_goal_bearing_rad"].extend(
+                response_initial_bearing[ids].cpu().tolist())
+            seg["switch_gait_phase"].extend(response_initial_phase[ids].cpu().tolist())
 
             if instrumented:
                 approach = goal_xy - prev_start_pos[ids]
@@ -606,13 +950,27 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
             peak_speed[stale] = 0.0
             sum_speed[stale] = 0.0
             n_speed[stale] = 0.0
+            response_elapsed[stale] = 0.0
+            response_min_speed_2s[stale] = float("inf")
+            response_t05[stale] = float("nan")
+            response_t08[stale] = float("nan")
+            response_t10[stale] = float("nan")
+            response_initial_bearing[stale] = torch.atan2(
+                env.goal_rel_pos[stale, 1], env.goal_rel_pos[stale, 0])
+            response_initial_phase[stale] = env.gait_process[stale]
 
         if not video_done:
             _, _, yaw_all = get_euler_xyz(env.base_quat[0:1])
             push_n = push_nm = 0.0
+            force_vec = np.zeros(3, dtype=float)
+            force_origin = env.base_pos[0].cpu().numpy().copy()
             if hasattr(env, "pushing_forces") and hasattr(env, "base_indice"):
-                push_n = float(torch.norm(env.pushing_forces[0, env.base_indice, :]).item())
-                push_nm = float(torch.norm(env.pushing_torques[0, env.base_indice, :]).item())
+                body_norm = torch.norm(env.pushing_forces[0], dim=-1)
+                body_idx = int(torch.argmax(body_norm).item())
+                force_vec = env.pushing_forces[0, body_idx].cpu().numpy().copy()
+                force_origin = env.body_states[0, body_idx, :3].cpu().numpy().copy()
+                push_n = float(body_norm[body_idx].item())
+                push_nm = float(torch.norm(env.pushing_torques[0, body_idx, :]).item())
             overlay_states.append((
                 env.base_pos[0, :2].cpu().numpy().copy(),
                 float(wrap(yaw_all)[0].item()),
@@ -628,6 +986,9 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
                 (env.seq_goals[0].cpu().numpy().copy()
                  if hasattr(env, "seq_goals") and bool(env.is_seq_env[0]) else None),
                 int(env.seq_idx[0].item()) if hasattr(env, "seq_idx") else 0,
+                force_vec,
+                force_origin,
+                int(env.goal_category[0].item()) if hasattr(env, "goal_category") else -1,
             ))
             if (step_i + 1) * env.dt >= record_video_s:
                 env.cfg["viewer"]["record_video"] = False  # stop accumulating frames (memory)
@@ -659,6 +1020,56 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     out["v7_extras"] = dict(getattr(env, "extras", {}).get("v7", {}) or {})
     out["upright_share"] = upright_steps / float(max(total_steps * env.num_envs, 1))
     out["env_minutes"] = total_steps * env.dt * env.num_envs / 60.0
+    out["stability_hist"] = stability_hist
+    out["stability_counts"] = stability_counts
+    out["mirror_error_hist"] = mirror_error_hist
+    out["mirror_error_hist_max"] = mirror_error_hist_max
+
+    fr = {k: np.asarray(v) for k, v in force_records.items()}
+
+    def event_summary(kind=None):
+        count = len(fr["kind"])
+        mask = np.ones(count, dtype=bool)
+        if kind is not None:
+            mask &= fr["kind"].astype(int) == kind
+        eligible = mask & fr["recovery_eligible"].astype(bool)
+        recovered = eligible & np.isfinite(fr["recovery_90_s"].astype(float))
+
+        def masked_pct(key, percentile):
+            values = fr[key].astype(float)[mask]
+            return _pct(values, percentile) if len(values) else float("nan")
+
+        return {
+            "records": int(mask.sum()),
+            "survival_2s": (float(fr["survived_2s"].astype(bool)[mask].mean())
+                            if mask.any() else float("nan")),
+            "survival_5s": (float(fr["survived_5s"].astype(bool)[mask].mean())
+                            if mask.any() else float("nan")),
+            "impulse_ns_median": masked_pct("impulse_ns", 50),
+            "impulse_ns_p90": masked_pct("impulse_ns", 90),
+            "torque_impulse_nms_p90": masked_pct("torque_impulse_nms", 90),
+            "max_tilt_deg_p90": masked_pct("max_tilt_deg", 90),
+            "speed_loss_mps_p90": masked_pct("speed_loss_mps", 90),
+            "recovery_eligible": int(eligible.sum()),
+            "recovery_90_within_5s_share": (
+                float(recovered.sum() / eligible.sum()) if eligible.any() else float("nan")),
+            "recovery_90_s_p50": (_pct(fr["recovery_90_s"].astype(float)[recovered], 50)
+                                  if recovered.any() else float("nan")),
+            "recovery_90_s_p90": (_pct(fr["recovery_90_s"].astype(float)[recovered], 90)
+                                  if recovered.any() else float("nan")),
+        }
+
+    out["disturbance_eval"] = {
+        "events": force_events,
+        "active_env_steps": force_active_steps,
+        "active_share": force_active_steps / float(max(total_steps * env.num_envs, 1)),
+        "falls_during_force": force_context_falls,
+        "events_with_outcome_record": len(fr["kind"]),
+        "events_censored_or_overlapping": max(0, force_events - len(fr["kind"])),
+        "overall": event_summary(),
+        "collision": event_summary(1),
+        "support": event_summary(2),
+    }
     return out
 
 
@@ -889,6 +1300,97 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
     else:
         results["body_speed"] = None
 
+    # ---- phase-conditioned high-speed stability --------------------------
+    sh = roll.get("stability_hist") or {}
+    sc = roll.get("stability_counts") or {}
+    if sh:
+        results["high_speed_stability"] = {
+            "phase_definition": {
+                "acceleration": "v>0.3 m/s and forward acceleration>threshold",
+                "cruise": "v>=high_speed_threshold and |a_xy|<=steady threshold",
+                "high_speed_threshold_mps": float(eval_cfg.get("high_speed_threshold_mps", 0.8)),
+                "steady_accel_threshold_mps2": float(eval_cfg.get("steady_accel_threshold_mps2", 0.3)),
+            },
+            "samples": {k: int(v) for k, v in sc.items()},
+            "accel_pitch_abs_p50_deg": _hist_pct(sh["accel_pitch_deg"], 90.0, 50),
+            "accel_pitch_abs_p90_deg": _hist_pct(sh["accel_pitch_deg"], 90.0, 90),
+            "cruise_pitch_abs_p90_deg": _hist_pct(sh["cruise_pitch_deg"], 90.0, 90),
+            "cruise_roll_abs_p90_deg": _hist_pct(sh["cruise_roll_deg"], 90.0, 90),
+            "cruise_ang_xy_p90_radps": _hist_pct(sh["cruise_ang_xy"], 8.0, 90),
+            "cruise_abs_z_vel_p90_mps": _hist_pct(sh["cruise_z_vel"], 3.0, 90),
+            "cruise_share_of_valid": sc.get("cruise", 0) / float(max(sc.get("valid", 0), 1)),
+        }
+    else:
+        results["high_speed_stability"] = None
+    results["disturbance_eval"] = roll.get("disturbance_eval") or {}
+    mirror_hist = roll.get("mirror_error_hist")
+    if mirror_hist is not None and mirror_hist.sum() > 0:
+        mirror_max = float(roll.get("mirror_error_hist_max", 2.0))
+        results["symmetry_eval"] = {
+            "definition": "RMS(pi(Ms) - M pi(s)) over actions; sampled every 10 control steps",
+            "samples": int(mirror_hist.sum()),
+            "median": _hist_pct(mirror_hist, mirror_max, 50),
+            "p90": _hist_pct(mirror_hist, mirror_max, 90),
+            "p99": _hist_pct(mirror_hist, mirror_max, 99),
+        }
+    else:
+        results["symmetry_eval"] = None
+
+    # ---- segment transient response -------------------------------------
+    def response_stats(values, mask):
+        values = np.asarray(values, dtype=float)
+        reached = mask & np.isfinite(values)
+        return {
+            "eligible": int(mask.sum()),
+            "reached_share": float(reached.sum() / mask.sum()) if mask.any() else float("nan"),
+            "p50_s": _pct(values[reached], 50) if reached.any() else float("nan"),
+            "p90_s": _pct(values[reached], 90) if reached.any() else float("nan"),
+        }
+
+    if path_mask.any():
+        results["path_acceleration_response"] = {
+            "time_to_0p5": response_stats(roll["time_to_0p5_s"], path_mask),
+            "time_to_0p8": response_stats(roll["time_to_0p8_s"], path_mask),
+            "time_to_1p0": response_stats(roll["time_to_1p0_s"], path_mask),
+        }
+    else:
+        results["path_acceleration_response"] = None
+
+    goal_pattern = eval_cfg.get("goal_pattern")
+    if goal_pattern:
+        response_mask = np.ones(n, dtype=bool)
+        bearing = np.degrees(np.abs(roll["initial_goal_bearing_rad"]))
+        min2 = np.asarray(roll["min_speed_first_2s"], dtype=float)
+        phase = np.mod(np.asarray(roll["switch_gait_phase"], dtype=float), 1.0)
+        phase_bin = np.minimum((phase * 4.0).astype(int), 3)
+        phase_rows = []
+        for b in range(4):
+            pm = response_mask & (phase_bin == b)
+            if not pm.any():
+                continue
+            phase_rows.append({
+                "phase_lo": b / 4.0,
+                "phase_hi": (b + 1) / 4.0,
+                "n": int(pm.sum()),
+                "time_to_0p5": response_stats(roll["time_to_0p5_s"], pm),
+                "time_to_1p0": response_stats(roll["time_to_1p0_s"], pm),
+            })
+        results["directional_response"] = {
+            "pattern": goal_pattern,
+            "segments": n,
+            "initial_goal_bearing_abs_deg": {
+                "median": _median(bearing), "p10": _pct(bearing, 10), "p90": _pct(bearing, 90)},
+            "min_speed_first_2s_mps": {
+                "median": _median(min2[np.isfinite(min2)]),
+                "p10": _pct(min2[np.isfinite(min2)], 10)},
+            "time_to_0p5": response_stats(roll["time_to_0p5_s"], response_mask),
+            "time_to_0p8": response_stats(roll["time_to_0p8_s"], response_mask),
+            "time_to_1p0": response_stats(roll["time_to_1p0_s"], response_mask),
+            "by_switch_gait_quarter": phase_rows,
+        }
+    else:
+        results["directional_response"] = None
+
     # ---- commanded vs achieved speed (path mode) --------------------------
     # The point of a WIDE FIXED commanded-speed distribution (no curriculum) is
     # that this curve saturates: below the robot's physical limit achieved
@@ -899,7 +1401,10 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
     cmd = roll.get("cmd_speed")
     results["speed_tracking"] = None
     if cmd is not None and np.isfinite(cmd).any():
-        ok = np.isfinite(cmd) & (cmd > 0) & np.isfinite(roll["mean_speed"])
+        # path_speed retains its last sampled value on waypoint envs.  Without
+        # this category gate, the old report mixed every waypoint into the
+        # commanded-speed curve and reported a fictitious saturation knee.
+        ok = path_mask & np.isfinite(cmd) & (cmd > 0) & np.isfinite(roll["mean_speed"])
         if ok.sum() >= 20:
             bins = [0.0, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, float("inf")]
             rows = []
@@ -991,7 +1496,9 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
     per_dist = []
     if np.isfinite(start_d).any():
         for lo, hi in zip(DISTANCE_BINS[:-1], DISTANCE_BINS[1:]):
-            m = np.isfinite(start_d) & (start_d >= lo) & (start_d < hi)
+            # Distance-to-final-goal is not a path metric.  Keep this table on
+            # the exact same waypoint scope as failure modes and pose gates.
+            m = gate_mask & np.isfinite(start_d) & (start_d >= lo) & (start_d < hi)
             if not m.any():
                 continue
             per_dist.append({
@@ -1016,6 +1523,16 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
         }
     else:
         results["fall_analysis"] = None
+
+    path_falls = (results["fall_analysis"]["per_category"].get("path", 0)
+                  if results["fall_analysis"] else 0)
+    path_attempts = int(path_mask.sum()) + int(path_falls)
+    results["path_safety"] = {
+        "falls": int(path_falls),
+        "attempts_completed_plus_falls": path_attempts,
+        "falls_per_1000_attempts": (
+            1000.0 * path_falls / path_attempts if path_attempts else float("nan")),
+    }
 
     results["recommendations"] = recommend(results, cfg)
     return results
@@ -1232,6 +1749,99 @@ def render_report(r):
                   "moving-carrot 과제라 final position error가 도착 오차가 아니며, 아래 `path 추종` "
                   "섹션의 lag/speed 지표로 따로 본다.")
     md.append("")
+
+    hs = r.get("high_speed_stability")
+    if hs:
+        md.append("## 고속 안정성 — 가속과 순항 분리")
+        md.append("")
+        md.append("가속 중 전방 lean은 빠른 가속에 유용할 수 있으므로 실패로 세지 않는다. "
+                  "`v≥{:.1f} m/s`이면서 `|a_xy|≤{:.1f} m/s²`인 순항만 별도로 채점한다.".format(
+                      hs["phase_definition"]["high_speed_threshold_mps"],
+                      hs["phase_definition"]["steady_accel_threshold_mps2"]))
+        md.append("")
+        md += _table(
+            ["phase 지표", "값"],
+            [["가속 pitch |.| median / p90", "{:.1f}° / {:.1f}°".format(
+                hs["accel_pitch_abs_p50_deg"], hs["accel_pitch_abs_p90_deg"])],
+             ["순항 pitch |.| p90", "{:.1f}°".format(hs["cruise_pitch_abs_p90_deg"])],
+             ["순항 roll |.| p90", "{:.1f}°".format(hs["cruise_roll_abs_p90_deg"])],
+             ["순항 |ωxy| p90", "{:.2f} rad/s".format(hs["cruise_ang_xy_p90_radps"])],
+             ["순항 |vz| p90", "{:.2f} m/s".format(hs["cruise_abs_z_vel_p90_mps"])],
+             ["유효 sample 중 순항", "{:.1f}%".format(hs["cruise_share_of_valid"] * 100)]])
+        md.append("")
+
+    pa = r.get("path_acceleration_response")
+    if pa:
+        md.append("## path 가속 응답")
+        md.append("")
+        md += _table(
+            ["임계", "도달 비율", "도달한 구간 p50 / p90"],
+            [[label, "{:.1f}%".format(100 * pa[key]["reached_share"]),
+              "{:.2f} / {:.2f} s".format(pa[key]["p50_s"], pa[key]["p90_s"])]
+             for label, key in (("0.5 m/s", "time_to_0p5"),
+                                ("0.8 m/s", "time_to_0p8"),
+                                ("1.0 m/s", "time_to_1p0"))])
+        md.append("")
+
+    dr = r.get("directional_response")
+    if dr:
+        md.append("## 급격한 {} goal 응답".format(dr["pattern"]))
+        md.append("")
+        md.append("- 시작 goal bearing |.| median {:.1f}°, p10–p90 {:.1f}–{:.1f}°".format(
+            dr["initial_goal_bearing_abs_deg"]["median"],
+            dr["initial_goal_bearing_abs_deg"]["p10"],
+            dr["initial_goal_bearing_abs_deg"]["p90"]))
+        md.append("- 시작 후 2 s 내 최저속도 median/p10 {:.2f}/{:.2f} m/s".format(
+            dr["min_speed_first_2s_mps"]["median"], dr["min_speed_first_2s_mps"]["p10"]))
+        md += _table(
+            ["임계", "도달 비율", "p50 / p90"],
+            [[label, "{:.1f}%".format(100 * dr[key]["reached_share"]),
+              "{:.2f} / {:.2f} s".format(dr[key]["p50_s"], dr[key]["p90_s"])]
+             for label, key in (("0.5 m/s", "time_to_0p5"),
+                                ("0.8 m/s", "time_to_0p8"),
+                                ("1.0 m/s", "time_to_1p0"))])
+        md.append("- gait phase quarter별 같은 지표는 JSON에 저장된다. 특정 발 접지 시점에만 "
+                  "side/back 응답이 느려지는지 분리할 수 있다.")
+        md.append("")
+
+    sy = r.get("symmetry_eval")
+    if sy:
+        md.append("## 좌우 policy equivariance")
+        md.append("")
+        md.append("`RMS(π(Ms) − Mπ(s))` action error: median {:.3f}, p90 {:.3f}, p99 {:.3f} "
+                  "({} samples).".format(
+                      sy["median"], sy["p90"], sy["p99"], sy["samples"]))
+        md.append("")
+
+    de = r.get("disturbance_eval") or {}
+    if de:
+        md.append("## 외력 노출 감사")
+        md.append("")
+        md.append("- 감지된 force event: {}회; 외력 active env-step 비율 {:.2f}%".format(
+            de.get("events", 0), 100 * de.get("active_share", 0.0)))
+        md.append("- 외력 인가 중 낙상: {}회".format(de.get("falls_during_force", 0)))
+        md.append("- 5 s outcome record {} / censored·overlap {}".format(
+            de.get("events_with_outcome_record", 0), de.get("events_censored_or_overlapping", 0)))
+        rows = []
+        for label, key in (("전체", "overall"), ("충돌", "collision"), ("support", "support")):
+            e = de.get(key) or {}
+            if e.get("records", 0):
+                rows.append([
+                    label, e["records"], "{:.1f}/{:.1f}%".format(
+                        100 * e["survival_2s"], 100 * e["survival_5s"]),
+                    "{:.1f}".format(e["impulse_ns_p90"]),
+                    "{:.1f}°".format(e["max_tilt_deg_p90"]),
+                    "{:.2f}".format(e["speed_loss_mps_p90"]),
+                    "{:.1f}% / {:.2f}s".format(
+                        100 * e["recovery_90_within_5s_share"], e["recovery_90_s_p90"]),
+                ])
+        if rows:
+            md += _table(
+                ["유형", "n", "2s/5s 생존", "impulse p90 N·s", "max tilt p90",
+                 "speed loss p90", "90% 회복≤5s / p90"], rows)
+        if de.get("events", 0) == 0:
+            md.append("- ⚠️ 외력 event가 0회이므로 이 report는 충돌 강건성 근거로 사용할 수 없다.")
+        md.append("")
 
     bs = r.get("body_speed")
     if bs:
@@ -1469,6 +2079,7 @@ def summarize_stress(roll, cfg, num_envs, duration_s, dt, checkpoint, config_pat
                        "p99": _hist_pct(sh, sm, 99)},
         "body_angvel": {"median": _hist_pct(ah, am, 50), "p90": _hist_pct(ah, am, 90),
                         "p99": _hist_pct(ah, am, 99)},
+        "disturbance_eval": roll.get("disturbance_eval") or {},
         "timing": {"setup_wall_s": setup_wall_s, "rollout_wall_s": roll["rollout_wall_s"]},
     }
 
@@ -1479,6 +2090,21 @@ def summarize_stress(roll, cfg, num_envs, duration_s, dt, checkpoint, config_pat
         num_envs, duration_s, "ON" if perturbations else "OFF"))
     md.append("- 누적 관측 시간: {:.0f} env·분".format(env_min))
     md.append("")
+    de = results["disturbance_eval"]
+    if perturbations:
+        md.append("- 외력 event {}회, active env-step {:.2f}%, 외력 중 낙상 {}회".format(
+            de.get("events", 0), 100 * de.get("active_share", 0.0),
+            de.get("falls_during_force", 0)))
+        overall = de.get("overall") or {}
+        if overall.get("records", 0):
+            md.append("- outcome {}건: 2 s/5 s 생존 {:.1f}/{:.1f}%, max tilt p90 {:.1f}°, "
+                      "90% 속도회복≤5 s {:.1f}%".format(
+                          overall["records"], 100 * overall["survival_2s"],
+                          100 * overall["survival_5s"], overall["max_tilt_deg_p90"],
+                          100 * overall["recovery_90_within_5s_share"]))
+        if de.get("events", 0) == 0:
+            md.append("- ❌ 외력을 켰지만 event가 0회다. 이 결과를 combined robustness로 채택하지 않는다.")
+        md.append("")
     md.append("> ⚠️ **이 리포트에는 위치오차 게이트가 없다.** 목표가 50 Hz로 무작위 재추첨되면 "
               "참값 목표의 기댓값이 로봇 주변이 되어 위치오차는 정책이 아니라 샘플러를 측정한다. "
               "여기서 의미가 있는 것은 **넘어지지 않는가**와 **발산하지 않는가**뿐이다.")
@@ -1535,12 +2161,16 @@ def write_outputs(out_dir, results, roll, report_md, env=None, cfg=None):
         w = csv.writer(f)
         w.writerow(["pos_err_m", "heading_err_deg", "final_speed_mps", "category",
                     "start_dist_m", "duration_s", "min_dist_m", "along_err_m", "cross_err_m",
-                    "peak_speed_mps", "mean_speed_mps", "cmd_speed_mps", "path_lag_m"])
+                    "peak_speed_mps", "mean_speed_mps", "cmd_speed_mps", "path_lag_m",
+                    "time_to_0p5_s", "time_to_0p8_s", "time_to_1p0_s",
+                    "min_speed_first_2s", "initial_goal_bearing_rad", "switch_gait_phase"])
         rows = zip(roll["pos_err"], np.degrees(roll["head_err"]), roll["speed"],
                    roll["category"], roll["start_dist"], roll["duration_s"],
                    roll["min_dist"], roll["along"], roll["cross"],
                    roll["peak_speed"], roll["mean_speed"], roll["cmd_speed"],
-                   roll["path_lag"])
+                   roll["path_lag"], roll["time_to_0p5_s"], roll["time_to_0p8_s"],
+                   roll["time_to_1p0_s"], roll["min_speed_first_2s"],
+                   roll["initial_goal_bearing_rad"], roll["switch_gait_phase"])
         for row in rows:
             w.writerow([CATEGORY_NAMES.get(int(c), c) if i == 3 else "{:.4f}".format(c)
                         for i, c in enumerate(row)])
@@ -1566,17 +2196,29 @@ def write_outputs(out_dir, results, roll, report_md, env=None, cfg=None):
         import imageio
         radius = cfg["rewards"].get("constellation_radius", 1.0)
         video_path = os.path.join(out_dir, "rollout_env0.mp4")
+        perspective = bool(cfg.get("evaluation", {}).get("perspective_overlays", False))
+        path_trace = []
+        camera_poses = getattr(env, "camera_poses", [])
+        fov = float(getattr(env, "camera_horizontal_fov", 75.0))
         with imageio.get_writer(video_path, fps=int(1.0 / env.dt)) as writer:
-            for frame, st in zip(env.camera_frames, roll["overlay_states"]):
-                f = draw_constellation_inset(frame.copy(), st[0], st[1], st[2], st[3], radius)
+            for i, (frame, st) in enumerate(zip(env.camera_frames, roll["overlay_states"])):
+                if len(st) >= 16 and int(st[15]) == CATEGORY_PATH:
+                    path_trace.append(np.asarray(st[2]).copy())
+                elif path_trace:
+                    path_trace = []
+                if perspective and i < len(camera_poses):
+                    f = draw_perspective_scene(frame.copy(), st, camera_poses[i], fov, path_trace)
+                else:
+                    f = draw_constellation_inset(frame.copy(), st[0], st[1], st[2], st[3], radius)
                 if len(st) >= 11:
                     f = draw_telemetry_hud(f, st)
-                if len(st) >= 13 and st[11] is not None:
+                if not perspective and len(st) >= 13 and st[11] is not None:
                     f = draw_goal_sequence(f, st[0], st[1], st[11], st[12], radius and 240 or 240)
                 if f.ndim == 3 and f.shape[2] == 4:
                     f = f[..., :3]
                 writer.append_data(f)
-        print("video written (constellation inset + velocity/disturbance HUD): {}".format(video_path))
+        print("video written ({} + velocity/disturbance HUD): {}".format(
+            "perspective path/goal/force overlays" if perspective else "constellation inset", video_path))
 
 
 # --------------------------------------------------------------------------
@@ -1599,6 +2241,8 @@ def main():
     parser.add_argument("--record_video_s", type=float, default=8.0)
     parser.add_argument("--feasible_speed", type=float, help="override evaluation.feasible_speed_mps (m/s) used by the feasibility check")
     parser.add_argument("--stress", choices=["jitter"], help="robustness stress mode instead of a gate evaluation. 'jitter': the true goal is redrawn uniformly in a +-3 m box every control step (50 Hz), modelling BT thrash / ball re-detection. Scored on falls and body oscillation -- position error is undefined in this mode.")
+    parser.add_argument("--goal_pattern", choices=["lateral", "reverse"],
+                        help="force abrupt robot-local side or rear waypoint goals")
     parser.add_argument("--exploratory", action="store_true", help="label this run as a non-authoritative preview rather than an official gate evaluation")
     parser.add_argument("--out", help="output dir (default: <run_dir>/eval/<timestamp>)")
     args = parser.parse_args()
@@ -1615,7 +2259,7 @@ def main():
 
     prepare_cfg(cfg, args.task, num_envs, args.sim_device, args.rl_device,
                 record_video=args.record_video, keep_perturbations=args.keep_perturbations,
-                no_noise=args.no_noise, stress=args.stress)
+                no_noise=args.no_noise, stress=args.stress, goal_pattern=args.goal_pattern)
 
     random.seed(args.seed)
     np.random.seed(args.seed)

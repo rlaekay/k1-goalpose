@@ -610,7 +610,8 @@ class GoalPoseV7(GoalPoseV3):
         full = self.default_dof_pos.repeat(self.num_envs, 1).clone()
         scale = self.cfg["control"]["action_scale"]
         full[:, self.leg_dof_idx] = (self.default_dof_pos[:, self.leg_dof_idx]
-                                     + scale * self.actions)
+                                     + scale * self.actions
+                                     + self.joint_target_offset[:, self.leg_dof_idx])
         full[:, self.arm_dof_idx] = self._arm_targets()
         return full
 

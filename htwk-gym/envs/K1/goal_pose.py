@@ -83,6 +83,10 @@ class GoalPose(BaseTask):
         self.dof_friction = apply_randomization(self.dof_friction, self.cfg["randomization"].get("dof_friction"))
 
         body_names = self.gym.get_asset_rigid_body_names(robot_asset)
+        # Keep the exact loaded ordering available to subclasses.  HBatch uses
+        # it to distribute synthetic collision wrenches over trunk/arm/hip
+        # bodies instead of silently applying every event at the trunk COM.
+        self.body_names = list(body_names)
         penalized_contact_names = []
         for name in self.cfg["rewards"]["penalize_contacts_on"]:
             penalized_contact_names.extend([s for s in body_names if name in s])
@@ -231,6 +235,12 @@ class GoalPose(BaseTask):
         self.last_dof_vel = torch.zeros_like(self.dof_vel)
         self.last_root_vel = torch.zeros_like(self.root_states[:, 7:13])
         self.last_dof_targets = torch.zeros(self.num_envs, self.num_dofs, dtype=torch.float, device=self.device)
+        # Episode-constant calibration errors are distinct from both the reset
+        # pose spread and the iid sensor noise used below.  Defaults are zero,
+        # so every existing task remains bit-for-bit compatible unless a new
+        # config explicitly enables these fields.
+        self.joint_encoder_bias = torch.zeros_like(self.dof_pos)
+        self.joint_target_offset = torch.zeros_like(self.dof_pos)
         self.delay_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         # Perceived-goal model (sim2real): the real goal_rel_x/y/heading come from a
         # perception/localization pipeline, not an instantaneous ground-truth read.
@@ -340,6 +350,14 @@ class GoalPose(BaseTask):
         self._reset_root_states(env_ids)
 
         self.last_dof_targets[env_ids] = self.dof_pos[env_ids]
+        self.joint_encoder_bias[env_ids] = apply_randomization(
+            torch.zeros(len(env_ids), self.num_dofs, device=self.device),
+            self.cfg["randomization"].get("joint_encoder_bias"),
+        )
+        self.joint_target_offset[env_ids] = apply_randomization(
+            torch.zeros(len(env_ids), self.num_dofs, device=self.device),
+            self.cfg["randomization"].get("joint_target_offset"),
+        )
         self.last_root_vel[env_ids] = self.root_states[env_ids, 7:13]
         self.episode_length_buf[env_ids] = 0
         self.filtered_lin_vel[env_ids] = 0.0
@@ -428,6 +446,27 @@ class GoalPose(BaseTask):
             dx_local = torch.where(stand | (cat == 2) | (cat == 3), zero, dx_local)
             dy_local = torch.where(stand | (cat == 1) | (cat == 3), zero, dy_local)
             dtheta_local = torch.where(stand | (cat == 1) | (cat == 2), zero, dtheta_local)
+
+        # Evaluation-only abrupt-direction probes.  Lateral uses a signed
+        # 1-2 m magnitude rather than a continuous [-2,2] draw, which would
+        # pollute the stress set with near-zero goals that require no response.
+        pattern = self.cfg.get("evaluation", {}).get("goal_pattern")
+        if pattern == "lateral":
+            magnitude = torch_rand_float(1.0, 2.0, (len(env_ids), 1), device=self.device).squeeze(1)
+            sign = torch.where(torch.rand(len(env_ids), device=self.device) < 0.5,
+                               -torch.ones_like(magnitude), torch.ones_like(magnitude))
+            dx_local = torch.zeros_like(dx_local)
+            dy_local = sign * magnitude
+            dtheta_local = torch.zeros_like(dtheta_local)
+            cat = torch.full_like(cat, 2)
+            stand = torch.zeros_like(stand)
+        elif pattern == "reverse":
+            dx_local = -torch_rand_float(
+                1.0, 2.0, (len(env_ids), 1), device=self.device).squeeze(1)
+            dy_local = torch.zeros_like(dy_local)
+            dtheta_local = torch.zeros_like(dtheta_local)
+            cat = torch.full_like(cat, 1)
+            stand = torch.zeros_like(stand)
 
         _, _, base_yaw = get_euler_xyz(self.base_quat[env_ids])
         base_yaw = (base_yaw + torch.pi) % (2 * torch.pi) - torch.pi
@@ -520,7 +559,8 @@ class GoalPose(BaseTask):
         Extracted so a subclass can drive DOFs the policy does not control
         (v7's scripted elbows) without duplicating step().
         """
-        return self.default_dof_pos + self.cfg["control"]["action_scale"] * self.actions
+        return (self.default_dof_pos + self.cfg["control"]["action_scale"] * self.actions
+                + self.joint_target_offset)
 
     def step(self, actions):
         # pre physics step
@@ -729,7 +769,10 @@ class GoalPose(BaseTask):
                 noisy_commands * commands_scale,
                 (torch.cos(2 * torch.pi * self.gait_process)).unsqueeze(-1),
                 (torch.sin(2 * torch.pi * self.gait_process)).unsqueeze(-1),
-                self._obs_dofs(apply_randomization(self.dof_pos - self.default_dof_pos, self.cfg["noise"].get("dof_pos")) * self.cfg["normalization"]["dof_pos"]),
+                self._obs_dofs(apply_randomization(
+                    self.dof_pos + self.joint_encoder_bias - self.default_dof_pos,
+                    self.cfg["noise"].get("dof_pos"),
+                ) * self.cfg["normalization"]["dof_pos"]),
                 self._obs_dofs(apply_randomization(self.dof_vel, self.cfg["noise"].get("dof_vel")) * self.cfg["normalization"]["dof_vel"]),
                 self.actions,
             ),

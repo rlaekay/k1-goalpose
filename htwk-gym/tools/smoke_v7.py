@@ -128,8 +128,32 @@ def main():
     # revolute so they can be scripted, so it is equally valid -- asserting
     # "armsdown" in the name failed G3_full for using exactly the asset its whole
     # arm is about.
-    check("using an arms-down URDF (armsdown or armswing)",
-          ("armsdown" in urdf) or ("armswing" in urdf), urdf)
+    check("using a compact-arm URDF",
+          ("armsdown" in urdf) or ("armswing" in urdf) or ("hbatch" in urdf), urdf)
+
+    if hasattr(env, "mirror_obs"):
+        probe_o = torch.randn(7, env.num_obs, device=env.device)
+        probe_a = torch.randn(7, env.num_actions, device=env.device)
+        check("observation mirror is an involution",
+              bool(torch.allclose(env.mirror_obs(env.mirror_obs(probe_o)), probe_o, atol=1e-6)))
+        check("action mirror is an involution",
+              bool(torch.allclose(env.mirror_actions(env.mirror_actions(probe_a)), probe_a, atol=1e-6)))
+        check("mirror observation permutation is bijective",
+              len(torch.unique(env.mirror_obs_perm)) == env.num_obs)
+        check("mirror action permutation is bijective",
+              len(torch.unique(env.mirror_act_perm)) == env.num_actions)
+    if hasattr(env, "mirror_privileged_obs"):
+        probe_p = torch.randn(7, env.num_privileged_obs, device=env.device)
+        check("privileged mirror is an involution",
+              bool(torch.allclose(env.mirror_privileged_obs(
+                  env.mirror_privileged_obs(probe_p)), probe_p, atol=1e-6)))
+
+    if cfg["randomization"].get("joint_encoder_bias"):
+        check("episode-constant encoder bias sampled",
+              float(env.joint_encoder_bias.abs().max().item()) > 0.0)
+    if cfg["randomization"].get("joint_target_offset"):
+        check("episode-constant motor-target offset sampled",
+              float(env.joint_target_offset.abs().max().item()) > 0.0)
 
     pcfg = cfg["commands"].get("path", {})
     share = cfg["commands"].get("goal_mode_mixture", {}).get("path", 0.0)
@@ -157,6 +181,7 @@ def main():
     gap_dwell, gap_run = [], []
     goal_step_move = []
     push_f_seen, push_t_seen, push_active_steps = [], [], 0
+    disturbance_bodies_seen, disturbance_kinds_seen = set(), set()
     has_segment_id = hasattr(env, "goal_segment_id")
     prev_seg = env.goal_segment_id.clone() if has_segment_id else None
     prev_goal = env.goal_pos_world.clone()
@@ -239,16 +264,33 @@ def main():
         if hasattr(env, "path_dwell_left"):
             dwell_seen += int(((env.path_dwell_left > 0) & env.is_path_env).sum().item())
 
-        f = torch.norm(env.pushing_forces[:, env.base_indice, :], dim=-1)
-        t = torch.norm(env.pushing_torques[:, env.base_indice, :], dim=-1)
+        # HBatch distributes artificial hits over several rigid bodies.  The
+        # former base-only readout falsely reported that those events never fired.
+        f = torch.norm(env.pushing_forces, dim=-1).amax(dim=-1)
+        t = torch.norm(env.pushing_torques, dim=-1).amax(dim=-1)
         act_mask = f > 1e-3
         if bool(act_mask.any()):
             push_active_steps += 1
             push_f_seen.append(f[act_mask].cpu().numpy())
             push_t_seen.append(t[act_mask].cpu().numpy())
+            if hasattr(env, "dist_active_body"):
+                disturbance_bodies_seen.update(
+                    int(x) for x in env.dist_active_body[act_mask].cpu().tolist())
+            if hasattr(env, "dist_event_kind"):
+                disturbance_kinds_seen.update(
+                    int(x) for x in env.dist_event_kind[act_mask].cpu().tolist() if int(x) > 0)
 
     check("rewards and observations stay finite", rew_bad == 0,
           "{} bad steps".format(rew_bad))
+    if hasattr(env, "dist_event_serial"):
+        check("all configured disturbance bodies receive events",
+              disturbance_bodies_seen == set(int(x) for x in env.dist_body_indices.cpu().tolist()),
+              "seen {} expected {}".format(
+                  sorted(disturbance_bodies_seen),
+                  sorted(int(x) for x in env.dist_body_indices.cpu().tolist())))
+        check("collision and support event classes both fire",
+              disturbance_kinds_seen == {1, 2},
+              "event kinds seen {}".format(sorted(disturbance_kinds_seen)))
 
     # ---- path mode ---------------------------------------------------------
     if n_path > 0 and goal_step_move and gaps:
