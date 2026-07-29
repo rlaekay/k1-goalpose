@@ -127,6 +127,13 @@ class GoalPoseHBatch(GoalPoseV7):
             fire = due[torch.rand(len(due), device=self.device) < event_prob.clamp(max=1.0)]
             if len(fire) > 0:
                 k = len(fire)
+                # One event owns one body.  Clear any still-active wrench before
+                # replacing it so an accidentally short interval cannot leave a
+                # force on the previous body and silently accumulate multi-body
+                # loads.  Normal H configs already space events beyond their
+                # maximum duration; this makes the invariant explicit in code.
+                self.pushing_forces[fire] = 0.0
+                self.pushing_torques[fire] = 0.0
                 body = self.dist_body_indices[
                     torch.randint(0, len(self.dist_body_indices), (k,), device=self.device)]
                 self.dist_active_body[fire] = body

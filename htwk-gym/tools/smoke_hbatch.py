@@ -85,10 +85,14 @@ def main():
         return 0
 
     # Force both disturbance classes to appear inside a short smoke.  This
-    # changes only the temporary smoke config, never the training arm.
+    # changes only the temporary smoke config, never the training arm.  One
+    # event per env inside 6 s gives ~256 samples, enough to cover five bodies
+    # and both classes.  Keep the interval above the longest 1.5 s support hit:
+    # the former 0.2-0.6 s interval re-fired before support ended, overloaded an
+    # untrained warm start, and made an unrelated path-floor check fail.
     smoke_cfg = copy.deepcopy(cfg)
     smoke_cfg["randomization"]["disturbance"].update({
-        "interval_s": [0.2, 0.6], "event_probability": 1.0, "ramp_steps": 1})
+        "interval_s": [3.0, 4.0], "event_probability": 1.0, "ramp_steps": 1})
     with tempfile.NamedTemporaryFile(mode="w", suffix="-codex.yaml", delete=False) as f:
         yaml.safe_dump(smoke_cfg, f, sort_keys=False)
         temp_path = f.name

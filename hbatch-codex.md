@@ -189,6 +189,8 @@ symmetry/DR:
 3. 통과한 arm만 GPU에 올린다.
 4. 성공 smoke log는 삭제하고, 실패한 arm만 `logs/hbatch/smoke_failures/Hx-codex.log`에 남긴다.
 
+동적 smoke는 짧은 시간 안에 collision/support 두 class와 다섯 body를 모두 실행하기 위해 임시 config에서 외란 주기를 `3–4 s`, 확률을 `1.0`, ramp를 1 step으로 바꾼다. 6초×256 env에서 env당 첫 이벤트 약 1회면 coverage에 충분하고, 최대 1.5초인 support보다 주기가 길어 이벤트가 겹치지 않는다. 최초 구현의 `0.2–0.6 s`는 아직 외란을 학습하지 않은 G1 warm-start에 실제 H 학습 설정보다 약 64–110배 높은 event rate를 가했고, support 종료 전 새 body event를 생성해 무관한 lookahead-floor gate까지 실패시켰다. 판정 기준은 완화하지 않았다. per-env floor 초기화, rollout floor occupancy, goal rate limit, leash, finite reward/observation, force/torque 상한, 두 event class와 다섯 body coverage가 모두 hard gate다. runtime도 새 event 직전에 해당 env의 기존 force/torque 전체를 지워 한 번에 한 body에만 외란이 남도록 이중 방어한다.
+
 `tools/train_and_eval_hbatch.sh`:
 
 1. train.

@@ -44,7 +44,7 @@ def check(name, ok, detail=""):
     CHECKS.append((name, bool(ok), detail))
     print("{}  {:<46} {}".format("PASS" if ok else "FAIL", name, detail))
     if not ok:
-        FAILURES.append(name)
+        FAILURES.append((name, detail))
 
 
 def note(name, detail=""):
@@ -175,6 +175,22 @@ def main():
           "configured {:.2f}{}, got {:.2f} ({} envs)".format(
               share, " x (1-{:.2f} seq)={:.2f}".format(st_share, expect) if st_share else "",
               frac, n_path))
+
+    # This is the policy-independent floor invariant.  _reroll_paths places
+    # every moving carrot at its own sampled/capped lookahead.  Allow 2 cm for
+    # the reset() physics step, but fail if the old "goal starts on the robot"
+    # defect returns.  The long-rollout occupancy check below is necessarily
+    # policy dependent because the hard goal-speed limit intentionally takes
+    # precedence over the soft floor.
+    if n_path > 0 and hasattr(env, "lookahead"):
+        init_mask = env.is_path_env
+        init_gap = torch.norm(
+            env.goal_pos_world[init_mask] - env.base_pos[init_mask, :2], dim=-1)
+        init_floor = env.lookahead[init_mask]
+        init_margin = init_gap - init_floor
+        check("path lookahead initializes at its per-env floor",
+              bool((init_margin >= -0.02).all()),
+              "minimum gap-floor margin {:.3f} m".format(float(init_margin.min().item())))
 
     # ---- run ---------------------------------------------------------------
     gaps, seg_ticks, rew_bad = [], 0, 0
@@ -348,10 +364,11 @@ def main():
             # precedence, so the carrot may lag the floor briefly while catching
             # up. Measured steady-state miss rate is 11%; this trips only if the
             # floor has stopped working altogether.
+            floor_detail = (
+                "{:.0%} of running steps inside the floor, gap p2 {:.2f} vs floor {:.2f}"
+                .format(frac_bad, np.percentile(gr, 2), la_floor))
             check("lookahead floor mostly holds while running (soft target)",
-                  frac_bad < 0.30,
-                  "{:.0%} of running steps inside the floor, gap p2 {:.2f} vs floor {:.2f}".format(
-                      frac_bad, np.percentile(gr, 2), la_floor))
+                  frac_bad < 0.30, floor_detail)
         dwell_cfg = pcfg.get("dwell") or {}
         if dwell_cfg.get("enabled", False):
             check("dwell actually releases the floor",
@@ -511,7 +528,9 @@ def main():
 
     print("\n{}/{} checks passed".format(len(CHECKS) - len(FAILURES), len(CHECKS)))
     if FAILURES:
-        print("FAILED: " + ", ".join(FAILURES))
+        print("FAILED:")
+        for name, detail in FAILURES:
+            print("  - {}{}".format(name, ": " + detail if detail else ""))
         print("\nDo NOT launch training until these are resolved.")
         return 1
     print("v7 machinery verified — safe to launch training.")
