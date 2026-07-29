@@ -220,26 +220,12 @@ class RunnerV3(Runner):
             self.recorder.record_statistics(record, it)
 
             if (it + 1) % self.cfg["runner"]["save_interval"] == 0:
-                self.recorder.save(
-                    {
-                        "model": self.model.state_dict(),
-                        "optimizer": self.optimizer.state_dict(),
-                        "curriculum": self.env.curriculum_prob,
-                    },
-                    it + 1,
-                )
+                self.recorder.save(self._checkpoint_payload(), it + 1)
             print("epoch: {}/{}".format(it + 1, self.cfg["basic"]["max_iterations"]))
 
             # graceful early stop: tools/auto_stop.py (or a human) drops a STOP
             # file into the run dir when the reward curve plateaus
             if os.path.exists(os.path.join(self.recorder.dir, "STOP")):
-                self.recorder.save(
-                    {
-                        "model": self.model.state_dict(),
-                        "optimizer": self.optimizer.state_dict(),
-                        "curriculum": self.env.curriculum_prob,
-                    },
-                    it + 1,
-                )
+                self.recorder.save(self._checkpoint_payload(), it + 1)
                 print("STOP file found in {}; saved checkpoint and stopped at iteration {}.".format(self.recorder.dir, it + 1))
                 break

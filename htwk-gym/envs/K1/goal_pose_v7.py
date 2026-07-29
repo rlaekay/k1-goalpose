@@ -88,8 +88,19 @@ class GoalPoseV7(GoalPoseV3):
         # distance can never reach 0 in path mode (the goal is meant to sit
         # lookahead_min ahead), so raw distance is not the tracking error.
         self.path_lag = torch.zeros(n, dtype=torch.float, device=dev)
+        # Keep the other side of the error too.  The former one-sided lag made
+        # an overtaken/collapsed carrot (gap < lookahead) look perfect because
+        # clamp(gap-lookahead, min=0) returned zero.  Curriculum and eval need
+        # the signed margin to distinguish "behind" from "inside the floor".
+        self.path_floor_margin = torch.zeros(n, dtype=torch.float, device=dev)
+        self.path_floor_deficit = torch.zeros(n, dtype=torch.float, device=dev)
+        self.path_goal_rate_limit = torch.zeros(n, dtype=torch.float, device=dev)
+        self.path_floor_recovering = torch.zeros(n, dtype=torch.bool, device=dev)
+        self.path_floor_recovery_steps = torch.zeros(n, dtype=torch.long, device=dev)
         self.path_dwell_left = torch.zeros(n, dtype=torch.long, device=dev)
         self.path_dwell_next = torch.zeros(n, dtype=torch.long, device=dev)
+        self.path_was_dwelling = torch.zeros(n, dtype=torch.bool, device=dev)
+        self.path_run_gait_frequency = torch.zeros(n, dtype=torch.float, device=dev)
         self.track_ok_steps = torch.zeros(n, dtype=torch.float, device=dev)
         self.track_steps = torch.zeros(n, dtype=torch.float, device=dev)
         self.grid_on = False
@@ -148,6 +159,37 @@ class GoalPoseV7(GoalPoseV3):
         f = torch.where(s == 5, torch.tanh(3.0 * torch.sin(phi)), f)
         return self.path_dir * f / self.path_scale.clamp(min=0.2)
 
+    @staticmethod
+    def _bounded_annulus_delta(old_goal, robot_pos, nominal_delta,
+                                l_min, l_max, max_step, fallback_dir):
+        """Minimum 2-D correction toward a robot-centred distance annulus.
+
+        Projecting the nominal candidate radially is the smallest Euclidean
+        displacement that satisfies ``l_min <= gap <= l_max``.  The previous
+        scalar ``step += l_min-gap`` moved only along leader heading and was
+        exact only when that heading happened to be radial; at a tangent it
+        under-corrected even before the hard rate limit was applied.
+
+        The returned delta is vector-rate-limited, so a large deficit improves
+        smoothly without reintroducing the historical goal teleports.
+        """
+        candidate = old_goal + nominal_delta
+        rel = candidate - robot_pos
+        dist = torch.norm(rel, dim=-1)
+        fallback = fallback_dir / torch.norm(
+            fallback_dir, dim=-1, keepdim=True).clamp(min=1.0e-6)
+        direction = rel / dist.unsqueeze(-1).clamp(min=1.0e-6)
+        direction = torch.where((dist > 1.0e-6).unsqueeze(-1), direction, fallback)
+        target_dist = torch.minimum(torch.maximum(dist, l_min), l_max)
+        projected = robot_pos + direction * target_dist.unsqueeze(-1)
+        desired = projected - old_goal
+        desired_norm = torch.norm(desired, dim=-1)
+        scale = torch.minimum(
+            torch.ones_like(desired_norm),
+            max_step / desired_norm.clamp(min=1.0e-6),
+        )
+        return desired * scale.unsqueeze(-1)
+
     def _reroll_paths(self, env_ids):
         if len(env_ids) == 0:
             return
@@ -196,6 +238,8 @@ class GoalPoseV7(GoalPoseV3):
         self.track_ok_steps[env_ids] = 0.0
         self.track_steps[env_ids] = 0.0
         self.path_lag[env_ids] = 0.0
+        self.path_floor_recovering[env_ids] = False
+        self.path_floor_recovery_steps[env_ids] = 0
         # Place the leader exactly on the floor, l_min ahead of the robot, facing
         # away from it. It must START at the floor: climbing 0.5-3.0 m at the
         # rate limit takes 50-119 control steps, and for that whole stretch the
@@ -209,14 +253,9 @@ class GoalPoseV7(GoalPoseV3):
         self.goal_pos_world[env_ids, 1] = self.base_pos[env_ids, 1] + la * torch.sin(head)
         self.goal_heading_world[env_ids] = head
 
-        # Stagger the first disturbance-style dwell. Leaving the counter at zero
-        # made every path env dwell on step 1, which is why the measured duty
-        # cycle (43.7%) ran well above the configured one (32%).
-        dw = p.get("dwell") or {}
-        lo, hi = dw.get("interval_s", [4.0, 10.0])
-        self.path_dwell_next[env_ids] = torch.randint(
-            1, max(2, int(hi / self.dt)), (k,), device=self.device)
-        self.path_dwell_left[env_ids] = 0
+        # A normal 4-8 s path segment boundary must not restart or terminate the
+        # independent 12-24 s dwell schedule. Episode reset owns the first
+        # stagger; a fired dwell owns every subsequent interval and duration.
 
     def _advance_paths(self):
         """Integrate the virtual leader one control step.
@@ -247,7 +286,7 @@ class GoalPoseV7(GoalPoseV3):
         line). The old code enforced them on the curve phase u and converted
         through ds_du, which is exactly where the teleports came from.
 
-        ONE hard invariant: the leader's world-space step is clamped LAST, so
+        ONE hard invariant: the leader's world-space delta is clamped LAST, so
         goal speed can never exceed the rate limit. Floor and leash are soft --
         a brief floor miss only flattens the gradient while the carrot catches
         up and is self-correcting, whereas a teleporting goal is a
@@ -287,6 +326,25 @@ class GoalPoseV7(GoalPoseV3):
                     int(lo / self.dt), max(int(lo / self.dt) + 1, int(hi / self.dt)),
                     (k,), device=self.device)
         dwelling = self.path_dwell_left > 0
+        was_dwelling = self.path_was_dwelling.clone()
+        started = ids & dwelling & ~was_dwelling
+        resumed = ids & ~dwelling & was_dwelling
+        # A parked carrot can be on the robot when dwell ends. Recover the
+        # lookahead smoothly under the same hard goal-rate limit, but do not
+        # grade those transition steps as failed speed-grid trials.
+        self.path_floor_recovering[resumed] = True
+        self.path_floor_recovery_steps[resumed] = 0
+
+        if bool(p.get("pause_gait_during_dwell", False)):
+            if bool(started.any()):
+                self.path_run_gait_frequency[started] = self.gait_frequency[started].clamp(min=1.8)
+                self.gait_frequency[started] = 0.0
+            if bool(resumed.any()):
+                self.gait_frequency[resumed] = self.path_run_gait_frequency[resumed].clamp(min=1.8)
+            changed = started | resumed
+            if bool(changed.any()):
+                self.commands[changed, 3] = self.gait_frequency[changed]
+        self.path_was_dwelling = torch.where(ids, dwelling, self.path_was_dwelling)
 
         l_min = torch.where(dwelling, torch.zeros_like(self.lookahead), self.lookahead)
         l_max = torch.clamp(self.lookahead * float(p.get("leash_ratio", 1.6)),
@@ -302,45 +360,70 @@ class GoalPoseV7(GoalPoseV3):
         rx, ry = self.base_pos[:, 0], self.base_pos[:, 1]
         gx, gy = self.goal_pos_world[:, 0], self.goal_pos_world[:, 1]
 
-        step = pace * self.dt                                    # nominal advance
-        head = self.path_head + kappa * step
+        nominal_step = pace * self.dt
+        head = self.path_head + kappa * nominal_step
         cx, cy = torch.cos(head), torch.sin(head)
 
-        def gap_after(s):
-            return torch.sqrt((gx + s * cx - rx) ** 2 + (gy + s * cy - ry) ** 2)
-
-        # floor: push out by the shortfall. leash: pull back by the excess.
-        # Both are corrections along the leader's own heading, which is the
-        # direction that changes the gap fastest in the lookahead regime.
-        step = step + (l_min - gap_after(step)).clamp(min=0.0)
-        step = step - (gap_after(step) - l_max).clamp(min=0.0)
-
-        # HARD invariant, applied last: |world step| <= rate * dt, bounding the
-        # goal's d(pose)/dt directly since that is how speed is measured.
-        #
-        # The budget tracks max(pace, robot speed) because at the floor a robot
-        # running faster than the pace legitimately drags the carrot along at
-        # its own speed -- that is what lets the achieved-speed distribution
-        # reveal the physical limit rather than the commanded one.
-        #
-        # But robot speed is clamped to this env's COMMANDED pace before it
-        # enters the budget, so the bound is analytic: rate <= path_speed *
-        # catchup_ratio + 0.05, whatever the robot does. Without the clamp a
-        # fallen robot flung by a collision impulse hands the carrot its own
-        # spike -- a 10 m/s launch buys a 15 m/s carrot, which is exactly the
-        # shape of the teleports that kept coming back. A robot faster than
-        # 1.5x pace simply catches the carrot; goal_reached fires, the
-        # curriculum sees the keepup and raises the pace. That is the loop
-        # working, not a failure to model.
+        # A normal running robot may drag the floor; a collision spike may not.
+        # The old min(v_robot, path_speed) made a 0.3 m/s seed cell cap the goal
+        # at ~0.5 m/s even when the warm policy was already moving much faster,
+        # so overtaking remained inside the floor for seconds.  H config caps
+        # ordinary robot-follow speed at the largest jittered grid command
+        # (2.1 m/s), while a separate absolute cap remains teleport-safe.
         v_robot = torch.norm(self.root_states[:, 7:9], dim=-1)
-        drag = torch.minimum(v_robot, self.path_speed)
+        drag_cap = p.get("drag_speed_cap_mps")
+        if drag_cap is None:
+            drag = torch.minimum(v_robot, self.path_speed)  # legacy V7 behaviour
+        else:
+            drag = v_robot.clamp(max=float(drag_cap))
         rate = torch.maximum(pace, drag) * float(p.get("catchup_ratio", 1.5)) + 0.05
-        step = torch.clamp(step, -rate * self.dt, rate * self.dt)
+        if p.get("floor_recovery_rate_mps") is not None:
+            recovery_rate = torch.full_like(
+                rate, float(p["floor_recovery_rate_mps"]))
+            rate = torch.where(
+                self.path_floor_recovering,
+                torch.maximum(rate, recovery_rate),
+                rate,
+            )
+        if p.get("goal_rate_max_mps") is not None:
+            rate = rate.clamp(max=float(p["goal_rate_max_mps"]))
+        self.path_goal_rate_limit = torch.where(ids, rate, self.path_goal_rate_limit)
+
+        constraint_mode = p.get("constraint_mode", "heading_scalar_legacy")
+        if constraint_mode == "radial_rate_limited":
+            old_goal = torch.stack([gx, gy], dim=-1)
+            heading_vec = torch.stack([cx, cy], dim=-1)
+            nominal_delta = nominal_step.unsqueeze(-1) * heading_vec
+            delta = self._bounded_annulus_delta(
+                old_goal,
+                self.base_pos[:, :2],
+                nominal_delta,
+                l_min,
+                l_max,
+                rate * self.dt,
+                heading_vec,
+            )
+            # Dwell means the world-frame carrot is parked.  It releases both
+            # distance constraints instead of chasing a robot that walks away.
+            delta = torch.where(dwelling.unsqueeze(-1), torch.zeros_like(delta), delta)
+            next_goal = old_goal + delta
+            gx, gy = next_goal[:, 0], next_goal[:, 1]
+            phase_step = nominal_step
+        elif constraint_mode == "heading_scalar_legacy":
+            def gap_after(s):
+                return torch.sqrt((gx + s * cx - rx) ** 2 + (gy + s * cy - ry) ** 2)
+
+            step = nominal_step + (l_min - gap_after(nominal_step)).clamp(min=0.0)
+            step = step - (gap_after(step) - l_max).clamp(min=0.0)
+            step = torch.clamp(step, -rate * self.dt, rate * self.dt)
+            gx, gy = gx + step * cx, gy + step * cy
+            phase_step = step
+        else:
+            raise ValueError("unknown commands.path.constraint_mode: {}".format(constraint_mode))
 
         self.path_head = torch.where(ids, head, self.path_head)
-        self.path_phi = torch.where(ids, self.path_phi + step / self.path_scale.clamp(min=0.2),
+        self.path_phi = torch.where(ids, self.path_phi + phase_step / self.path_scale.clamp(min=0.2),
                                     self.path_phi)
-        gx, gy = gx + step * cx, gy + step * cy
         self.goal_pos_world[:, 0] = torch.where(ids, gx, self.goal_pos_world[:, 0])
         self.goal_pos_world[:, 1] = torch.where(ids, gy, self.goal_pos_world[:, 1])
         # The leader's own heading IS the goal heading -- no tangent to
@@ -352,13 +435,39 @@ class GoalPoseV7(GoalPoseV3):
         # distance, is the tracking error: the goal is SUPPOSED to sit l_min
         # ahead, so distance alone can never reach zero.
         gap_now = torch.norm(torch.stack([gx, gy], dim=-1) - self.base_pos[:, :2], dim=-1)
-        self.path_lag = torch.where(ids, (gap_now - l_min).clamp(min=0.0), self.path_lag)
+        signed_margin = gap_now - self.lookahead
+        self.path_floor_margin = torch.where(ids, signed_margin, self.path_floor_margin)
+        self.path_floor_deficit = torch.where(
+            ids, (-signed_margin).clamp(min=0.0), self.path_floor_deficit)
+        self.path_lag = torch.where(ids, signed_margin.clamp(min=0.0), self.path_lag)
         keep = float(p.get("keepup_gap_m", 2.0))
-        self.track_ok_steps = torch.where(ids & (self.path_lag < keep),
+        running = ids & ~dwelling
+        floor_tol = float(p.get("floor_tolerance_m", 0.02))
+        recovering = running & self.path_floor_recovering
+        scored_running = running & ~recovering
+        tracking_ok = (scored_running & (signed_margin >= -floor_tol)
+                       & (self.path_lag < keep))
+        self.track_ok_steps = torch.where(tracking_ok,
                                           self.track_ok_steps + 1, self.track_ok_steps)
-        self.track_steps = torch.where(ids, self.track_steps + 1, self.track_steps)
+        self.track_steps = torch.where(
+            scored_running, self.track_steps + 1, self.track_steps)
+        self.path_floor_recovery_steps = torch.where(
+            recovering,
+            self.path_floor_recovery_steps + 1,
+            self.path_floor_recovery_steps,
+        )
+        recovered = recovering & (signed_margin >= -floor_tol)
+        grace_s = float(p.get("floor_recovery_grace_s", 2.0))
+        recovery_expired = recovering & (
+            self.path_floor_recovery_steps >= max(1, int(np.ceil(grace_s / self.dt))))
+        # Recovery is a bounded transition allowance, never a permanent
+        # curriculum/eval exclusion.  After the grace period, an unresolved
+        # floor deficit is graded as an ordinary tracking failure.
+        recovery_done = recovered | recovery_expired
+        self.path_floor_recovering[recovery_done] = False
+        self.path_floor_recovery_steps[recovery_done] = 0
 
-        self._update_speed_curriculum(self.path_lag[ids])
+        self._update_speed_curriculum(signed_margin[scored_running])
 
     # ---- 2b. grid-adaptive curriculum over (speed x curvature) --------------
     #
@@ -391,10 +500,52 @@ class GoalPoseV7(GoalPoseV3):
                                        dtype=torch.float, device=self.device)
         ns, nc = len(self.grid_speeds), len(self.grid_curvs)
         self.grid_active = torch.zeros(ns, nc, dtype=torch.bool, device=self.device)
-        self.grid_active[0, 0] = True          # seed: slowest, straightest
+        initial = g.get("initial_active", "seed")
+        if initial == "all":
+            self.grid_active[:] = True
+        elif initial == "seed":
+            self.grid_active[0, 0] = True      # slowest, straightest
+        else:
+            raise ValueError("speed_grid.initial_active must be 'seed' or 'all'")
         self.env_cell = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.grid_success = torch.zeros(ns, nc, dtype=torch.float, device=self.device)
         self.grid_trials = torch.zeros(ns, nc, dtype=torch.float, device=self.device)
+
+    def get_checkpoint_state(self):
+        """Task state that must travel with policy/optimizer checkpoints.
+
+        Historical checkpoints saved only ``curriculum_prob`` from the base
+        task, so the V7 speed/curvature grid silently restarted from one slow
+        cell on every resume.  H starts from an explicit frozen initial grid;
+        checkpoints produced from now on preserve subsequent task state too.
+        """
+        state = {
+            "speed_level": float(self.speed_level),
+            "keepup_ema": float(self.keepup_ema),
+        }
+        if self.grid_on:
+            state["path_grid"] = {
+                "active": self.grid_active.detach().clone(),
+                "trials": self.grid_trials.detach().clone(),
+                "success": self.grid_success.detach().clone(),
+            }
+        return state
+
+    def load_checkpoint_state(self, state):
+        if not isinstance(state, dict):
+            return
+        self.speed_level = float(state.get("speed_level", self.speed_level))
+        self.keepup_ema = float(state.get("keepup_ema", self.keepup_ema))
+        grid = state.get("path_grid")
+        if not (self.grid_on and isinstance(grid, dict)):
+            return
+        for key, dst in (("active", self.grid_active),
+                         ("trials", self.grid_trials),
+                         ("success", self.grid_success)):
+            src = grid.get(key)
+            if src is None or tuple(src.shape) != tuple(dst.shape):
+                raise ValueError("checkpoint path_grid.{} shape mismatch".format(key))
+            dst.copy_(src.to(device=self.device, dtype=dst.dtype))
 
     def _sample_cells(self, k):
         flat = self.grid_active.flatten().float()
@@ -402,13 +553,30 @@ class GoalPoseV7(GoalPoseV3):
         nc = len(self.grid_curvs)
         return idx, idx // nc, idx % nc
 
-    def _grid_report(self, env_ids):
+    def _grid_report(self, env_ids, terminal_failure=None):
         """Promote neighbours of any cell the policy is now tracking well."""
         if not self.grid_on or len(env_ids) == 0:
+            return
+        # The first _reroll_paths() after reset has no preceding segment.  It
+        # used to record a zero-length failure for every env, biasing trials and
+        # success before the policy had taken one action.  A fall after actual
+        # rollout still has track_steps > 0 and is retained as a real failure.
+        eligible = self.track_steps[env_ids] > 0
+        if terminal_failure is not None:
+            # A fall during dwell or dwell-resume recovery can occur before a
+            # scored running step exists.  It is still a real attempted cell,
+            # not the zero-length initialization case this filter removes.
+            eligible |= terminal_failure
+        env_ids = env_ids[eligible]
+        if terminal_failure is not None:
+            terminal_failure = terminal_failure[eligible]
+        if len(env_ids) == 0:
             return
         ok = (self.track_ok_steps[env_ids] /
               self.track_steps[env_ids].clamp(min=1.0)) > float(
                   self.path_cfg.get("speed_grid", {}).get("up_threshold", 0.8))
+        if terminal_failure is not None:
+            ok &= ~terminal_failure
         nc = len(self.grid_curvs)
         cells = self.env_cell[env_ids]
         self.grid_trials.view(-1).index_add_(0, cells, torch.ones_like(ok, dtype=torch.float))
@@ -423,15 +591,18 @@ class GoalPoseV7(GoalPoseV3):
             s2, c2 = (si + dsi).clamp(0, ns - 1), (ci + dci).clamp(0, nc - 1)
             self.grid_active[s2, c2] = True
 
-    def _update_speed_curriculum(self, gap):
+    def _update_speed_curriculum(self, signed_margin):
         p = self.path_cfg
         if self.grid_on:
             return   # the grid replaces the scalar level entirely
-        if not p.get("speed_curriculum", False) or gap.numel() == 0:
+        if not p.get("speed_curriculum", False) or signed_margin.numel() == 0:
             return
         target = float(p.get("keepup_gap_m", 2.0))
+        floor_tol = float(p.get("floor_tolerance_m", 0.02))
+        tracked = (signed_margin >= -floor_tol) & (signed_margin < target)
         e = float(p.get("ema", 0.995))
-        self.keepup_ema = e * self.keepup_ema + (1.0 - e) * float((gap < target).float().mean().item())
+        self.keepup_ema = e * self.keepup_ema + (1.0 - e) * float(
+            tracked.float().mean().item())
         every = int(p.get("adjust_every_steps", 500))
         if self.common_step_counter - self._last_speed_adjust < every:
             return
@@ -443,6 +614,24 @@ class GoalPoseV7(GoalPoseV3):
             self.speed_level = max(float(p.get("speed_min_level", 0.1)), self.speed_level - step)
 
     def _reset_idx(self, env_ids):
+        # Close the old path segment before base reset overwrites episode state.
+        # A physical fall is never allowed to promote a speed/curvature cell,
+        # even if its pre-fall gap ratio happened to look good.
+        if (len(env_ids) > 0 and getattr(self, "grid_on", False)
+                and hasattr(self, "is_path_env")):
+            old_path = env_ids[self.is_path_env[env_ids]]
+            if len(old_path) > 0:
+                physical = self.extras.get("physical_failures")
+                if isinstance(physical, torch.Tensor):
+                    terminal_failure = physical[old_path]
+                else:
+                    episode_timeout = self.episode_length_buf[old_path] > np.ceil(
+                        self.cfg["rewards"]["episode_length_s"] / self.dt)
+                    terminal_failure = ~episode_timeout
+                self._grid_report(old_path, terminal_failure=terminal_failure)
+        if len(env_ids) > 0 and hasattr(self, "track_steps"):
+            self.track_ok_steps[env_ids] = 0.0
+            self.track_steps[env_ids] = 0.0
         super()._reset_idx(env_ids)
         if len(env_ids) == 0:
             return
@@ -452,6 +641,20 @@ class GoalPoseV7(GoalPoseV3):
         # _resample_goals call that follows, and rolling there uses a base_pos that
         # has actually been refreshed from the new root state.
         self.is_path_env[env_ids] = torch.rand(len(env_ids), device=self.device) < self.path_share
+        dw = self.path_cfg.get("dwell") or {}
+        if dw.get("enabled", False):
+            hi = float(dw.get("interval_s", [4.0, 10.0])[1])
+            self.path_dwell_next[env_ids] = torch.randint(
+                1, max(2, int(hi / self.dt)), (len(env_ids),), device=self.device)
+        else:
+            self.path_dwell_next[env_ids] = 0
+        self.path_dwell_left[env_ids] = 0
+        self.path_was_dwelling[env_ids] = False
+        self.path_floor_margin[env_ids] = 0.0
+        self.path_floor_deficit[env_ids] = 0.0
+        self.path_goal_rate_limit[env_ids] = 0.0
+        self.path_floor_recovering[env_ids] = False
+        self.path_floor_recovery_steps[env_ids] = 0
 
     def _resample_goals(self):
         # base samples a waypoint for every due env; path envs then have their
@@ -459,17 +662,45 @@ class GoalPoseV7(GoalPoseV3):
         # natural moment to re-roll path shape/speed/lookahead.
         all_due = self.episode_length_buf == self.cmd_resample_time
         due = all_due & self.is_path_env
+        # Base resampling writes a temporary waypoint for every due env.  If a
+        # path segment rolls while its dwell is active, preserve the parked
+        # world position after drawing the next path parameters; otherwise the
+        # supposedly stopped carrot teleports at an unrelated 4-8 s boundary.
+        parked_due = due & (self.path_dwell_left > 0)
+        parked_ids = parked_due.nonzero(as_tuple=False).flatten()
+        parked_goal = self.goal_pos_world[parked_ids].clone()
+        parked_heading = self.goal_heading_world[parked_ids].clone()
+        parked_path_head = self.path_head[parked_ids].clone()
         super()._resample_goals()
         if not getattr(self, "manual_control", False):
             self.goal_segment_id[all_due] += 1
         ids = due.nonzero(as_tuple=False).flatten()
         if len(ids) > 0:
             self._reroll_paths(ids)
+        if len(parked_ids) > 0:
+            self.goal_pos_world[parked_ids] = parked_goal
+            self.goal_heading_world[parked_ids] = parked_heading
+            self.path_head[parked_ids] = parked_path_head
         self._advance_paths()
         if bool(self.is_path_env.any()):
             self.goal_category[self.is_path_env] = CATEGORY_PATH
-            # a moving lookahead has no "stand still" case; keep the gait clock live
-            self.gait_frequency[self.is_path_env] = self.gait_frequency[self.is_path_env].clamp(min=1.8)
+            if bool(self.path_cfg.get("pause_gait_during_dwell", False)):
+                parked = self.is_path_env & (self.path_dwell_left > 0)
+                running = self.is_path_env & ~parked
+                # Never clamp parked 0 Hz back to 1.8 and overwrite the saved
+                # cadence: _resample_goals() is called every control step, not
+                # only when a command is due.  Preserve the pre-dwell value
+                # until _advance_paths() restores it on the transition out.
+                self.gait_frequency[running] = self.gait_frequency[running].clamp(min=1.8)
+                self.path_run_gait_frequency[running] = self.gait_frequency[running]
+                self.gait_frequency[parked] = 0.0
+            else:
+                # A moving lookahead has no stand-still case in legacy mode.
+                self.gait_frequency[self.is_path_env] = self.gait_frequency[
+                    self.is_path_env].clamp(min=1.8)
+                self.path_run_gait_frequency[self.is_path_env] = self.gait_frequency[
+                    self.is_path_env]
+            self.commands[self.is_path_env, 3] = self.gait_frequency[self.is_path_env]
 
     def _update_goal_state(self):
         self._advance_paths()
@@ -497,6 +728,14 @@ class GoalPoseV7(GoalPoseV3):
                 e["grid_max_curv"] = float(self.grid_curvs[act[:, 1]].max().item())
         if bool(self.is_path_env.any()):
             e["path_lag_mean"] = float(self.path_lag[self.is_path_env].mean().item())
+            running = self.is_path_env & (self.path_dwell_left == 0)
+            if bool(running.any()):
+                e["path_floor_deficit_mean"] = float(
+                    self.path_floor_deficit[running].mean().item())
+                e["path_inside_floor_share"] = float(
+                    (self.path_floor_margin[running] < 0.0).float().mean().item())
+                e["path_floor_recovering_share"] = float(
+                    self.path_floor_recovering[running].float().mean().item())
 
         # Joint protection: a zero penalty is ambiguous -- it means either
         # "well within limits" or "the term is switched off". Margin occupancy
@@ -741,11 +980,21 @@ class GoalPoseV7(GoalPoseV3):
         stop_ang_speed_threshold <= 0 restores the exact armB behaviour.
         """
         base = super()._reward_goal_reached()
+        if self.path_cfg.get("arrival_reward_mode", "legacy") == "dwell_only":
+            arrival_mode = (~self.is_path_env) | (self.path_dwell_left > 0)
+            base = base * arrival_mode.float()
         thr = self.cfg["rewards"].get("stop_ang_speed_threshold", 0.0)
         if thr <= 0.0:
             return base
         settled = torch.norm(self.root_states[:, 10:13], dim=-1) < thr
         return base * settled.float()
+
+    def _reward_stand_posture(self):
+        reward = super()._reward_stand_posture()
+        if self.path_cfg.get("arrival_reward_mode", "legacy") == "dwell_only":
+            arrival_mode = (~self.is_path_env) | (self.path_dwell_left > 0)
+            reward = reward * arrival_mode.float()
+        return reward
 
     # ---- 5. joint / actuator protection -------------------------------------
 

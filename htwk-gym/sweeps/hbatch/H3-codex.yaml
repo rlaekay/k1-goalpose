@@ -41,7 +41,7 @@ algorithm:
   entropy_coef: -0.01
   symmetric_coef: 10.0
   desired_kl: 0.01
-  symmetry_coef: 0.5
+  symmetry_coef: 0.0
   mirror_augmentation_coef: 0.0
 sim:
   dt: 0.002
@@ -236,6 +236,7 @@ commands:
       - 0.8
       - 1.0
       up_threshold: 0.8
+      initial_active: all
     speed_init: 0.4
     speed_min_level: 0.1
     speed_step: 0.05
@@ -244,6 +245,14 @@ commands:
     down_threshold: 0.5
     ema: 0.995
     adjust_every_steps: 500
+    constraint_mode: radial_rate_limited
+    drag_speed_cap_mps: 2.1
+    floor_recovery_rate_mps: 2.1
+    floor_recovery_grace_s: 2.0
+    goal_rate_max_mps: 3.2
+    floor_tolerance_m: 0.02
+    arrival_reward_mode: dwell_only
+    pause_gait_during_dwell: true
   gait_frequency:
   - 1.8
   - 2.4
@@ -436,13 +445,13 @@ randomization:
   push_force:
     range:
     - 0.0
-    - 15.0
+    - 0.0
     operation: additive
     distribution: gaussian
   push_torque:
     range:
     - 0.0
-    - 2.0
+    - 0.0
     operation: additive
     distribution: gaussian
   dof_stiffness:
@@ -640,13 +649,102 @@ evaluation:
     pos_p90_m: 0.1
     heading_median_deg: 10.0
     max_falls: 0
+  hbatch_protocol_version: 2026-07-30-codex-v2
+  hbatch_common_eval:
+    noise_overrides:
+      goal_bt_flicker:
+        prob_per_step: 0.001
+        radius_m: 0.3
+        heading_rad: 0.2
+    randomization_overrides:
+      joint_encoder_bias:
+        range:
+        - -0.025
+        - 0.025
+        operation: additive
+        distribution: uniform
+      joint_target_offset:
+        range:
+        - -0.02
+        - 0.02
+        operation: additive
+        distribution: uniform
+      init_dof_pos:
+        range:
+        - 0.0
+        - 0.075
+        operation: additive
+        distribution: gaussian
+    disturbance:
+      enabled: true
+      interval_s:
+      - 6.0
+      - 12.0
+      event_probability: 0.5
+      ramp_steps: 1
+      collision_share: 0.35
+      body_names:
+      - Trunk
+      - Left_Hip_Roll
+      - Right_Hip_Roll
+      - Left_Shank
+      - Right_Shank
+      collision:
+        force_n:
+        - 40.0
+        - 100.0
+        torque_nm:
+        - 3.0
+        - 12.0
+        duration_s:
+        - 0.05
+        - 0.1
+      support:
+        force_n:
+        - 3.0
+        - 8.0
+        torque_nm:
+        - 0.2
+        - 1.0
+        duration_s:
+        - 0.5
+        - 1.5
+      high_speed_probability_boost: 2.0
+      high_speed_threshold_mps: 0.8
   perspective_overlays: true
   high_speed_threshold_mps: 0.8
   steady_accel_threshold_mps2: 0.3
   reset_guard_s: 0.25
   hbatch_gates:
+    waypoint_pos_median_max_m: 0.0552
+    waypoint_pos_p90_max_m: 0.0742
+    waypoint_heading_median_max_deg: 2.54
+    waypoint_never_arrived_share_max: 0.015
+    overall_falls_per_1000_max: 5.0
+    waypoint_falls_per_1000_max: 2.0
     time_to_1mps_regression_max: 0.1
     path_falls_per_1000_max: 5.0
+    path_speed_median_min: 0.95
+    path_floor_below_0p75_max: 0.1
+    path_dwell_resume_recovery_share_max: 0.15
+    path_outside_leash_max: 0.01
+    time_to_1mps_reached_share_min: 0.8
+    time_to_1mps_p90_s_max: 3.0
+    cruise_share_of_valid_min: 0.05
+    cruise_pitch_p90_max_deg: 20.0
+    cruise_roll_p90_max_deg: 15.0
+    cruise_ang_xy_p90_max_radps: 3.0
+    directional_t0p5_reached_share_min: 0.8
+    directional_t0p5_p90_s_max: 2.0
     force_survival_5s_min: 0.98
+    speed_recovery_within_5s_min: 0.9
     speed_recovery_p90_s_max: 2.0
     mirror_error_p90_max: 0.1
+    touchdown_samples_min: 100
+    touchdown_lr_bias_max_m: 0.02
+    touchdown_target_share_min: 0.4
+    touchdown_overstride_share_max: 0.1
+    jitter_falls_per_env_min_max: 0.5
+    combined_falls_per_env_min_max: 0.5
+    jitter_body_angvel_p90_max: 3.0
+    combined_body_angvel_p90_max: 3.0

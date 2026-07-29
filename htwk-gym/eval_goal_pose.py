@@ -34,6 +34,8 @@ Usage (server):
 
 import os
 import csv
+import copy
+import hashlib
 import json
 import glob
 import time
@@ -47,7 +49,7 @@ import torch
 import numpy as np
 import yaml
 
-from isaacgym.torch_utils import get_euler_xyz
+from isaacgym.torch_utils import get_euler_xyz, quat_rotate, quat_rotate_inverse
 from utils.model import ActorCritic
 from utils.runner import get_task_class
 
@@ -312,6 +314,53 @@ def _project_world(point, camera_pose, horizontal_fov_deg, width, height):
     return (u, v)
 
 
+def _segment_intersects_image(p0, p1, width, height):
+    """Return whether a 2-D segment intersects the rendered image rectangle."""
+    x0, y0 = float(p0[0]), float(p0[1])
+    x1, y1 = float(p1[0]), float(p1[1])
+    dx, dy = x1 - x0, y1 - y0
+    t0, t1 = 0.0, 1.0
+    for p, q in ((-dx, x0), (dx, width - 1 - x0),
+                 (-dy, y0), (dy, height - 1 - y0)):
+        if abs(p) <= 1.0e-12:
+            if q < 0.0:
+                return False
+            continue
+        r = q / p
+        if p < 0.0:
+            t0 = max(t0, r)
+        else:
+            t1 = min(t1, r)
+        if t0 > t1:
+            return False
+    return True
+
+
+def _force_arrow_points(st, camera_pose, horizontal_fov_deg, width, height):
+    """Project the force that acted in a recorded frame, or return ``None``.
+
+    This helper is shared by rendering and smoke telemetry.  Consequently a
+    counted arrow frame means the red world-space shaft actually has drawable
+    pixels in the simulator image, not merely that some env had a nonzero force.
+    """
+    if len(st) < 15:
+        return None
+    force = np.asarray(st[13], dtype=float)
+    origin = np.asarray(st[14], dtype=float)
+    mag = float(np.linalg.norm(force))
+    if not np.isfinite(mag) or mag <= 1.0e-3:
+        return None
+    length = 0.15 + 0.85 * np.sqrt(min(mag, 150.0) / 150.0)
+    end = origin + length * force / mag
+    p0 = _project_world(origin, camera_pose, horizontal_fov_deg, width, height)
+    p1 = _project_world(end, camera_pose, horizontal_fov_deg, width, height)
+    if p0 is None or p1 is None:
+        return None
+    if not _segment_intersects_image(p0, p1, width, height):
+        return None
+    return p0, p1
+
+
 def draw_perspective_scene(frame, st, camera_pose, horizontal_fov_deg, path_trace):
     """Draw path/carrot/waypoint and a force arrow on the simulator view."""
     rgb = frame[..., :3]
@@ -349,23 +398,16 @@ def draw_perspective_scene(frame, st, camera_pose, horizontal_fov_deg, path_trac
     # HBatch stores force in ENV_SPACE.  The origin is the selected rigid body
     # COM and arrow length uses sqrt scaling so both 3 N support and 150 N hits
     # remain visible without saturating the screen.
-    if len(st) >= 15:
-        force = np.asarray(st[13], dtype=float)
-        origin = np.asarray(st[14], dtype=float)
-        mag = float(np.linalg.norm(force))
-        if mag > 1.0e-3:
-            length = 0.15 + 0.85 * np.sqrt(min(mag, 150.0) / 150.0)
-            end = origin + length * force / mag
-            p0 = _project_world(origin, camera_pose, horizontal_fov_deg, w, h)
-            p1 = _project_world(end, camera_pose, horizontal_fov_deg, w, h)
-            if p0 is not None and p1 is not None:
-                red = (255, 40, 40)
-                _draw_line(rgb, p0[0], p0[1], p1[0], p1[1], red)
-                ang = np.arctan2(p1[1] - p0[1], p1[0] - p0[0])
-                for da in (2.55, -2.55):
-                    _draw_line(rgb, p1[0], p1[1],
-                               p1[0] + 14 * np.cos(ang + da),
-                               p1[1] + 14 * np.sin(ang + da), red)
+    arrow = _force_arrow_points(st, camera_pose, horizontal_fov_deg, w, h)
+    if arrow is not None:
+        p0, p1 = arrow
+        red = (255, 40, 40)
+        _draw_line(rgb, p0[0], p0[1], p1[0], p1[1], red)
+        ang = np.arctan2(p1[1] - p0[1], p1[0] - p0[0])
+        for da in (2.55, -2.55):
+            _draw_line(rgb, p1[0], p1[1],
+                       p1[0] + 14 * np.cos(ang + da),
+                       p1[1] + 14 * np.sin(ang + da), red)
     return frame
 
 
@@ -423,9 +465,66 @@ def env_code_sha():
         return None
 
 
+def evaluation_protocol_sha():
+    """Git SHA of the code that defines an evaluation protocol.
+
+    ``env_code_sha`` catches task drift, while this additionally catches a
+    changed evaluator/timeout or runner interface.  Cross-arm HBatch reports
+    refuse to compare suites without the same nonempty protocol SHA.
+    """
+    import subprocess
+    try:
+        root = os.path.dirname(os.path.abspath(__file__))
+        out = subprocess.run(
+            ["git", "-C", root, "log", "-1", "--format=%H", "--",
+             "eval_goal_pose.py", "envs", "utils/runner.py", "utils/runner_v3.py"],
+            capture_output=True, text=True, timeout=10)
+        return (out.stdout or "").strip() or None
+    except Exception:
+        return None
+
+
+def _stable_protocol_sha(value):
+    """Hash an effective, JSON-like evaluation configuration deterministically."""
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        allow_nan=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _apply_hbatch_common_eval(cfg, task):
+    """Replace arm-specific training randomization with one held-out test profile.
+
+    H1/H2 deliberately train with wider joint offsets and H2 with a denser
+    disturbance schedule.  Those are interventions, not permission to change
+    the exam.  Every final HBatch report therefore uses the same observation,
+    joint-calibration and force distribution; the effective post-override
+    protocol is fingerprinted later in :func:`prepare_cfg`.
+    """
+    if task.split("/")[-1] != "Goal_Pose_HBatch":
+        return
+    evaluation = cfg.setdefault("evaluation", {})
+    profile = evaluation.get("hbatch_common_eval")
+    if not isinstance(profile, dict):
+        raise ValueError(
+            "HBatch evaluation requires evaluation.hbatch_common_eval; "
+            "refusing an arm-specific test distribution")
+    noise = cfg.setdefault("noise", {})
+    randomization = cfg.setdefault("randomization", {})
+    for name, value in (profile.get("noise_overrides") or {}).items():
+        noise[name] = copy.deepcopy(value)
+    for name, value in (profile.get("randomization_overrides") or {}).items():
+        randomization[name] = copy.deepcopy(value)
+    disturbance = profile.get("disturbance")
+    if not isinstance(disturbance, dict):
+        raise ValueError(
+            "HBatch evaluation.hbatch_common_eval.disturbance is missing")
+    randomization["disturbance"] = copy.deepcopy(disturbance)
+
+
 def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
                 record_video=False, keep_perturbations=False, no_noise=False,
-                stress=None, goal_pattern=None):
+                stress=None, goal_pattern=None, force_visualization_probe=False):
     """Apply the standard evaluation conditions to a task config, in place."""
     cfg["basic"]["task"] = task
     cfg["basic"]["headless"] = True
@@ -436,6 +535,7 @@ def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
         cfg["basic"]["rl_device"] = rl_device
     cfg["viewer"]["record_video"] = bool(record_video)
     cfg["viewer"]["record_env_idx"] = 0
+    _apply_hbatch_common_eval(cfg, task)
     if not keep_perturbations:
         cfg["randomization"]["kick_interval_s"] = 1.0e9
         cfg["randomization"]["push_interval_s"] = 1.0e9
@@ -448,11 +548,29 @@ def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
     else:
         # Training ramps disturbance probability in gradually.  A fresh eval
         # process starts common_step_counter at zero, so retaining that ramp
-        # would accidentally score an almost disturbance-free run.  Stress
-        # evaluation instead exercises the configured terminal distribution.
+        # would accidentally score an almost disturbance-free run.  Evaluation
+        # instead exercises the shared held-out HBatch distribution installed
+        # above (or the task's configured terminal distribution for non-H tasks).
         disturbance = cfg["randomization"].get("disturbance")
         if isinstance(disturbance, dict) and disturbance.get("enabled", False):
             disturbance["ramp_steps"] = 1
+    if force_visualization_probe:
+        disturbance = cfg["randomization"].get("disturbance")
+        if not (keep_perturbations and isinstance(disturbance, dict)):
+            raise ValueError(
+                "--force_visualization_probe requires --keep_perturbations and "
+                "the HBatch disturbance model")
+        # Deterministic video-only protocol: long, gentle support forces keep
+        # env0 alive, start early enough to overlap the recorded window, and
+        # path-only commands guarantee the requested carrot/path visualization.
+        disturbance.update({
+            "enabled": True, "interval_s": [3.0, 4.0],
+            "event_probability": 1.0, "ramp_steps": 1,
+            "collision_share": 0.0,
+        })
+        cfg["commands"]["goal_mode_mixture"] = {
+            "waypoint": 0.0, "path": 1.0}
+        cfg.setdefault("evaluation", {})["force_visualization_probe"] = True
     if no_noise:
         cfg["noise"] = {}
 
@@ -483,6 +601,27 @@ def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
             c["goal_dx"], c["goal_dy"] = [0.0, 0.0], [-2.0, 2.0]
         elif goal_pattern == "reverse":
             c["goal_dx"], c["goal_dy"] = [-2.0, -1.0], [0.0, 0.0]
+    # Fingerprint what the simulator will actually sample after every CLI and
+    # common-profile override.  Cross-arm aggregation rejects a single missing
+    # or unequal hash, preventing another comparison of unequal force/noise/DR
+    # protocols while still calling them "the same evaluation".
+    effective_protocol = {
+        "task": task,
+        "sim_dt": cfg.get("sim", {}).get("dt"),
+        "control_decimation": cfg.get("control", {}).get("decimation"),
+        "commands": cfg.get("commands", {}),
+        "noise": cfg.get("noise", {}),
+        "randomization": cfg.get("randomization", {}),
+        "stress": stress,
+        "goal_pattern": goal_pattern,
+        "record_video": bool(record_video),
+        "force_visualization_probe": bool(force_visualization_probe),
+    }
+    evaluation = cfg.setdefault("evaluation", {})
+    evaluation["effective_eval_protocol_sha"] = _stable_protocol_sha(
+        effective_protocol)
+    evaluation["effective_disturbance_protocol"] = copy.deepcopy(
+        cfg.get("randomization", {}).get("disturbance") or {"enabled": False})
     return cfg
 
 
@@ -493,13 +632,30 @@ def build_env(cfg, task):
     return task_class(cfg)
 
 
-def load_policy(checkpoint, env, device, model=None, verbose=True):
+def load_policy(checkpoint, env, device, model=None, verbose=True,
+                restore_task_state=False):
     """Load checkpoint weights, reusing `model` if given (so a sweep over many
-    checkpoints does not rebuild the network each time)."""
+    checkpoints does not rebuild the network each time).
+
+    Evaluation normally keeps the config-defined task distribution fixed so
+    paired checkpoints see the same protocol.  ``restore_task_state`` is an
+    explicit native-resume diagnostic for inspecting the checkpoint's own
+    curriculum distribution; it must not be silently enabled in a selector.
+    """
     if model is None:
         model = ActorCritic(env.num_actions, env.num_obs, env.num_privileged_obs).to(device)
     model_dict = torch.load(checkpoint, map_location=device, weights_only=True)
     load_result = model.load_state_dict(model_dict["model"], strict=False)
+    env.eval_task_state_protocol = "config_fixed"
+    if restore_task_state:
+        if hasattr(env, "load_checkpoint_state") and "env_state" in model_dict:
+            env.load_checkpoint_state(model_dict["env_state"])
+            env.eval_task_state_protocol = "checkpoint_restored"
+        elif verbose:
+            print("NOTE: checkpoint has no restorable task curriculum state")
+            env.eval_task_state_protocol = "requested_but_missing"
+        else:
+            env.eval_task_state_protocol = "requested_but_missing"
     if verbose and (load_result.missing_keys or load_result.unexpected_keys):
         print("WARNING: partial checkpoint load ({} missing, {} unexpected keys)".format(
             len(load_result.missing_keys), len(load_result.unexpected_keys)))
@@ -529,7 +685,10 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     keys = ("pos_err", "head_err", "speed", "category", "start_dist", "duration_s",
             "min_dist", "along", "cross", "peak_speed", "mean_speed", "cmd_speed",
             "path_lag", "time_to_0p5_s", "time_to_0p8_s", "time_to_1p0_s",
-            "min_speed_first_2s", "initial_goal_bearing_rad", "switch_gait_phase")
+            "direction_time_to_0p5_s", "direction_time_to_0p8_s",
+            "direction_time_to_1p0_s",
+            "min_speed_first_2s", "initial_speed_mps",
+            "initial_goal_bearing_rad", "switch_gait_phase")
     seg = {k: [] for k in keys}
     # Whole-rollout body-speed histogram, over every env and every control step.
     # The per-segment "final_speed" only says how well it stops; this says how
@@ -553,14 +712,61 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     stability_counts = {"valid": 0, "accel": 0, "cruise": 0}
     mirror_error_hist = np.zeros(400, dtype=np.int64)  # RMS action error, 0..2
     mirror_error_hist_max = 2.0
+    # First-contact gait evidence for H1 symmetry and the H3 heel-placement
+    # ablation.  Fixed histograms keep memory bounded during long vectorized
+    # rollouts while retaining the distribution, not just a final snapshot.
+    touchdown_hist = {
+        "heel_x_body": np.zeros(800, dtype=np.int64),
+        "heel_x_left": np.zeros(800, dtype=np.int64),
+        "heel_x_right": np.zeros(800, dtype=np.int64),
+        "precontact_down_speed": np.zeros(400, dtype=np.int64),
+        "contact_force": np.zeros(500, dtype=np.int64),
+    }
+    touchdown_bounds = {
+        "heel_x_body": [-0.40, 0.40],
+        "precontact_down_speed": [0.0, 4.0],
+        "contact_force": [0.0, 1000.0],
+    }
+    touchdown_counts = {
+        "samples": 0, "ahead": 0, "within_target_sigma": 0,
+        "overstride": 0,
+    }
+    # Step-level path telemetry must stay bounded even for long evaluations.
+    # Keep fixed-size streaming histograms rather than one value per env-step.
+    # The distance range is derived from the configured hard leash cap, with
+    # enough headroom to expose (rather than immediately clip) leash violations.
+    path_cfg = env.cfg.get("commands", {}).get("path", {}) or {}
+    path_ratio_hist_max = 4.0
+    path_distance_hist_max = max(
+        4.0, 2.0 * float(path_cfg.get("lookahead_max_m", 3.5)))
+    path_step_hist = {
+        "gap_over_lookahead": np.zeros(400, dtype=np.int64),
+        "gap_m": np.zeros(800, dtype=np.int64),
+        "lookahead_m": np.zeros(800, dtype=np.int64),
+        "leash_m": np.zeros(800, dtype=np.int64),
+        "floor_deficit_m": np.zeros(800, dtype=np.int64),
+        "behind_lag_m": np.zeros(800, dtype=np.int64),
+    }
+    path_step_counts = {
+        "samples": 0,
+        "below_0p75": 0,
+        "outside_leash": 0,
+        "dwell_resume_recovery": 0,
+        "steady_samples": 0,
+        "steady_below_0p75": 0,
+    }
     eval_accel_filtered = torch.zeros(env.num_envs, 3, device=env.device)
-    force_prev_active = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     force_events = force_active_steps = force_context_falls = 0
+    force_cancelled_before_application = 0
     force_records = {
         key: [] for key in (
             "kind", "path", "duration_observed_s", "impulse_ns",
             "torque_impulse_nms", "max_tilt_deg", "speed_loss_mps",
-            "recovery_eligible", "recovery_90_s", "survived_2s", "survived_5s")
+            "baseline_goal_progress_speed_mps",
+            "recovery_eligible", "recovery_censored_by_goal_protocol",
+            "outcome_censored_by_episode_timeout",
+            "outcome_censored_by_rollout_end", "recovery_90_s",
+            "survived_2s", "survived_5s")
     }
     fall_ctx = {k: [] for k in ("category", "goal_dist", "t_into_segment", "start_dist")}
     falls = 0
@@ -598,6 +804,13 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     response_t05 = torch.full((env.num_envs,), float("nan"), device=env.device)
     response_t08 = torch.full((env.num_envs,), float("nan"), device=env.device)
     response_t10 = torch.full((env.num_envs,), float("nan"), device=env.device)
+    direction_t05 = torch.full((env.num_envs,), float("nan"), device=env.device)
+    direction_t08 = torch.full((env.num_envs,), float("nan"), device=env.device)
+    direction_t10 = torch.full((env.num_envs,), float("nan"), device=env.device)
+    response_initial_speed = torch.norm(env.filtered_lin_vel[:, :2], dim=-1)
+    response_goal_dir_world = env.goal_pos_world - env.base_pos[:, :2]
+    response_goal_dir_world /= torch.norm(
+        response_goal_dir_world, dim=-1, keepdim=True).clamp(min=1.0e-6)
     response_initial_bearing = torch.atan2(env.goal_rel_pos[:, 1], env.goal_rel_pos[:, 0])
     response_initial_phase = env.gait_process.clone()
 
@@ -617,6 +830,18 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     force_max_tilt = torch.zeros(env.num_envs, device=env.device)
     force_ended = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     force_recovery = torch.full((env.num_envs,), float("nan"), device=env.device)
+    force_recovery_candidate = torch.zeros(
+        env.num_envs, dtype=torch.bool, device=env.device)
+    force_recovery_valid = torch.zeros(
+        env.num_envs, dtype=torch.bool, device=env.device)
+    force_recovery_censored = torch.zeros(
+        env.num_envs, dtype=torch.bool, device=env.device)
+    force_outcome_censored = torch.zeros(
+        env.num_envs, dtype=torch.bool, device=env.device)
+    force_rollout_censored = torch.zeros(
+        env.num_envs, dtype=torch.bool, device=env.device)
+    force_goal_segment = torch.zeros(
+        env.num_envs, dtype=torch.long, device=env.device)
 
     def close_force_records(mask, age_s):
         ids = mask.nonzero(as_tuple=False).flatten()
@@ -626,7 +851,10 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
             age = float(age_s[idx].item())
             baseline = float(force_baseline_speed[idx].item())
             minimum = float(force_min_speed[idx].item())
-            relevant_recovery = bool(force_path[idx].item()) and baseline >= 0.5
+            recovery_observed = bool(torch.isfinite(force_recovery[idx]).item())
+            outcome_censored = bool(force_outcome_censored[idx].item())
+            relevant_recovery = (bool(force_recovery_valid[idx].item())
+                                 and (not outcome_censored or recovery_observed))
             recovery = float(force_recovery[idx].item()) if relevant_recovery else float("nan")
             force_records["kind"].append(int(force_kind[idx].item()))
             force_records["path"].append(bool(force_path[idx].item()))
@@ -635,13 +863,25 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
             force_records["torque_impulse_nms"].append(float(force_torque_impulse[idx].item()))
             force_records["max_tilt_deg"].append(float(force_max_tilt[idx].item()))
             force_records["speed_loss_mps"].append(max(0.0, baseline - minimum))
+            force_records["baseline_goal_progress_speed_mps"].append(baseline)
             force_records["recovery_eligible"].append(relevant_recovery)
+            force_records["recovery_censored_by_goal_protocol"].append(
+                bool(force_recovery_censored[idx].item()))
+            force_records["outcome_censored_by_episode_timeout"].append(
+                outcome_censored and not bool(force_rollout_censored[idx].item()))
+            force_records["outcome_censored_by_rollout_end"].append(
+                bool(force_rollout_censored[idx].item()))
             force_records["recovery_90_s"].append(recovery)
             force_records["survived_2s"].append(age >= 2.0)
             force_records["survived_5s"].append(age >= 5.0)
         force_live[ids] = False
         force_ended[ids] = False
         force_recovery[ids] = float("nan")
+        force_recovery_candidate[ids] = False
+        force_recovery_valid[ids] = False
+        force_recovery_censored[ids] = False
+        force_outcome_censored[ids] = False
+        force_rollout_censored[ids] = False
 
     # CUDA work is asynchronous. Synchronize only at the timing boundaries so
     # rollout_wall_s measures completed simulation/inference work without adding
@@ -714,13 +954,68 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
         prev_goal_dist = env.goal_dist.clone()
         prev_len = env.episode_length_buf.clone()
         prev_filtered_lin_vel = env.filtered_lin_vel.clone()
-        force_before = force_prev_active.clone()
+        prev_feet_contact = (env.feet_contact.clone()
+                             if hasattr(env, "feet_contact") else None)
+        prev_feet_world_vz = None
+        if (hasattr(env, "body_states") and hasattr(env, "feet_indices")):
+            prev_feet_world_vz = env.body_states[
+                :, env.feet_indices, 9].clone()
+        if hasattr(env, "pushing_forces"):
+            # This is the wrench submitted during the physics ticks about to be
+            # simulated.  The post-step tensor below is the NEXT control step's
+            # wrench because HBatch schedules after physics.
+            force_norm_before = torch.norm(
+                env.pushing_forces, dim=-1).amax(dim=-1)
+            torque_norm_before = torch.norm(
+                env.pushing_torques, dim=-1).amax(dim=-1)
+            force_before = force_norm_before > 1.0e-3
+        else:
+            force_norm_before = torch.zeros(env.num_envs, device=env.device)
+            torque_norm_before = torch.zeros(env.num_envs, device=env.device)
+            force_before = torch.zeros(
+                env.num_envs, dtype=torch.bool, device=env.device)
         prev_force_serial = (env.dist_event_serial.clone()
                              if hasattr(env, "dist_event_serial") else None)
         if instrumented:
             prev_category = env.goal_category.clone()
             prev_start_pos = env.goal_start_pos.clone()
             prev_start_step = env.goal_start_step.clone()
+
+        # The camera is rendered before the post-physics goal update/resample.
+        # Keep the command metadata from the action/frame being visualized; a
+        # post-step read is one carrot tick ahead and, at a segment boundary,
+        # would draw a newly re-anchored goal over the previous segment's frame.
+        if not video_done:
+            video_goal_pos = env.goal_pos_world[0].clone()
+            video_goal_heading = env.goal_heading_world[0].clone()
+            video_goal_category = int(
+                env.goal_category[0].item()) if hasattr(env, "goal_category") else -1
+            video_goal_segment = int(
+                env.goal_segment_id[0].item()) if hasattr(env, "goal_segment_id") else -1
+            video_seq_goals = (
+                env.seq_goals[0].detach().cpu().numpy().copy()
+                if hasattr(env, "seq_goals") and bool(env.is_seq_env[0]) else None)
+            video_seq_idx = int(env.seq_idx[0].item()) if hasattr(env, "seq_idx") else 0
+
+            # BaseTask captures the camera inside env.step(), after physics but
+            # BEFORE _push_robots() installs the wrench for the next simulation
+            # step.  Snapshot the already-installed wrench now so this overlay is
+            # paired with the frame in which that force actually acts.  Reading it
+            # after env.step() would draw every arrow one frame early and could let
+            # a force created on the final recorded step produce a false video PASS.
+            video_push_n = video_push_nm = 0.0
+            video_force_vec = np.zeros(3, dtype=float)
+            video_force_origin = env.base_pos[0].detach().cpu().numpy().copy()
+            if hasattr(env, "pushing_forces"):
+                body_norm = torch.norm(env.pushing_forces[0], dim=-1)
+                body_idx = int(torch.argmax(body_norm).item())
+                video_force_vec = env.pushing_forces[
+                    0, body_idx].detach().cpu().numpy().copy()
+                video_force_origin = env.body_states[
+                    0, body_idx, :3].detach().cpu().numpy().copy()
+                video_push_n = float(body_norm[body_idx].item())
+                video_push_nm = float(torch.norm(
+                    env.pushing_torques[0, body_idx, :]).item())
 
         with torch.no_grad():
             dist = model.act(obs)
@@ -742,10 +1037,19 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
         obs = obs.to(device)
 
         timeouts = infos["time_outs"].to(done.device)
-        fell = done & ~timeouts
+        physical_failures = infos.get("physical_failures")
+        if physical_failures is not None:
+            fell = done & physical_failures.to(done.device)
+        else:
+            fell = done & ~timeouts
+        episode_timeouts = infos.get("episode_time_outs")
+        if episode_timeouts is not None:
+            episode_timeouts = episode_timeouts.to(done.device)
+        else:
+            episode_timeouts = done & timeouts
         n_fell = int(fell.sum().item())
         falls += n_fell
-        censored += int((done & timeouts).sum().item())
+        censored += int((done & episode_timeouts & ~fell).sum().item())
 
         # ---- acceleration / cruise separation -----------------------------
         reset_guard = float(env.cfg.get("evaluation", {}).get("reset_guard_s", 0.25))
@@ -758,6 +1062,22 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
         acc_body = eval_accel_filtered
         acc_xy = torch.norm(acc_body[:, :2], dim=-1)
         speed_now = torch.norm(env.filtered_lin_vel[:, :2], dim=-1)
+        # Direction-change probes must measure velocity TOWARD the new goal.
+        # Raw speed alone falsely calls a robot that keeps running in its old
+        # direction an instant success after a lateral/reverse switch.
+        _, _, response_yaw = get_euler_xyz(env.base_quat)
+        cy, sy = torch.cos(response_yaw), torch.sin(response_yaw)
+        response_vel_world = torch.stack((
+            cy * env.filtered_lin_vel[:, 0] - sy * env.filtered_lin_vel[:, 1],
+            sy * env.filtered_lin_vel[:, 0] + cy * env.filtered_lin_vel[:, 1],
+        ), dim=-1)
+        response_closing_speed = torch.sum(
+            response_vel_world * response_goal_dir_world, dim=-1)
+        current_goal_direction = env.goal_pos_world - env.base_pos[:, :2]
+        current_goal_direction /= torch.norm(
+            current_goal_direction, dim=-1, keepdim=True).clamp(min=1.0e-6)
+        current_goal_progress_speed = torch.sum(
+            response_vel_world * current_goal_direction, dim=-1)
         accel_thr = float(env.cfg.get("evaluation", {}).get("steady_accel_threshold_mps2", 0.3))
         fast_thr = float(env.cfg.get("evaluation", {}).get("high_speed_threshold_mps", 0.8))
         accel_phase = valid_phase & (speed_now > 0.3) & (acc_body[:, 0] > accel_thr)
@@ -782,6 +1102,135 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
         stability_counts["accel"] += int(accel_phase.sum().item())
         stability_counts["cruise"] += int(cruise_phase.sum().item())
 
+        # ---- first-contact foot placement / impact -----------------------
+        if (prev_feet_contact is not None and prev_feet_world_vz is not None
+                and hasattr(env, "feet_pos") and hasattr(env, "feet_quat")):
+            first_contact = env.feet_contact & ~prev_feet_contact
+            first_contact &= ~done.unsqueeze(-1)
+            if hasattr(env, "is_path_env"):
+                first_contact &= env.is_path_env.unsqueeze(-1)
+            heel_cfg = env.cfg.get("rewards", {}).get("heel_strike", {}) or {}
+            min_forward = float(heel_cfg.get("min_forward_speed_mps", 0.6))
+            first_contact &= (env.base_lin_vel[:, 0] > min_forward).unsqueeze(-1)
+            if bool(first_contact.any()):
+                n_feet = len(env.feet_indices)
+                heel_local = torch.tensor(
+                    [-0.1015, 0.0, -0.03], device=env.device).view(1, 1, 3)
+                heel_local = heel_local.expand(env.num_envs, n_feet, 3)
+                heel_world = env.feet_pos + quat_rotate(
+                    env.feet_quat.reshape(-1, 4),
+                    heel_local.reshape(-1, 3)).reshape_as(env.feet_pos)
+                heel_rel_world = heel_world - env.base_pos.unsqueeze(1)
+                heel_rel_body = quat_rotate_inverse(
+                    env.base_quat.unsqueeze(1).expand(
+                        -1, n_feet, -1).reshape(-1, 4),
+                    heel_rel_world.reshape(-1, 3)).reshape_as(heel_rel_world)
+                heel_x = heel_rel_body[:, :, 0]
+                target = (float(heel_cfg.get("velocity_gain_s", 0.08))
+                          * env.base_lin_vel[:, 0]).clamp(
+                              min=float(heel_cfg.get("target_min_m", 0.02)),
+                              max=float(heel_cfg.get("target_max_m", 0.12)))
+                sigma = float(heel_cfg.get("sigma_m", 0.04))
+                down_speed = (-prev_feet_world_vz).clamp(min=0.0)
+                contact_force = torch.norm(
+                    env.contact_forces[:, env.feet_indices, :], dim=-1)
+
+                hx = heel_x[first_contact].detach().cpu().numpy()
+                ds = down_speed[first_contact].detach().cpu().numpy()
+                cf = contact_force[first_contact].detach().cpu().numpy()
+                target_error = torch.abs(heel_x - target.unsqueeze(-1))
+                touchdown_counts["samples"] += int(first_contact.sum().item())
+                touchdown_counts["ahead"] += int(
+                    ((heel_x > 0.0) & first_contact).sum().item())
+                touchdown_counts["within_target_sigma"] += int(
+                    ((target_error <= sigma) & first_contact).sum().item())
+                overstride_limit = float(
+                    heel_cfg.get("target_max_m", 0.12)) + 2.0 * sigma
+                touchdown_counts["overstride"] += int(
+                    ((heel_x > overstride_limit) & first_contact).sum().item())
+
+                def add_touchdown_hist(name, values, lo, hi):
+                    hist = touchdown_hist[name]
+                    idx = np.clip(
+                        ((values - lo) / (hi - lo) * len(hist)).astype(int),
+                        0, len(hist) - 1)
+                    np.add.at(hist, idx, 1)
+
+                hx_lo, hx_hi = touchdown_bounds["heel_x_body"]
+                add_touchdown_hist("heel_x_body", hx, hx_lo, hx_hi)
+                add_touchdown_hist(
+                    "precontact_down_speed", ds,
+                    *touchdown_bounds["precontact_down_speed"])
+                add_touchdown_hist(
+                    "contact_force", cf, *touchdown_bounds["contact_force"])
+                for foot_i, name in enumerate(("heel_x_left", "heel_x_right")):
+                    if foot_i >= n_feet:
+                        break
+                    foot_values = heel_x[:, foot_i][
+                        first_contact[:, foot_i]].detach().cpu().numpy()
+                    if len(foot_values):
+                        add_touchdown_hist(name, foot_values, hx_lo, hx_hi)
+
+        # ---- signed path floor/leash state, every running control step -----
+        # Segment-end path_lag alone misses short floor collapses and leash
+        # excursions.  Measure the post-step state against EACH env's sampled
+        # lookahead and the exact leash construction used by GoalPoseV7.  Dwell
+        # deliberately releases the floor, so it is explicitly out of scope.
+        if hasattr(env, "is_path_env") and hasattr(env, "lookahead"):
+            running_path = env.is_path_env & ~done & (env.lookahead > 1.0e-6)
+            if hasattr(env, "path_dwell_left"):
+                running_path &= env.path_dwell_left <= 0
+            if bool(running_path.any()):
+                gap = torch.norm(env.goal_pos_world - env.base_pos[:, :2], dim=-1)
+                lookahead = env.lookahead
+                leash = torch.clamp(
+                    lookahead * float(path_cfg.get("leash_ratio", 1.6)),
+                    max=float(path_cfg.get("lookahead_max_m", 3.5)),
+                )
+                leash = torch.maximum(leash, lookahead + 0.1)
+                ratio = gap / lookahead.clamp(min=1.0e-6)
+                floor_deficit = (lookahead - gap).clamp(min=0.0)
+                behind_lag = (gap - lookahead).clamp(min=0.0)
+                finite = (torch.isfinite(gap) & torch.isfinite(lookahead)
+                          & torch.isfinite(leash) & torch.isfinite(ratio))
+                sample_mask = running_path & finite
+                if bool(sample_mask.any()):
+                    recovering = getattr(
+                        env, "path_floor_recovering",
+                        torch.zeros(env.num_envs, dtype=torch.bool, device=env.device))
+                    samples = torch.stack((
+                        ratio,
+                        gap,
+                        lookahead,
+                        leash,
+                        floor_deficit,
+                        behind_lag,
+                        (ratio < 0.75).float(),
+                        (gap > leash + 1.0e-4).float(),
+                        recovering.float(),
+                    ), dim=-1)[sample_mask].detach().cpu().numpy()
+                    path_step_counts["samples"] += int(len(samples))
+                    path_step_counts["below_0p75"] += int(samples[:, 6].sum())
+                    path_step_counts["outside_leash"] += int(samples[:, 7].sum())
+                    recovery = samples[:, 8] > 0.5
+                    path_step_counts["dwell_resume_recovery"] += int(recovery.sum())
+                    path_step_counts["steady_samples"] += int((~recovery).sum())
+                    path_step_counts["steady_below_0p75"] += int(
+                        ((samples[:, 6] > 0.5) & ~recovery).sum())
+                    for name, column, maximum in (
+                        ("gap_over_lookahead", 0, path_ratio_hist_max),
+                        ("gap_m", 1, path_distance_hist_max),
+                        ("lookahead_m", 2, path_distance_hist_max),
+                        ("leash_m", 3, path_distance_hist_max),
+                        ("floor_deficit_m", 4, path_distance_hist_max),
+                        ("behind_lag_m", 5, path_distance_hist_max),
+                    ):
+                        hist = path_step_hist[name]
+                        idx = np.clip(
+                            (samples[:, column] / maximum * len(hist)).astype(int),
+                            0, len(hist) - 1)
+                        np.add.at(hist, idx, 1)
+
         # Disturbance exposure and fall counts are separate from clean gates.
         # A clean 0-fall report can never be cited as force robustness again.
         if hasattr(env, "pushing_forces"):
@@ -791,24 +1240,52 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
             rising = force_now & ~force_before
             event_edge = ((env.dist_event_serial != prev_force_serial)
                           if prev_force_serial is not None else rising)
-            force_events += int(event_edge.sum().item())
-            force_active_steps += int(force_now.sum().item())
-            force_context_falls += int((fell & (force_before | force_now)).sum().item())
+            # _push_robots installs a newly scheduled wrench after this step's
+            # simulate() and before termination/reset.  If the env was already
+            # done, _reset_idx clears it before it ever reaches physics.  Such
+            # an edge is a cancelled schedule, not a collision outcome.
+            applied_edge = event_edge & force_now & ~done
+            force_cancelled_before_application += int(
+                (event_edge & ~applied_edge).sum().item())
+            force_events += int(applied_edge.sum().item())
+            force_active_steps += int(force_before.sum().item())
+            # Only the pre-step wrench acted in the physics that produced this
+            # termination; force_now was merely installed for the next step.
+            force_context_falls += int((fell & force_before).sum().item())
 
-            if bool(event_edge.any()):
+            if bool(applied_edge.any()):
                 # H intervals are intentionally longer than the five-second
                 # outcome window.  A rising edge while one is still live is a
                 # config error; leave the older record live so the count
                 # mismatch is visible rather than silently overwriting it.
-                start = event_edge & ~force_live
+                start = applied_edge & ~force_live
                 force_live[start] = True
-                force_start_step[start] = step_i
-                force_baseline_speed[start] = torch.norm(
-                    prev_filtered_lin_vel[start, :2], dim=-1)
-                force_min_speed[start] = speed_now[start]
+                force_start_step[start] = step_i + 1
+                # The newly installed wrench acts on the NEXT simulate.  The
+                # post-step state is therefore the actual pre-hit baseline and
+                # already contains any goal reroll that happened on this step.
+                force_baseline_speed[start] = current_goal_progress_speed[start].clamp(min=0.0)
+                force_min_speed[start] = current_goal_progress_speed[start]
                 force_path[start] = getattr(
                     env, "is_path_env",
                     torch.zeros(env.num_envs, dtype=torch.bool, device=env.device))[start]
+                dwelling = getattr(
+                    env, "path_dwell_left",
+                    torch.zeros(env.num_envs, dtype=torch.long, device=env.device)) > 0
+                floor_recovering = getattr(
+                    env, "path_floor_recovering",
+                    torch.zeros(env.num_envs, dtype=torch.bool, device=env.device))
+                force_recovery_candidate[start] = (
+                    force_path[start]
+                    & (force_baseline_speed[start] >= 0.5)
+                    & ~dwelling[start]
+                    & ~floor_recovering[start])
+                force_recovery_valid[start] = force_recovery_candidate[start]
+                force_recovery_censored[start] = False
+                force_outcome_censored[start] = False
+                force_rollout_censored[start] = False
+                if has_segment_id:
+                    force_goal_segment[start] = env.goal_segment_id[start]
                 if hasattr(env, "dist_last_event_kind"):
                     force_kind[start] = env.dist_last_event_kind[start]
                 elif hasattr(env, "dist_event_kind"):
@@ -817,43 +1294,75 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
                     force_kind[start] = 0
                 force_impulse[start] = 0.0
                 force_torque_impulse[start] = 0.0
-                vanished = start & ~force_now
-                if bool(vanished.any()) and hasattr(env, "dist_last_expected_impulse"):
-                    # A collision can trigger termination and be cleared by
-                    # _reset_idx inside the same env.step.  Its monotonic event
-                    # serial still exposes it; retain the sampled impulse rather
-                    # than reporting a physically impossible zero-strength fall.
-                    force_impulse[vanished] = env.dist_last_expected_impulse[vanished]
-                    force_torque_impulse[vanished] = (
-                        env.dist_last_expected_torque_impulse[vanished])
                 force_max_tilt[start] = 0.0
                 force_ended[start] = False
                 force_recovery[start] = float("nan")
 
             active_record = force_live
-            force_impulse[active_record] += force_norm[active_record] * env.dt
-            force_torque_impulse[active_record] += torque_norm[active_record] * env.dt
+            # Integrate only the wrench that acted in the just-completed
+            # physics interval.  Counting force_now here would add one phantom
+            # control step at event creation and close the five-second outcome
+            # window one step early.
+            force_impulse[active_record] += (
+                force_norm_before[active_record] * env.dt)
+            force_torque_impulse[active_record] += (
+                torque_norm_before[active_record] * env.dt)
             not_recovered = active_record & torch.isnan(force_recovery)
             force_min_speed[not_recovered] = torch.minimum(
-                force_min_speed[not_recovered], speed_now[not_recovered])
+                force_min_speed[not_recovered],
+                current_goal_progress_speed[not_recovered])
             tilt_deg = torch.rad2deg(torch.acos(
                 (-env.projected_gravity[:, 2]).clamp(-1.0, 1.0)))
             force_max_tilt[active_record] = torch.maximum(
                 force_max_tilt[active_record], tilt_deg[active_record])
 
+            # Recovery speed is meaningful only while the event's command
+            # protocol remains the same.  A 4-8 s path reroll or a dwell can
+            # otherwise make motion toward a new carrot look like recovery from
+            # the old hit.  Keep survival tracking alive, but censor recovery.
+            recovery_protocol_changed = torch.zeros_like(active_record)
+            if has_segment_id:
+                recovery_protocol_changed |= (
+                    active_record
+                    & (env.goal_segment_id != force_goal_segment))
+            recovery_protocol_changed |= active_record & ~getattr(
+                env, "is_path_env",
+                torch.zeros(env.num_envs, dtype=torch.bool, device=env.device))
+            if hasattr(env, "path_dwell_left"):
+                recovery_protocol_changed |= active_record & (env.path_dwell_left > 0)
+            if hasattr(env, "path_floor_recovering"):
+                recovery_protocol_changed |= (
+                    active_record & env.path_floor_recovering)
+            # A physical fall is an observed recovery failure, not a command
+            # censor.  Post-reset goal/path fields describe the new episode and
+            # must not remove the failed hit from the recovery denominator.
+            recovery_protocol_changed &= ~done
+            newly_censored = (recovery_protocol_changed
+                              & force_recovery_candidate
+                              & force_recovery_valid
+                              & torch.isnan(force_recovery))
+            force_recovery_censored[newly_censored] = True
+            force_recovery_valid[newly_censored] = False
+
             ended_now = active_record & force_before & ~force_now & ~force_ended
             force_ended[ended_now] = True
             force_end_step[ended_now] = step_i
-            recovery_now = (active_record & force_ended & torch.isnan(force_recovery)
-                            & force_path & (force_baseline_speed >= 0.5)
-                            & (speed_now >= 0.9 * force_baseline_speed))
+            recovery_now = (active_record & ~done & force_ended & torch.isnan(force_recovery)
+                            & force_recovery_valid
+                            & (current_goal_progress_speed
+                               >= 0.9 * force_baseline_speed)
+                            & (tilt_deg <= 20.0))
             force_recovery[recovery_now] = (
                 step_i - force_end_step[recovery_now]).float() * env.dt
 
             age_s = (step_i - force_start_step + 1).float() * env.dt
-            close_force_records((active_record & (age_s >= 5.0)) | (active_record & fell), age_s)
-            force_prev_active = force_now & ~done
-
+            timeout_censor = active_record & done & episode_timeouts & ~fell
+            force_outcome_censored[timeout_censor] = True
+            close_force_records(
+                (active_record & (age_s >= 5.0))
+                | (active_record & fell)
+                | timeout_censor,
+                age_s)
         if n_fell and instrumented:
             fids = fell.nonzero(as_tuple=False).flatten()
             elapsed = (prev_len[fids] + 1 - prev_start_step[fids]).clamp(min=0).float() * env.dt
@@ -886,6 +1395,11 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
         for threshold, target in ((0.5, response_t05), (0.8, response_t08), (1.0, response_t10)):
             reached = response_valid & torch.isnan(target) & (speed_now >= threshold)
             target[reached] = response_elapsed[reached]
+        for threshold, target in ((0.5, direction_t05), (0.8, direction_t08),
+                                  (1.0, direction_t10)):
+            reached = (response_valid & torch.isnan(target)
+                       & (response_closing_speed >= threshold))
+            target[reached] = response_elapsed[reached]
 
         if completed.any():
             ids = completed.nonzero(as_tuple=False).flatten()
@@ -914,7 +1428,11 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
             seg["time_to_0p5_s"].extend(response_t05[ids].cpu().tolist())
             seg["time_to_0p8_s"].extend(response_t08[ids].cpu().tolist())
             seg["time_to_1p0_s"].extend(response_t10[ids].cpu().tolist())
+            seg["direction_time_to_0p5_s"].extend(direction_t05[ids].cpu().tolist())
+            seg["direction_time_to_0p8_s"].extend(direction_t08[ids].cpu().tolist())
+            seg["direction_time_to_1p0_s"].extend(direction_t10[ids].cpu().tolist())
             seg["min_speed_first_2s"].extend(response_min_speed_2s[ids].cpu().tolist())
+            seg["initial_speed_mps"].extend(response_initial_speed[ids].cpu().tolist())
             seg["initial_goal_bearing_rad"].extend(
                 response_initial_bearing[ids].cpu().tolist())
             seg["switch_gait_phase"].extend(response_initial_phase[ids].cpu().tolist())
@@ -955,40 +1473,42 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
             response_t05[stale] = float("nan")
             response_t08[stale] = float("nan")
             response_t10[stale] = float("nan")
+            direction_t05[stale] = float("nan")
+            direction_t08[stale] = float("nan")
+            direction_t10[stale] = float("nan")
+            response_initial_speed[stale] = torch.norm(
+                env.filtered_lin_vel[stale, :2], dim=-1)
+            new_goal_delta = env.goal_pos_world[stale] - env.base_pos[stale, :2]
+            response_goal_dir_world[stale] = new_goal_delta / torch.norm(
+                new_goal_delta, dim=-1, keepdim=True).clamp(min=1.0e-6)
             response_initial_bearing[stale] = torch.atan2(
                 env.goal_rel_pos[stale, 1], env.goal_rel_pos[stale, 0])
             response_initial_phase[stale] = env.gait_process[stale]
 
         if not video_done:
             _, _, yaw_all = get_euler_xyz(env.base_quat[0:1])
-            push_n = push_nm = 0.0
-            force_vec = np.zeros(3, dtype=float)
-            force_origin = env.base_pos[0].cpu().numpy().copy()
-            if hasattr(env, "pushing_forces") and hasattr(env, "base_indice"):
-                body_norm = torch.norm(env.pushing_forces[0], dim=-1)
-                body_idx = int(torch.argmax(body_norm).item())
-                force_vec = env.pushing_forces[0, body_idx].cpu().numpy().copy()
-                force_origin = env.body_states[0, body_idx, :3].cpu().numpy().copy()
-                push_n = float(body_norm[body_idx].item())
-                push_nm = float(torch.norm(env.pushing_torques[0, body_idx, :]).item())
+            video_goal_dist = float(torch.norm(
+                video_goal_pos - env.base_pos[0, :2]).item())
+            video_heading_error = float(torch.rad2deg(torch.abs(wrap(
+                video_goal_heading - yaw_all[0]))).item())
             overlay_states.append((
                 env.base_pos[0, :2].cpu().numpy().copy(),
                 float(wrap(yaw_all)[0].item()),
-                env.goal_pos_world[0].cpu().numpy().copy(),
-                float(env.goal_heading_world[0].item()),
+                video_goal_pos.cpu().numpy().copy(),
+                float(video_goal_heading.item()),
                 float(env.base_lin_vel[0, 0].item()),
                 float(env.base_lin_vel[0, 1].item()),
                 float(env.base_ang_vel[0, 2].item()),
-                float(env.goal_dist[0].item()),
-                float(np.degrees(env.heading_error[0].item())),
-                push_n,
-                push_nm,
-                (env.seq_goals[0].cpu().numpy().copy()
-                 if hasattr(env, "seq_goals") and bool(env.is_seq_env[0]) else None),
-                int(env.seq_idx[0].item()) if hasattr(env, "seq_idx") else 0,
-                force_vec,
-                force_origin,
-                int(env.goal_category[0].item()) if hasattr(env, "goal_category") else -1,
+                video_goal_dist,
+                video_heading_error,
+                video_push_n,
+                video_push_nm,
+                video_seq_goals,
+                video_seq_idx,
+                video_force_vec,
+                video_force_origin,
+                video_goal_category,
+                video_goal_segment,
             ))
             if (step_i + 1) * env.dt >= record_video_s:
                 env.cfg["viewer"]["record_video"] = False  # stop accumulating frames (memory)
@@ -1003,6 +1523,17 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
 
     synchronize_cuda_devices(env.cfg["basic"]["sim_device"], device)
     wall_s = time.perf_counter() - started
+
+    # The end of a finite rollout is ordinary right-censoring, not an
+    # overlapping/lost event.  Close every still-live record with exactly the
+    # horizon it was observable for so 2 s and 5 s survival use honest,
+    # separately eligible denominators.
+    if bool(force_live.any()):
+        rollout_age_s = (
+            total_steps - force_start_step).clamp(min=0).float() * env.dt
+        force_outcome_censored[force_live] = True
+        force_rollout_censored[force_live] = True
+        close_force_records(force_live.clone(), rollout_age_s)
 
     out = {k: np.asarray(v, dtype=float) for k, v in seg.items()}
     out["category"] = out["category"].astype(int)
@@ -1024,16 +1555,97 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     out["stability_counts"] = stability_counts
     out["mirror_error_hist"] = mirror_error_hist
     out["mirror_error_hist_max"] = mirror_error_hist_max
+    out["touchdown_hist"] = touchdown_hist
+    out["touchdown_bounds"] = touchdown_bounds
+    out["touchdown_counts"] = touchdown_counts
+    out["path_step_hist"] = path_step_hist
+    out["path_step_hist_max"] = {
+        "gap_over_lookahead": path_ratio_hist_max,
+        "distance_m": path_distance_hist_max,
+    }
+    out["path_step_counts"] = path_step_counts
+
+    # These are the frames that will actually be paired and written below
+    # (`zip(camera_frames, overlay_states)`).  Counting overlay samples alone
+    # would falsely claim visibility when headless graphics produced no images.
+    captured_frames = (len(env.camera_frames)
+                       if record_video and hasattr(env, "camera_frames") else 0)
+    video_recorded_frames = min(captured_frames, len(overlay_states))
+    video_force_active_frames = sum(
+        1 for st in overlay_states[:video_recorded_frames]
+        if len(st) >= 10 and float(st[9]) > 1.0e-3)
+    video_force_arrow_drawn_frames = 0
+    video_path_frames = sum(
+        1 for st in overlay_states[:video_recorded_frames]
+        if len(st) >= 16 and int(st[15]) == CATEGORY_PATH)
+    video_path_carrot_drawn_frames = 0
+    video_path_trace_drawn_frames = 0
+    perspective = bool(env.cfg.get("evaluation", {}).get(
+        "perspective_overlays", False))
+    camera_poses = getattr(env, "camera_poses", [])
+    fov = float(getattr(env, "camera_horizontal_fov", 75.0))
+    if perspective:
+        paired = min(video_recorded_frames, len(camera_poses))
+        path_trace_world = []
+        last_path_segment = None
+        for i in range(paired):
+            frame = env.camera_frames[i]
+            h, w = frame.shape[:2]
+            if _force_arrow_points(
+                    overlay_states[i], camera_poses[i], fov, w, h) is not None:
+                video_force_arrow_drawn_frames += 1
+            st = overlay_states[i]
+            if len(st) >= 16 and int(st[15]) == CATEGORY_PATH:
+                segment = int(st[16]) if len(st) >= 17 else None
+                if (last_path_segment is not None and segment is not None
+                        and segment != last_path_segment):
+                    path_trace_world = []
+                path_trace_world.append(np.asarray(st[2], dtype=float).copy())
+                point = _project_world(
+                    (float(st[2][0]), float(st[2][1]), 0.06),
+                    camera_poses[i], fov, w, h)
+                if point is not None and 0 <= point[0] < w and 0 <= point[1] < h:
+                    video_path_carrot_drawn_frames += 1
+                trace_tail = path_trace_world[-120:]
+                projected_trace = [
+                    _project_world((float(xy[0]), float(xy[1]), 0.04),
+                                   camera_poses[i], fov, w, h)
+                    for xy in trace_tail
+                ]
+                if any(
+                        a is not None and b is not None
+                        and np.linalg.norm(xyb - xya) > 1.0e-6
+                        and _segment_intersects_image(a, b, w, h)
+                        for a, b, xya, xyb in zip(
+                            projected_trace[:-1], projected_trace[1:],
+                            trace_tail[:-1], trace_tail[1:])):
+                    video_path_trace_drawn_frames += 1
+                last_path_segment = segment
+            else:
+                path_trace_world = []
+                last_path_segment = None
 
     fr = {k: np.asarray(v) for k, v in force_records.items()}
 
-    def event_summary(kind=None):
+    def event_summary(kind=None, high_speed_only=False):
         count = len(fr["kind"])
         mask = np.ones(count, dtype=bool)
         if kind is not None:
             mask &= fr["kind"].astype(int) == kind
+        if high_speed_only:
+            high_speed_threshold = float(env.cfg.get("evaluation", {}).get(
+                "high_speed_threshold_mps", 0.8))
+            mask &= (fr["baseline_goal_progress_speed_mps"].astype(float)
+                     >= high_speed_threshold)
         eligible = mask & fr["recovery_eligible"].astype(bool)
         recovered = eligible & np.isfinite(fr["recovery_90_s"].astype(float))
+        outcome_censored = fr[
+            "outcome_censored_by_episode_timeout"].astype(bool)
+        rollout_censored = fr["outcome_censored_by_rollout_end"].astype(bool)
+        outcome_censored |= rollout_censored
+        duration = fr["duration_observed_s"].astype(float)
+        survival_2_eligible = mask & (~outcome_censored | (duration >= 2.0))
+        survival_5_eligible = mask & (~outcome_censored | (duration >= 5.0))
 
         def masked_pct(key, percentile):
             values = fr[key].astype(float)[mask]
@@ -1041,16 +1653,28 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
 
         return {
             "records": int(mask.sum()),
-            "survival_2s": (float(fr["survived_2s"].astype(bool)[mask].mean())
-                            if mask.any() else float("nan")),
-            "survival_5s": (float(fr["survived_5s"].astype(bool)[mask].mean())
-                            if mask.any() else float("nan")),
+            "baseline_goal_progress_speed_mps_p50": masked_pct(
+                "baseline_goal_progress_speed_mps", 50),
+            "outcomes_censored_by_episode_timeout": int(
+                (mask & fr["outcome_censored_by_episode_timeout"].astype(bool)).sum()),
+            "outcomes_censored_by_rollout_end": int(
+                (mask & rollout_censored).sum()),
+            "survival_2s_eligible": int(survival_2_eligible.sum()),
+            "survival_5s_eligible": int(survival_5_eligible.sum()),
+            "survival_2s": (
+                float(fr["survived_2s"].astype(bool)[survival_2_eligible].mean())
+                if survival_2_eligible.any() else float("nan")),
+            "survival_5s": (
+                float(fr["survived_5s"].astype(bool)[survival_5_eligible].mean())
+                if survival_5_eligible.any() else float("nan")),
             "impulse_ns_median": masked_pct("impulse_ns", 50),
             "impulse_ns_p90": masked_pct("impulse_ns", 90),
             "torque_impulse_nms_p90": masked_pct("torque_impulse_nms", 90),
             "max_tilt_deg_p90": masked_pct("max_tilt_deg", 90),
             "speed_loss_mps_p90": masked_pct("speed_loss_mps", 90),
             "recovery_eligible": int(eligible.sum()),
+            "recovery_censored_by_goal_protocol": int(
+                (mask & fr["recovery_censored_by_goal_protocol"].astype(bool)).sum()),
             "recovery_90_within_5s_share": (
                 float(recovered.sum() / eligible.sum()) if eligible.any() else float("nan")),
             "recovery_90_s_p50": (_pct(fr["recovery_90_s"].astype(float)[recovered], 50)
@@ -1060,13 +1684,34 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
         }
 
     out["disturbance_eval"] = {
+        "recovery_definition": (
+            "path-only: filtered world velocity projected toward the current "
+            "carrot regains 90% of the post-schedule/pre-application goal-progress "
+            "speed, with tilt <=20 deg; unresolved records are recovery-censored "
+            "when segment/dwell/floor-recovery protocol changes"),
         "events": force_events,
+        "scheduled_events_cancelled_before_application": (
+            force_cancelled_before_application),
         "active_env_steps": force_active_steps,
         "active_share": force_active_steps / float(max(total_steps * env.num_envs, 1)),
         "falls_during_force": force_context_falls,
         "events_with_outcome_record": len(fr["kind"]),
         "events_censored_or_overlapping": max(0, force_events - len(fr["kind"])),
+        "video_requested": bool(record_video),
+        "video_recorded_frames": int(video_recorded_frames),
+        "video_force_active_frames": int(video_force_active_frames),
+        "video_force_active_share": (
+            video_force_active_frames / float(video_recorded_frames)
+            if video_recorded_frames else 0.0),
+        "video_force_arrow_drawn_frames": int(video_force_arrow_drawn_frames),
+        "video_force_arrow_drawn_share": (
+            video_force_arrow_drawn_frames / float(video_recorded_frames)
+            if video_recorded_frames else 0.0),
+        "video_path_frames": int(video_path_frames),
+        "video_path_carrot_drawn_frames": int(video_path_carrot_drawn_frames),
+        "video_path_trace_drawn_frames": int(video_path_trace_drawn_frames),
         "overall": event_summary(),
+        "high_speed": event_summary(high_speed_only=True),
         "collision": event_summary(1),
         "support": event_summary(2),
     }
@@ -1079,7 +1724,8 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
 
 def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task,
               deterministic=True, perturbations=False, obs_noise=True,
-              exploratory=False, setup_wall_s=0.0, seed=0):
+              exploratory=False, setup_wall_s=0.0, seed=0,
+              task_state_protocol="config_fixed"):
     """Turn a rollout into gate verdicts plus the breakdowns needed to act on them."""
     eval_cfg = cfg.get("evaluation", {})
     gates = eval_cfg.get("gates", {})
@@ -1138,6 +1784,7 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
         "checkpoint": checkpoint,
         "config": config_path,
         "task": task,
+        "experiment_description": cfg.get("basic", {}).get("description", ""),
         "date": time.strftime("%Y-%m-%d %H:%M:%S"),
         "seed": seed,
         "num_envs": num_envs,
@@ -1146,7 +1793,17 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
         "perturbations": perturbations,
         "obs_noise": obs_noise,
         "authoritative_gate_evaluation": not exploratory,
+        "task_state_protocol": task_state_protocol,
+        "force_visualization_probe": bool(
+            eval_cfg.get("force_visualization_probe", False)),
+        "hbatch_protocol_version": eval_cfg.get("hbatch_protocol_version"),
+        "effective_eval_protocol_sha": eval_cfg.get(
+            "effective_eval_protocol_sha"),
+        "effective_disturbance_protocol": copy.deepcopy(
+            eval_cfg.get("effective_disturbance_protocol") or {}),
+        "hbatch_gates": dict(eval_cfg.get("hbatch_gates", {}) or {}),
         "env_code_sha": env_code_sha(),
+        "evaluation_protocol_sha": evaluation_protocol_sha(),
         # Symmetry / joint-margin telemetry. These were being written into
         # env.extras["v7"] and read by nothing, so every "we added the metric"
         # claim was hollow -- the numbers never reached a report.
@@ -1300,6 +1957,60 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
     else:
         results["body_speed"] = None
 
+    # ---- path floor/leash telemetry at control-step resolution ------------
+    # This is intentionally separate from segment-end path_tracking.  A carrot
+    # can violate the floor for a short interval and recover before resampling;
+    # only a streaming step metric can expose that failure mode.
+    path_hist = roll.get("path_step_hist") or {}
+    path_counts = roll.get("path_step_counts") or {}
+    path_hist_max = roll.get("path_step_hist_max") or {}
+    path_samples = int(path_counts.get("samples", 0))
+    if path_samples and path_hist:
+        ratio_max = float(path_hist_max.get("gap_over_lookahead", 4.0))
+        distance_max = float(path_hist_max.get("distance_m", 7.0))
+        steady_samples = int(path_counts.get("steady_samples", 0))
+        results["path_step_tracking"] = {
+            "scope": "post-step is_path_env, excluding dwell and reset steps",
+            "definition": (
+                "signed error = gap - per-env lookahead; floor deficit is its "
+                "negative magnitude, behind lag its positive magnitude; leash "
+                "uses the per-env runtime bound; dwell-resume recovery is "
+                "reported both included and excluded"),
+            "samples": path_samples,
+            "steady_samples_excluding_recovery": steady_samples,
+            "gap_over_lookahead_p2": _hist_pct(
+                path_hist["gap_over_lookahead"], ratio_max, 2),
+            "gap_over_lookahead_p50": _hist_pct(
+                path_hist["gap_over_lookahead"], ratio_max, 50),
+            "below_0p75_share": (
+                path_counts.get("below_0p75", 0) / float(path_samples)),
+            "dwell_resume_recovery_share": (
+                path_counts.get("dwell_resume_recovery", 0) / float(path_samples)),
+            "below_0p75_share_excluding_recovery": (
+                path_counts.get("steady_below_0p75", 0)
+                / float(steady_samples) if steady_samples > 0 else float("nan")),
+            "gap_m_p2": _hist_pct(path_hist["gap_m"], distance_max, 2),
+            "gap_m_p50": _hist_pct(path_hist["gap_m"], distance_max, 50),
+            "lookahead_m_p2": _hist_pct(
+                path_hist["lookahead_m"], distance_max, 2),
+            "lookahead_m_p50": _hist_pct(
+                path_hist["lookahead_m"], distance_max, 50),
+            "leash_m_p2": _hist_pct(path_hist["leash_m"], distance_max, 2),
+            "leash_m_p50": _hist_pct(path_hist["leash_m"], distance_max, 50),
+            "floor_deficit_m_p50": _hist_pct(
+                path_hist["floor_deficit_m"], distance_max, 50),
+            "floor_deficit_m_p90": _hist_pct(
+                path_hist["floor_deficit_m"], distance_max, 90),
+            "behind_lag_m_p50": _hist_pct(
+                path_hist["behind_lag_m"], distance_max, 50),
+            "behind_lag_m_p90": _hist_pct(
+                path_hist["behind_lag_m"], distance_max, 90),
+            "outside_leash_share": (
+                path_counts.get("outside_leash", 0) / float(path_samples)),
+        }
+    else:
+        results["path_step_tracking"] = None
+
     # ---- phase-conditioned high-speed stability --------------------------
     sh = roll.get("stability_hist") or {}
     sc = roll.get("stability_counts") or {}
@@ -1322,6 +2033,51 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
         }
     else:
         results["high_speed_stability"] = None
+
+    th = roll.get("touchdown_hist") or {}
+    tc = roll.get("touchdown_counts") or {}
+    tb = roll.get("touchdown_bounds") or {}
+    touchdown_samples = int(tc.get("samples", 0))
+    if th and touchdown_samples > 0:
+        heel_lo, heel_hi = tb.get("heel_x_body", [-0.40, 0.40])
+        speed_lo, speed_hi = tb.get("precontact_down_speed", [0.0, 4.0])
+        force_lo, force_hi = tb.get("contact_force", [0.0, 1000.0])
+        left_med = _hist_pct_range(
+            th["heel_x_left"], heel_lo, heel_hi, 50)
+        right_med = _hist_pct_range(
+            th["heel_x_right"], heel_lo, heel_hi, 50)
+        results["gait_touchdown"] = {
+            "scope": (
+                "first foot-contact transitions during forward path motion "
+                "(body vx above heel_strike.min_forward_speed_mps), excluding resets"),
+            "samples": touchdown_samples,
+            "heel_x_body_m": {
+                "p10": _hist_pct_range(
+                    th["heel_x_body"], heel_lo, heel_hi, 10),
+                "median": _hist_pct_range(
+                    th["heel_x_body"], heel_lo, heel_hi, 50),
+                "p90": _hist_pct_range(
+                    th["heel_x_body"], heel_lo, heel_hi, 90),
+            },
+            "ahead_of_trunk_share": tc.get("ahead", 0) / float(touchdown_samples),
+            "within_dynamic_target_one_sigma_share": (
+                tc.get("within_target_sigma", 0) / float(touchdown_samples)),
+            "overstride_share": tc.get("overstride", 0) / float(touchdown_samples),
+            "left_samples": int(th["heel_x_left"].sum()),
+            "right_samples": int(th["heel_x_right"].sum()),
+            "left_heel_x_median_m": left_med,
+            "right_heel_x_median_m": right_med,
+            "left_right_heel_x_median_abs_diff_m": (
+                abs(left_med - right_med)
+                if np.isfinite(left_med) and np.isfinite(right_med)
+                else float("nan")),
+            "precontact_down_speed_p90_mps": _hist_pct_range(
+                th["precontact_down_speed"], speed_lo, speed_hi, 90),
+            "contact_force_p90_n": _hist_pct_range(
+                th["contact_force"], force_lo, force_hi, 90),
+        }
+    else:
+        results["gait_touchdown"] = None
     results["disturbance_eval"] = roll.get("disturbance_eval") or {}
     mirror_hist = roll.get("mirror_error_hist")
     if mirror_hist is not None and mirror_hist.sum() > 0:
@@ -1348,10 +2104,19 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
         }
 
     if path_mask.any():
+        initial_speed = np.asarray(roll["initial_speed_mps"], dtype=float)
+        commanded_speed = np.asarray(roll["cmd_speed"], dtype=float)
+        from_rest = path_mask & np.isfinite(initial_speed) & (initial_speed <= 0.30)
         results["path_acceleration_response"] = {
-            "time_to_0p5": response_stats(roll["time_to_0p5_s"], path_mask),
-            "time_to_0p8": response_stats(roll["time_to_0p8_s"], path_mask),
-            "time_to_1p0": response_stats(roll["time_to_1p0_s"], path_mask),
+            "definition": (
+                "from-rest segments only (initial speed <=0.30 m/s), and only "
+                "when commanded path speed is at least the reported threshold"),
+            "time_to_0p5": response_stats(
+                roll["time_to_0p5_s"], from_rest & (commanded_speed >= 0.5)),
+            "time_to_0p8": response_stats(
+                roll["time_to_0p8_s"], from_rest & (commanded_speed >= 0.8)),
+            "time_to_1p0": response_stats(
+                roll["time_to_1p0_s"], from_rest & (commanded_speed >= 1.0)),
         }
     else:
         results["path_acceleration_response"] = None
@@ -1372,8 +2137,10 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
                 "phase_lo": b / 4.0,
                 "phase_hi": (b + 1) / 4.0,
                 "n": int(pm.sum()),
-                "time_to_0p5": response_stats(roll["time_to_0p5_s"], pm),
-                "time_to_1p0": response_stats(roll["time_to_1p0_s"], pm),
+                "time_to_0p5": response_stats(
+                    roll["direction_time_to_0p5_s"], pm),
+                "time_to_1p0": response_stats(
+                    roll["direction_time_to_1p0_s"], pm),
             })
         results["directional_response"] = {
             "pattern": goal_pattern,
@@ -1383,9 +2150,15 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
             "min_speed_first_2s_mps": {
                 "median": _median(min2[np.isfinite(min2)]),
                 "p10": _pct(min2[np.isfinite(min2)], 10)},
-            "time_to_0p5": response_stats(roll["time_to_0p5_s"], response_mask),
-            "time_to_0p8": response_stats(roll["time_to_0p8_s"], response_mask),
-            "time_to_1p0": response_stats(roll["time_to_1p0_s"], response_mask),
+            "speed_definition": (
+                "filtered world velocity projected onto the initial new-goal "
+                "direction; continuing quickly in the old direction does not count"),
+            "time_to_0p5": response_stats(
+                roll["direction_time_to_0p5_s"], response_mask),
+            "time_to_0p8": response_stats(
+                roll["direction_time_to_0p8_s"], response_mask),
+            "time_to_1p0": response_stats(
+                roll["direction_time_to_1p0_s"], response_mask),
             "by_switch_gait_quarter": phase_rows,
         }
     else:
@@ -1524,14 +2297,36 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
     else:
         results["fall_analysis"] = None
 
+    classified_falls = int(len(fc["category"]))
+    fall_classification_complete = classified_falls == falls
     path_falls = (results["fall_analysis"]["per_category"].get("path", 0)
                   if results["fall_analysis"] else 0)
+    waypoint_falls = max(0, classified_falls - int(path_falls))
     path_attempts = int(path_mask.sum()) + int(path_falls)
+    waypoint_attempts = int(waypoint_mask.sum()) + int(waypoint_falls)
+    overall_attempts = n + falls
     results["path_safety"] = {
         "falls": int(path_falls),
         "attempts_completed_plus_falls": path_attempts,
+        "fall_classification_complete": fall_classification_complete,
         "falls_per_1000_attempts": (
-            1000.0 * path_falls / path_attempts if path_attempts else float("nan")),
+            1000.0 * path_falls / path_attempts
+            if fall_classification_complete and path_attempts else float("nan")),
+    }
+    results["waypoint_safety"] = {
+        "falls": int(waypoint_falls),
+        "attempts_completed_plus_falls": waypoint_attempts,
+        "fall_classification_complete": fall_classification_complete,
+        "falls_per_1000_attempts": (
+            1000.0 * waypoint_falls / waypoint_attempts
+            if fall_classification_complete and waypoint_attempts else float("nan")),
+    }
+    results["overall_safety"] = {
+        "falls": falls,
+        "attempts_completed_plus_falls": overall_attempts,
+        "falls_per_1000_attempts": (
+            1000.0 * falls / overall_attempts
+            if overall_attempts else float("nan")),
     }
 
     results["recommendations"] = recommend(results, cfg)
@@ -1541,14 +2336,144 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
 def gate_ratios(results):
     """Normalized distance-to-passing per gate (<=1 means passing). Used to rank
     checkpoints: the worst ratio is 'how far from passing everything' this is."""
+    def upper(value, limit):
+        try:
+            value, limit = float(value), float(limit)
+        except (TypeError, ValueError):
+            return float("inf")
+        return (value / max(limit, 1.0e-9)
+                if np.isfinite(value) and np.isfinite(limit) else float("inf"))
+
+    def lower(value, limit):
+        try:
+            value, limit = float(value), float(limit)
+        except (TypeError, ValueError):
+            return float("inf")
+        return (limit / max(value, 1.0e-9)
+                if np.isfinite(value) and np.isfinite(limit) else float("inf"))
+
     g = results["gates"]
-    fall_ref = max(results["segments_completed"], 1) * 0.002  # 0.2% of attempts as the soft reference
-    return {
-        "pos_median": g["pos_median"]["value"] / max(g["pos_median"]["limit"], 1e-9),
-        "pos_p90": g["pos_p90"]["value"] / max(g["pos_p90"]["limit"], 1e-9),
-        "heading_median": g["heading_median"]["value"] / max(g["heading_median"]["limit"], 1e-9),
-        "falls": results["falls"] / max(fall_ref, 1e-9),
-    }
+    hg = results.get("hbatch_gates") or {}
+    if hg:
+        path = results.get("path_tracking") or {}
+        safety = results.get("path_safety") or {}
+        waypoint_safety = results.get("waypoint_safety") or {}
+        overall_safety = results.get("overall_safety") or {}
+        failure_modes = results.get("failure_modes") or {}
+        step = results.get("path_step_tracking") or {}
+        accel = (results.get("path_acceleration_response") or {}).get(
+            "time_to_1p0") or {}
+        ratios = {
+            # H has a documented G1 preservation exam.  Do not also inject the
+            # legacy 5 cm / zero-fall MASTERPLAN gate: that makes the H0
+            # acceptance criteria internally contradictory.
+            "h_waypoint_pos_median": upper(
+                results.get("pos_err_m", {}).get("median", float("nan")),
+                hg.get("waypoint_pos_median_max_m", 0.0552)),
+            "h_waypoint_pos_p90": upper(
+                results.get("pos_err_m", {}).get("p90", float("nan")),
+                hg.get("waypoint_pos_p90_max_m", 0.0742)),
+            "h_waypoint_heading_median": upper(
+                results.get("heading_err_deg", {}).get(
+                    "median", float("nan")),
+                hg.get("waypoint_heading_median_max_deg", 2.54)),
+            "h_waypoint_never_arrived": upper(
+                (failure_modes.get("never_arrived") or {}).get(
+                    "share", float("nan")),
+                hg.get("waypoint_never_arrived_share_max", 0.015)),
+            "h_overall_falls": upper(
+                overall_safety.get("falls_per_1000_attempts", float("nan")),
+                hg.get("overall_falls_per_1000_max", 5.0)),
+            "h_waypoint_falls": upper(
+                waypoint_safety.get("falls_per_1000_attempts", float("nan")),
+                hg.get("waypoint_falls_per_1000_max", 2.0)),
+            "h_path_speed": lower(
+                path.get("mean_speed_median", float("nan")),
+                hg.get("path_speed_median_min", 0.95)),
+            "h_path_falls": upper(
+                safety.get("falls_per_1000_attempts", float("nan")),
+                hg.get("path_falls_per_1000_max", 5.0)),
+            "h_path_steady_samples": (
+                0.0 if step.get("steady_samples_excluding_recovery", 0) > 0
+                else float("inf")),
+            "h_path_floor": upper(
+                step.get("below_0p75_share_excluding_recovery", float("nan")),
+                hg.get("path_floor_below_0p75_max", 0.10)),
+            "h_path_recovery_share": upper(
+                step.get("dwell_resume_recovery_share", float("nan")),
+                hg.get("path_dwell_resume_recovery_share_max", 0.15)),
+            "h_path_leash": upper(
+                step.get("outside_leash_share", float("nan")),
+                hg.get("path_outside_leash_max", 0.01)),
+            "h_from_rest_t1_reached": lower(
+                accel.get("reached_share", float("nan")),
+                hg.get("time_to_1mps_reached_share_min", 0.80)),
+            "h_from_rest_t1_p90": upper(
+                accel.get("p90_s", float("nan")),
+                hg.get("time_to_1mps_p90_s_max", 3.0)),
+        }
+        desc = str(results.get("experiment_description", ""))
+        if desc.startswith("H1_") or desc.startswith("H2_"):
+            mirror = results.get("symmetry_eval") or {}
+            stable = results.get("high_speed_stability") or {}
+            gait = results.get("gait_touchdown") or {}
+            ratios.update({
+                "h_mirror_p90": upper(
+                    mirror.get("p90", float("nan")),
+                    hg.get("mirror_error_p90_max", 0.10)),
+                # H1 is H2's parent.  If checkpoint selection lets H1 win with
+                # no valid cruise samples, the cross-arm comparator cannot tell
+                # whether H2 preserved or improved high-speed behaviour.
+                "h_cruise_coverage": lower(
+                    stable.get("cruise_share_of_valid", float("nan")),
+                    hg.get("cruise_share_of_valid_min", 0.05)),
+                "h_touchdown_samples": lower(
+                    gait.get("samples", float("nan")),
+                    hg.get("touchdown_samples_min", 100)),
+                "h_touchdown_lr_bias": upper(
+                    gait.get("left_right_heel_x_median_abs_diff_m", float("nan")),
+                    hg.get("touchdown_lr_bias_max_m", 0.02)),
+            })
+        if desc.startswith("H2_"):
+            stable = results.get("high_speed_stability") or {}
+            ratios.update({
+                "h_cruise_pitch": upper(
+                    stable.get("cruise_pitch_abs_p90_deg", float("nan")),
+                    hg.get("cruise_pitch_p90_max_deg", 20.0)),
+                "h_cruise_roll": upper(
+                    stable.get("cruise_roll_abs_p90_deg", float("nan")),
+                    hg.get("cruise_roll_p90_max_deg", 15.0)),
+                "h_cruise_ang_xy": upper(
+                    stable.get("cruise_ang_xy_p90_radps", float("nan")),
+                    hg.get("cruise_ang_xy_p90_max_radps", 3.0)),
+            })
+        if desc.startswith("H3_"):
+            gait = results.get("gait_touchdown") or {}
+            ratios.update({
+                # Selection must optimize the lever H3 actually changes;
+                # cross-arm H0 non-regression remains a later full-suite gate.
+                "h_touchdown_samples": lower(
+                    gait.get("samples", float("nan")),
+                    hg.get("touchdown_samples_min", 100)),
+                "h_touchdown_target": lower(
+                    gait.get("within_dynamic_target_one_sigma_share", float("nan")),
+                    hg.get("touchdown_target_share_min", 0.40)),
+                "h_touchdown_overstride": upper(
+                    gait.get("overstride_share", float("nan")),
+                    hg.get("touchdown_overstride_share_max", 0.10)),
+            })
+    else:
+        fall_ref = max(results["segments_completed"], 1) * 0.002
+        ratios = {
+            "pos_median": upper(
+                g["pos_median"]["value"], g["pos_median"]["limit"]),
+            "pos_p90": upper(
+                g["pos_p90"]["value"], g["pos_p90"]["limit"]),
+            "heading_median": upper(
+                g["heading_median"]["value"], g["heading_median"]["limit"]),
+            "falls": upper(results["falls"], fall_ref),
+        }
+    return ratios
 
 
 # --------------------------------------------------------------------------
@@ -1672,7 +2597,11 @@ def recommend(r, cfg):
                        r["falls"], r["gates"]["falls"]["limit"], detail, rw.get("terminate_height", "?")))
 
     if r["all_gates_pass"]:
-        out.append("게이트 전부 통과 → 영상 확인 후 milestone 4(export + MuJoCo 검증)로 진행.")
+        if r.get("hbatch_gates"):
+            out.append("legacy MASTERPLAN 게이트는 통과했다. H arm 채택은 아직 별개이므로 "
+                       "7-report suite와 H0–H3 cross-arm 비교까지 완료할 것.")
+        else:
+            out.append("게이트 전부 통과 → 영상 확인 후 milestone 4(export + MuJoCo 검증)로 진행.")
 
     out.append("눈으로 확인: `python eval_goal_pose.py ... --record_video` (env 0을 mp4로 저장) 또는 로컬에서 `play.py`.")
     return out
@@ -1701,6 +2630,11 @@ def render_report(r):
     md.append("")
     md.append("- checkpoint: `{}`".format(r["checkpoint"]))
     md.append("- config: `{}`".format(r["config"]))
+    md.append("- task-state protocol: `{}`".format(
+        r.get("task_state_protocol", "config_fixed")))
+    if r.get("effective_eval_protocol_sha"):
+        md.append("- effective eval protocol: `{}`".format(
+            r["effective_eval_protocol_sha"]))
     md.append("- 조건: {} envs × {:.0f}s, {} 정책, 외란 {}, 관측노이즈 {}, seed {}".format(
         r["num_envs"], r["duration_s"],
         "결정론적" if r["deterministic"] else "확률적",
@@ -1739,7 +2673,12 @@ def render_report(r):
         ])
     md.append("")
     if r["authoritative_gate_evaluation"]:
-        md.append("**종합: {}**".format("✅ 전체 게이트 통과" if r["all_gates_pass"] else "❌ 미통과 게이트 있음"))
+        if r.get("hbatch_gates"):
+            md.append("**legacy MASTERPLAN 참고 판정: {} (H 채택은 full-suite cross-arm gate에서 별도 판정)**"
+                      .format("✅ 통과" if r["all_gates_pass"] else "❌ 미통과"))
+        else:
+            md.append("**종합: {}**".format(
+                "✅ 전체 게이트 통과" if r["all_gates_pass"] else "❌ 미통과 게이트 있음"))
     else:
         md.append("**탐색 결과: {} (표본/조건이 표준 프로토콜이 아니므로 공식 판정 아님)**".format(
             "모든 수치 기준 충족" if r["all_gates_pass"] else "미충족 수치 있음"))
@@ -1749,6 +2688,36 @@ def render_report(r):
                   "moving-carrot 과제라 final position error가 도착 오차가 아니며, 아래 `path 추종` "
                   "섹션의 lag/speed 지표로 따로 본다.")
     md.append("")
+
+    overall_safety = r.get("overall_safety") or {}
+    waypoint_safety = r.get("waypoint_safety") or {}
+    path_safety = r.get("path_safety") or {}
+    if overall_safety:
+        md.append("## 낙상 안전성 — survivor bias 보정")
+        md.append("")
+        md.append("완료 구간만 분모로 쓰면 낙상한 시도가 사라지므로 `완료+낙상`을 "
+                  "attempt로 센다. fall context 분류 완전성: **{}**.".format(
+                      "PASS" if path_safety.get(
+                          "fall_classification_complete", False) else "FAIL"))
+        md.append("")
+        md += _table(
+            ["범위", "falls / attempts", "falls / 1000 attempts"],
+            [["전체", "{} / {}".format(
+                overall_safety.get("falls", 0),
+                overall_safety.get("attempts_completed_plus_falls", 0)),
+              "{:.3f}".format(overall_safety.get(
+                  "falls_per_1000_attempts", float("nan")))],
+             ["waypoint", "{} / {}".format(
+                waypoint_safety.get("falls", 0),
+                waypoint_safety.get("attempts_completed_plus_falls", 0)),
+              "{:.3f}".format(waypoint_safety.get(
+                  "falls_per_1000_attempts", float("nan")))],
+             ["path", "{} / {}".format(
+                path_safety.get("falls", 0),
+                path_safety.get("attempts_completed_plus_falls", 0)),
+              "{:.3f}".format(path_safety.get(
+                  "falls_per_1000_attempts", float("nan")))]])
+        md.append("")
 
     hs = r.get("high_speed_stability")
     if hs:
@@ -1774,9 +2743,12 @@ def render_report(r):
     if pa:
         md.append("## path 가속 응답")
         md.append("")
+        md.append(pa.get("definition", ""))
+        md.append("")
         md += _table(
             ["임계", "도달 비율", "도달한 구간 p50 / p90"],
-            [[label, "{:.1f}%".format(100 * pa[key]["reached_share"]),
+            [[label, "{:.1f}% (n={})".format(
+                100 * pa[key]["reached_share"], pa[key]["eligible"]),
               "{:.2f} / {:.2f} s".format(pa[key]["p50_s"], pa[key]["p90_s"])]
              for label, key in (("0.5 m/s", "time_to_0p5"),
                                 ("0.8 m/s", "time_to_0p8"),
@@ -1793,6 +2765,7 @@ def render_report(r):
             dr["initial_goal_bearing_abs_deg"]["p90"]))
         md.append("- 시작 후 2 s 내 최저속도 median/p10 {:.2f}/{:.2f} m/s".format(
             dr["min_speed_first_2s_mps"]["median"], dr["min_speed_first_2s_mps"]["p10"]))
+        md.append("- 응답 속도 정의: {}".format(dr.get("speed_definition", "goal-direction closing speed")))
         md += _table(
             ["임계", "도달 비율", "p50 / p90"],
             [[label, "{:.1f}%".format(100 * dr[key]["reached_share"]),
@@ -1813,22 +2786,52 @@ def render_report(r):
                       sy["median"], sy["p90"], sy["p99"], sy["samples"]))
         md.append("")
 
+    td = r.get("gait_touchdown")
+    if td:
+        md.append("## 첫 접지 heel / impact")
+        md.append("")
+        md.append(td.get("scope", ""))
+        md.append("")
+        md += _table(
+            ["지표", "값"],
+            [["표본", td["samples"]],
+             ["heel이 trunk보다 앞", "{:.1f}%".format(
+                 100 * td["ahead_of_trunk_share"])],
+             ["dynamic target ±1σ", "{:.1f}%".format(
+                 100 * td["within_dynamic_target_one_sigma_share"])],
+             ["heel x body p10 / med / p90", "{:.3f} / {:.3f} / {:.3f} m".format(
+                 td["heel_x_body_m"]["p10"], td["heel_x_body_m"]["median"],
+                 td["heel_x_body_m"]["p90"])],
+             ["left/right heel median 차이", "{:.3f} m".format(
+                 td["left_right_heel_x_median_abs_diff_m"])],
+             ["overstride", "{:.1f}%".format(100 * td["overstride_share"])],
+             ["접지 직전 하강속도 p90", "{:.2f} m/s".format(
+                 td["precontact_down_speed_p90_mps"])],
+             ["접지 force p90", "{:.1f} N".format(
+                 td["contact_force_p90_n"])]])
+        md.append("")
+
     de = r.get("disturbance_eval") or {}
     if de:
         md.append("## 외력 노출 감사")
         md.append("")
         md.append("- 감지된 force event: {}회; 외력 active env-step 비율 {:.2f}%".format(
             de.get("events", 0), 100 * de.get("active_share", 0.0)))
+        md.append("- physics 적용 전 reset으로 취소된 schedule: {}회 (event/outcome에서 제외)".format(
+            de.get("scheduled_events_cancelled_before_application", 0)))
         md.append("- 외력 인가 중 낙상: {}회".format(de.get("falls_during_force", 0)))
         md.append("- 5 s outcome record {} / censored·overlap {}".format(
             de.get("events_with_outcome_record", 0), de.get("events_censored_or_overlapping", 0)))
         rows = []
-        for label, key in (("전체", "overall"), ("충돌", "collision"), ("support", "support")):
+        for label, key in (("전체", "overall"), ("고속", "high_speed"),
+                           ("충돌", "collision"), ("support", "support")):
             e = de.get(key) or {}
             if e.get("records", 0):
                 rows.append([
-                    label, e["records"], "{:.1f}/{:.1f}%".format(
-                        100 * e["survival_2s"], 100 * e["survival_5s"]),
+                    label, e["records"], "{:.1f}/{:.1f}% ({}/{})".format(
+                        100 * e["survival_2s"], 100 * e["survival_5s"],
+                        e.get("survival_2s_eligible", 0),
+                        e.get("survival_5s_eligible", 0)),
                     "{:.1f}".format(e["impulse_ns_p90"]),
                     "{:.1f}°".format(e["max_tilt_deg_p90"]),
                     "{:.2f}".format(e["speed_loss_mps_p90"]),
@@ -1837,10 +2840,21 @@ def render_report(r):
                 ])
         if rows:
             md += _table(
-                ["유형", "n", "2s/5s 생존", "impulse p90 N·s", "max tilt p90",
+                ["유형", "n", "2s/5s 생존 (denom)", "impulse p90 N·s", "max tilt p90",
                  "speed loss p90", "90% 회복≤5s / p90"], rows)
         if de.get("events", 0) == 0:
             md.append("- ⚠️ 외력 event가 0회이므로 이 report는 충돌 강건성 근거로 사용할 수 없다.")
+        if de.get("video_requested", False):
+            recorded = int(de.get("video_recorded_frames", 0))
+            active = int(de.get("video_force_active_frames", 0))
+            drawn = int(de.get("video_force_arrow_drawn_frames", 0))
+            if recorded:
+                md.append("- 영상 env0 외력 물리 frame: **{} / {}** ({:.1f}%); "
+                          "renderer가 실제 화면 안에 그린 빨간 화살표: **{} frame**."
+                          .format(active, recorded,
+                                  100 * de.get("video_force_active_share", 0.0), drawn))
+            else:
+                md.append("- ❌ 영상을 요청했지만 실제 기록 frame이 0개다. 외력 화살표 가시성을 검증할 수 없다.")
         md.append("")
 
     bs = r.get("body_speed")
@@ -1898,6 +2912,41 @@ def render_report(r):
         else:
             md.append("> 📌 모든 구간에서 추종비 0.75 이상 — **아직 한계에 도달하지 않았다.** "
                       "`commands.path.speed_range_mps` 상단을 더 올려 한계를 찾을 것.")
+        md.append("")
+
+    pst = r.get("path_step_tracking")
+    if pst:
+        md.append("## path step floor/leash 감사")
+        md.append("")
+        md.append("각 control step의 running path만 집계한다(dwell/reset 제외). 전역 최소값이 아니라 "
+                  "**각 env가 실제로 샘플한 lookahead와 leash**를 사용한다. "
+                  "signed error `gap-lookahead`가 음수면 floor deficit, 양수면 behind lag다.")
+        md.append("")
+        md += _table(
+            ["step 지표", "값"],
+            [["유효 running path sample", pst["samples"]],
+             ["gap/lookahead p2 / p50", "{:.3f} / {:.3f}".format(
+                 pst["gap_over_lookahead_p2"], pst["gap_over_lookahead_p50"])],
+             ["gap/lookahead < 0.75", "{:.2f}%".format(
+                 100 * pst["below_0p75_share"])],
+             ["dwell-resume floor 복구 중", "{:.2f}%".format(
+                 100 * pst["dwell_resume_recovery_share"])],
+             ["복구 transition 제외 gap/lookahead < 0.75", "{:.2f}%".format(
+                 100 * pst["below_0p75_share_excluding_recovery"])],
+             ["gap p2 / p50", "{:.3f} / {:.3f} m".format(
+                 pst["gap_m_p2"], pst["gap_m_p50"])],
+             ["per-env lookahead p2 / p50", "{:.3f} / {:.3f} m".format(
+                 pst["lookahead_m_p2"], pst["lookahead_m_p50"])],
+             ["per-env leash p2 / p50", "{:.3f} / {:.3f} m".format(
+                 pst["leash_m_p2"], pst["leash_m_p50"])],
+             ["floor deficit p50 / p90", "{:.1f} / {:.1f} cm".format(
+                 100 * pst["floor_deficit_m_p50"],
+                 100 * pst["floor_deficit_m_p90"])],
+             ["behind lag p50 / p90", "{:.1f} / {:.1f} cm".format(
+                 100 * pst["behind_lag_m_p50"],
+                 100 * pst["behind_lag_m_p90"])],
+             ["per-env leash 밖", "{:.2f}%".format(
+                 100 * pst["outside_leash_share"])]])
         md.append("")
 
     pt = r.get("path_tracking")
@@ -2052,8 +3101,18 @@ def _hist_pct(hist, hist_max, p):
     return float(edges[min(idx, len(edges) - 1)])
 
 
+def _hist_pct_range(hist, lo, hi, p):
+    if hist.sum() == 0:
+        return float("nan")
+    edges = lo + np.arange(len(hist)) * ((hi - lo) / len(hist))
+    cdf = np.cumsum(hist) / hist.sum()
+    idx = int(np.searchsorted(cdf, p / 100.0))
+    return float(edges[min(idx, len(edges) - 1)])
+
+
 def summarize_stress(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path,
-                     task, mode, perturbations, setup_wall_s, seed):
+                     task, mode, perturbations, setup_wall_s, seed,
+                     task_state_protocol="config_fixed"):
     """Stress runs are scored on survival and oscillation, not on the gates.
 
     Under 50 Hz goal jitter the goal's expectation IS the robot's neighbourhood,
@@ -2069,6 +3128,18 @@ def summarize_stress(roll, cfg, num_envs, duration_s, dt, checkpoint, config_pat
         "task": task, "config": config_path, "checkpoint": checkpoint,
         "date": time.strftime("%Y-%m-%d %H:%M:%S"), "mode": "stress:" + mode,
         "authoritative_gate_evaluation": False,
+        "task_state_protocol": task_state_protocol,
+        "env_code_sha": env_code_sha(),
+        "evaluation_protocol_sha": evaluation_protocol_sha(),
+        "force_visualization_probe": bool(
+            cfg.get("evaluation", {}).get("force_visualization_probe", False)),
+        "hbatch_protocol_version": cfg.get("evaluation", {}).get(
+            "hbatch_protocol_version"),
+        "effective_eval_protocol_sha": cfg.get("evaluation", {}).get(
+            "effective_eval_protocol_sha"),
+        "effective_disturbance_protocol": copy.deepcopy(
+            cfg.get("evaluation", {}).get(
+                "effective_disturbance_protocol") or {}),
         "num_envs": num_envs, "duration_s": duration_s, "seed": seed,
         "perturbations": bool(perturbations),
         "env_minutes": env_min,
@@ -2086,6 +3157,10 @@ def summarize_stress(roll, cfg, num_envs, duration_s, dt, checkpoint, config_pat
     md = ["# GoalPose 강건성 스트레스 리포트 ({}) — {}".format(mode, results["date"]), ""]
     md.append("- checkpoint: `{}`".format(checkpoint))
     md.append("- config: `{}`".format(config_path))
+    md.append("- task-state protocol: `{}`".format(task_state_protocol))
+    if results.get("effective_eval_protocol_sha"):
+        md.append("- effective eval protocol: `{}`".format(
+            results["effective_eval_protocol_sha"]))
     md.append("- 조건: {} envs × {:.0f}s, 목표를 매 제어스텝(50 Hz) ±3 m 균일 재추첨, 외란 {}".format(
         num_envs, duration_s, "ON" if perturbations else "OFF"))
     md.append("- 누적 관측 시간: {:.0f} env·분".format(env_min))
@@ -2104,6 +3179,14 @@ def summarize_stress(roll, cfg, num_envs, duration_s, dt, checkpoint, config_pat
                           100 * overall["recovery_90_within_5s_share"]))
         if de.get("events", 0) == 0:
             md.append("- ❌ 외력을 켰지만 event가 0회다. 이 결과를 combined robustness로 채택하지 않는다.")
+        if de.get("video_requested", False):
+            recorded = int(de.get("video_recorded_frames", 0))
+            active = int(de.get("video_force_active_frames", 0))
+            drawn = int(de.get("video_force_arrow_drawn_frames", 0))
+            md.append("- 영상 env0 외력 물리 frame {} / {} ({:.1f}%); "
+                      "renderer-confirmed 빨간 화살표 {} frame".format(
+                          active, recorded,
+                          100 * de.get("video_force_active_share", 0.0), drawn))
         md.append("")
     md.append("> ⚠️ **이 리포트에는 위치오차 게이트가 없다.** 목표가 50 Hz로 무작위 재추첨되면 "
               "참값 목표의 기댓값이 로봇 주변이 되어 위치오차는 정책이 아니라 샘플러를 측정한다. "
@@ -2163,13 +3246,17 @@ def write_outputs(out_dir, results, roll, report_md, env=None, cfg=None):
                     "start_dist_m", "duration_s", "min_dist_m", "along_err_m", "cross_err_m",
                     "peak_speed_mps", "mean_speed_mps", "cmd_speed_mps", "path_lag_m",
                     "time_to_0p5_s", "time_to_0p8_s", "time_to_1p0_s",
-                    "min_speed_first_2s", "initial_goal_bearing_rad", "switch_gait_phase"])
+                    "direction_time_to_0p5_s", "direction_time_to_0p8_s",
+                    "direction_time_to_1p0_s", "min_speed_first_2s",
+                    "initial_speed_mps", "initial_goal_bearing_rad", "switch_gait_phase"])
         rows = zip(roll["pos_err"], np.degrees(roll["head_err"]), roll["speed"],
                    roll["category"], roll["start_dist"], roll["duration_s"],
                    roll["min_dist"], roll["along"], roll["cross"],
                    roll["peak_speed"], roll["mean_speed"], roll["cmd_speed"],
                    roll["path_lag"], roll["time_to_0p5_s"], roll["time_to_0p8_s"],
-                   roll["time_to_1p0_s"], roll["min_speed_first_2s"],
+                   roll["time_to_1p0_s"], roll["direction_time_to_0p5_s"],
+                   roll["direction_time_to_0p8_s"], roll["direction_time_to_1p0_s"],
+                   roll["min_speed_first_2s"], roll["initial_speed_mps"],
                    roll["initial_goal_bearing_rad"], roll["switch_gait_phase"])
         for row in rows:
             w.writerow([CATEGORY_NAMES.get(int(c), c) if i == 3 else "{:.4f}".format(c)
@@ -2198,14 +3285,21 @@ def write_outputs(out_dir, results, roll, report_md, env=None, cfg=None):
         video_path = os.path.join(out_dir, "rollout_env0.mp4")
         perspective = bool(cfg.get("evaluation", {}).get("perspective_overlays", False))
         path_trace = []
+        last_path_segment = None
         camera_poses = getattr(env, "camera_poses", [])
         fov = float(getattr(env, "camera_horizontal_fov", 75.0))
         with imageio.get_writer(video_path, fps=int(1.0 / env.dt)) as writer:
             for i, (frame, st) in enumerate(zip(env.camera_frames, roll["overlay_states"])):
                 if len(st) >= 16 and int(st[15]) == CATEGORY_PATH:
+                    segment = int(st[16]) if len(st) >= 17 else None
+                    if (last_path_segment is not None and segment is not None
+                            and segment != last_path_segment):
+                        path_trace = []
                     path_trace.append(np.asarray(st[2]).copy())
+                    last_path_segment = segment
                 elif path_trace:
                     path_trace = []
+                    last_path_segment = None
                 if perspective and i < len(camera_poses):
                     f = draw_perspective_scene(frame.copy(), st, camera_poses[i], fov, path_trace)
                 else:
@@ -2229,6 +3323,10 @@ def main():
     parser.add_argument("--task", default="K1/Goal_Pose")
     parser.add_argument("--config", help="evaluation yaml (default: envs/<task>.yaml); use a run's config.yaml for native-dynamics preview")
     parser.add_argument("--checkpoint", default="-1", help=".pth path, or -1 for the latest under logs/")
+    parser.add_argument(
+        "--restore_task_state", action="store_true",
+        help="restore checkpoint curriculum/grid state for a native-resume diagnostic; "
+             "default evaluation keeps the config-defined protocol fixed")
     parser.add_argument("--num_envs", type=int, help="override evaluation.num_envs from the yaml")
     parser.add_argument("--duration_s", type=float, help="override evaluation.duration_s from the yaml")
     parser.add_argument("--sim_device", help="override yaml sim_device")
@@ -2239,6 +3337,9 @@ def main():
     parser.add_argument("--no_noise", action="store_true", help="disable observation noise")
     parser.add_argument("--record_video", action="store_true", help="also record an mp4 of env 0 (first --record_video_s seconds)")
     parser.add_argument("--record_video_s", type=float, default=8.0)
+    parser.add_argument(
+        "--force_visualization_probe", action="store_true",
+        help="video-only HBatch protocol: path-only goals plus a guaranteed early support force")
     parser.add_argument("--feasible_speed", type=float, help="override evaluation.feasible_speed_mps (m/s) used by the feasibility check")
     parser.add_argument("--stress", choices=["jitter"], help="robustness stress mode instead of a gate evaluation. 'jitter': the true goal is redrawn uniformly in a +-3 m box every control step (50 Hz), modelling BT thrash / ball re-detection. Scored on falls and body oscillation -- position error is undefined in this mode.")
     parser.add_argument("--goal_pattern", choices=["lateral", "reverse"],
@@ -2259,7 +3360,8 @@ def main():
 
     prepare_cfg(cfg, args.task, num_envs, args.sim_device, args.rl_device,
                 record_video=args.record_video, keep_perturbations=args.keep_perturbations,
-                no_noise=args.no_noise, stress=args.stress, goal_pattern=args.goal_pattern)
+                no_noise=args.no_noise, stress=args.stress, goal_pattern=args.goal_pattern,
+                force_visualization_probe=args.force_visualization_probe)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -2291,7 +3393,8 @@ def main():
 
     env = build_env(cfg, args.task)
     device = cfg["basic"]["rl_device"]
-    model = load_policy(checkpoint, env, device)
+    model = load_policy(
+        checkpoint, env, device, restore_task_state=args.restore_task_state)
 
     setup_wall_s = time.perf_counter() - eval_started
     roll = rollout(env, model, int(duration_s / env.dt), device,
@@ -2302,7 +3405,9 @@ def main():
     if args.stress:
         results, report_md = summarize_stress(
             roll, cfg, num_envs, duration_s, env.dt, checkpoint, config_path,
-            args.task, args.stress, args.keep_perturbations, setup_wall_s, args.seed)
+            args.task, args.stress, args.keep_perturbations, setup_wall_s, args.seed,
+            task_state_protocol=getattr(
+                env, "eval_task_state_protocol", "config_fixed"))
         out_dir = args.out
         if not out_dir:
             run_dir = os.path.dirname(os.path.dirname(os.path.abspath(checkpoint)))
@@ -2322,8 +3427,11 @@ def main():
     results = summarize(
         roll, cfg, num_envs, duration_s, env.dt, checkpoint, config_path, args.task,
         deterministic=not args.stochastic, perturbations=bool(args.keep_perturbations),
-        obs_noise=not args.no_noise, exploratory=args.exploratory,
-        setup_wall_s=setup_wall_s, seed=args.seed)
+        obs_noise=not args.no_noise,
+        exploratory=(args.exploratory or args.force_visualization_probe),
+        setup_wall_s=setup_wall_s, seed=args.seed,
+        task_state_protocol=getattr(
+            env, "eval_task_state_protocol", "config_fixed"))
     report_md = render_report(results)
 
     out_dir = args.out

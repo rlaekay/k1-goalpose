@@ -195,9 +195,24 @@ class Runner:
         except Exception as e:
             print(f"Failed to load curriculum: {e}")
         try:
+            if hasattr(self.env, "load_checkpoint_state") and "env_state" in model_dict:
+                self.env.load_checkpoint_state(model_dict["env_state"])
+        except Exception as e:
+            raise RuntimeError("Failed to load task checkpoint state: {}".format(e))
+        try:
             self.optimizer.load_state_dict(model_dict["optimizer"])
         except Exception as e:
             print(f"Failed to load optimizer: {e}")
+
+    def _checkpoint_payload(self):
+        payload = {
+            "model": self.model.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "curriculum": self.env.curriculum_prob,
+        }
+        if hasattr(self.env, "get_checkpoint_state"):
+            payload["env_state"] = self.env.get_checkpoint_state()
+        return payload
 
     def train(self):
         self.recorder = Recorder(self.cfg)
@@ -307,27 +322,13 @@ class Runner:
             )
 
             if (it + 1) % self.cfg["runner"]["save_interval"] == 0:
-                self.recorder.save(
-                    {
-                        "model": self.model.state_dict(),
-                        "optimizer": self.optimizer.state_dict(),
-                        "curriculum": self.env.curriculum_prob,
-                    },
-                    it + 1,
-                )
+                self.recorder.save(self._checkpoint_payload(), it + 1)
             print("epoch: {}/{}".format(it + 1, self.cfg["basic"]["max_iterations"]))
 
             # graceful early stop: tools/auto_stop.py (or a human) drops a STOP file
             # into the run dir when the reward curve plateaus
             if os.path.exists(os.path.join(self.recorder.dir, "STOP")):
-                self.recorder.save(
-                    {
-                        "model": self.model.state_dict(),
-                        "optimizer": self.optimizer.state_dict(),
-                        "curriculum": self.env.curriculum_prob,
-                    },
-                    it + 1,
-                )
+                self.recorder.save(self._checkpoint_payload(), it + 1)
                 print("STOP file found in {}; saved checkpoint and stopped at iteration {}.".format(self.recorder.dir, it + 1))
                 break
 

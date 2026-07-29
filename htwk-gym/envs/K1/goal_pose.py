@@ -579,6 +579,12 @@ class GoalPose(BaseTask):
             dof_torques = torch.clip(dof_torques - friction, min=-self.torque_limits, max=self.torque_limits)
             self.torques += dof_torques
             self.gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(dof_torques))
+            # Isaac Gym consumes rigid-body force tensors for the immediate
+            # physics timestep only.  Tasks with a control-step disturbance
+            # schedule therefore have to re-submit the held wrench before each
+            # decimation substep; a single call after the loop would deliver
+            # only 1/decimation of the configured impulse.
+            self._apply_external_wrenches_substep()
             self.gym.simulate(self.sim)
             if self.device == "cpu":
                 self.gym.fetch_results(self.sim, True)
@@ -628,6 +634,10 @@ class GoalPose(BaseTask):
         self.last_feet_pos[:] = self.feet_pos
 
         return self.obs_buf, self.rew_buf, self.reset_buf, self.extras
+
+    def _apply_external_wrenches_substep(self):
+        """Optional task hook, called immediately before every physics tick."""
+        return
 
     def _kick_robots(self):
         """Random kick the robots. Emulates an impulse by setting a randomized base velocity."""
@@ -690,12 +700,30 @@ class GoalPose(BaseTask):
 
     def _check_termination(self):
         """Check if environments need to be reset"""
-        self.reset_buf = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1.0, dim=1)
-        self.reset_buf |= self.root_states[:, 7:13].square().sum(dim=-1) > self.cfg["rewards"]["terminate_vel"]
-        self.reset_buf |= self.base_pos[:, 2] - self.terrain.terrain_heights(self.base_pos) < self.cfg["rewards"]["terminate_height"]
-        self.time_out_buf = self.episode_length_buf > np.ceil(self.cfg["rewards"]["episode_length_s"] / self.dt)
-        self.reset_buf |= self.time_out_buf
-        self.time_out_buf |= self.episode_length_buf == self.cmd_resample_time
+        physical = torch.any(
+            torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1.0,
+            dim=1,
+        )
+        physical |= (self.root_states[:, 7:13].square().sum(dim=-1)
+                     > self.cfg["rewards"]["terminate_vel"])
+        physical |= (self.base_pos[:, 2] - self.terrain.terrain_heights(self.base_pos)
+                     < self.cfg["rewards"]["terminate_height"])
+        episode_timeout = self.episode_length_buf > np.ceil(
+            self.cfg["rewards"]["episode_length_s"] / self.dt)
+        segment_boundary = self.episode_length_buf == self.cmd_resample_time
+        self.reset_buf = physical | episode_timeout
+        # Segment boundaries are marked for PPO bootstrapping without resetting
+        # the simulator.  A physical fall on that same step must take priority;
+        # otherwise eval hides the fall and PPO bootstraps through a terminal
+        # state merely because the goal happened to resample simultaneously.
+        self.time_out_buf = (episode_timeout | segment_boundary) & ~physical
+        # _reset_idx() is not guaranteed to run with a non-empty id set, and
+        # this method replaces time_out_buf with a new tensor every step.  Keep
+        # extras synchronized here; otherwise PPO/eval can receive a stale mask
+        # from an earlier step and bootstrap the wrong transitions.
+        self.extras["time_outs"] = self.time_out_buf
+        self.extras["episode_time_outs"] = episode_timeout
+        self.extras["physical_failures"] = physical
 
     def _compute_reward(self):
         """Compute rewards

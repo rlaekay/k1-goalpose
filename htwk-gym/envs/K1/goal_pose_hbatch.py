@@ -57,6 +57,7 @@ class GoalPoseHBatch(GoalPoseV7):
             self.num_envs, device=self.device)
         self.dist_last_expected_torque_impulse = torch.zeros(
             self.num_envs, device=self.device)
+        self.dist_wrench_apply_calls = 0
 
     # H1/H2 reflect the robot about its local y=0 plane.  Policy observation
     # and actions are handled by GoalPoseV3; the asymmetric critic channels
@@ -160,8 +161,11 @@ class GoalPoseHBatch(GoalPoseV7):
                 duration = torch.where(is_collision,
                                        sample_pair(collision, "duration_s", [0.05, 0.10]),
                                        sample_pair(support, "duration_s", [0.5, 1.5]))
-                self.dist_last_expected_impulse[fire] = fmag * duration
-                self.dist_last_expected_torque_impulse[fire] = tmag * duration
+                duration_steps = torch.ceil(duration / self.dt).long().clamp(min=1)
+                applied_duration = duration_steps.float() * self.dt
+                self.dist_last_expected_impulse[fire] = fmag * applied_duration
+                self.dist_last_expected_torque_impulse[fire] = (
+                    tmag * applied_duration)
 
                 angle = torch_rand_float(-np.pi, np.pi, (k, 1), device=self.device).squeeze(1)
                 self.pushing_forces[fire, body, 0] = fmag * torch.cos(angle)
@@ -169,8 +173,19 @@ class GoalPoseHBatch(GoalPoseV7):
                 axis = torch_rand_float(-1.0, 1.0, (k, 3), device=self.device)
                 axis /= axis.norm(dim=-1, keepdim=True).clamp(min=1e-6)
                 self.pushing_torques[fire, body] = axis * tmag.unsqueeze(-1)
-                self.dist_steps_left[fire] = (duration / self.dt).long().clamp(min=1)
+                self.dist_steps_left[fire] = duration_steps
 
+    def _apply_external_wrenches_substep(self):
+        """Apply a held control-step wrench on every decimated physics tick.
+
+        ``apply_rigid_body_force_tensors`` is an immediate-timestep API.  The
+        event schedule remains at the 50 Hz control rate, while this hook makes
+        its configured duration/impulse real at the 500 Hz physics rate.
+        """
+        d = self.cfg["randomization"].get("disturbance") or {}
+        if not d.get("enabled", False):
+            return
+        self.dist_wrench_apply_calls += 1
         # ENV_SPACE keeps a long support push fixed in the world instead of
         # rotating the force vector with the robot.  It is still a wrench proxy,
         # not a second simulated robot collision.

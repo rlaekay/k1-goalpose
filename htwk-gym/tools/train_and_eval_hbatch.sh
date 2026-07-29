@@ -61,17 +61,29 @@ eval_one jitter --stress jitter --duration_s 60
 eval_one combined --stress jitter --keep_perturbations --duration_s 60
 eval_one lateral --goal_pattern lateral --duration_s 60
 eval_one reverse --goal_pattern reverse --duration_s 60
-eval_one video_force --keep_perturbations --record_video --record_video_s "$VIDEO_S"
+eval_one video_force --keep_perturbations --record_video --record_video_s "$VIDEO_S" \
+  --duration_s 10 --num_envs 16 --force_visualization_probe
+
+VIDEO_REPORT="$RUN_DIR/eval/video_force/report.json"
+VIDEO_MP4="$RUN_DIR/eval/video_force/rollout_env0.mp4"
+if [ ! -s "$VIDEO_MP4" ] || [ ! -s "$VIDEO_REPORT" ]; then
+  echo "!!! $ARM video_force is missing a nonempty mp4 or report" >&2
+  exit 1
+fi
+python -c 'import json,sys; d=json.load(open(sys.argv[1])); e=d.get("disturbance_eval",{}); assert e.get("video_recorded_frames",0)>0 and e.get("video_force_arrow_drawn_frames",0)>0 and e.get("video_path_carrot_drawn_frames",0)>0 and e.get("video_path_trace_drawn_frames",0)>0, e' "$VIDEO_REPORT"
 
 DEST="$SHARED_DIR/${ARM}_$(date +%Y%m%d-%H%M%S)"
-mkdir -p "$DEST"
-cp "$SELECT_DIR/BEST_CHECKPOINT" "$SELECT_DIR/selection.json" "$SELECT_DIR/selection.md" "$DEST/"
+PARTIAL="${DEST}-partial-$$"
+mkdir -p "$PARTIAL"
+cp "$SELECT_DIR/BEST_CHECKPOINT" "$SELECT_DIR/selection.json" "$SELECT_DIR/selection.md" "$PARTIAL/"
 for name in clean force jitter combined lateral reverse video_force; do
-  mkdir -p "$DEST/$name"
+  mkdir -p "$PARTIAL/$name"
   for f in report.json report.md segments.csv rollout_env0.mp4; do
-    [ ! -f "$RUN_DIR/eval/$name/$f" ] || cp "$RUN_DIR/eval/$name/$f" "$DEST/$name/"
+    [ ! -f "$RUN_DIR/eval/$name/$f" ] || cp "$RUN_DIR/eval/$name/$f" "$PARTIAL/$name/"
   done
 done
+touch "$PARTIAL/COMPLETE"
+mv "$PARTIAL" "$DEST"
 python tools/compare_hbatch_results.py --root "$SHARED_DIR" \
   --out "$SHARED_DIR/hbatch-comparison-codex.md"
 echo "HBatch $ARM complete: $DEST"

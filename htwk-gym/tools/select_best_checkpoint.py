@@ -44,6 +44,7 @@ import time
 import random
 import argparse
 import subprocess
+import copy
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -108,20 +109,60 @@ def score(results):
     on every gate means passing."""
     ratios = ev.gate_ratios(results)
     values = list(ratios.values())
-    return float(max(values)), float(np.mean(values)), ratios
+    # HBatch has a separate G1-preservation + robustness gate set.  Conjoining
+    # it with the legacy 5 cm / max_falls=0 flag makes documented H candidates
+    # structurally unable to pass even when every H ratio is <= 1.
+    legacy_gate_required = not bool(results.get("hbatch_gates"))
+    return (float(max(values)), float(np.mean(values)), ratios,
+            (not legacy_gate_required
+             or bool(results.get("all_gates_pass", False)))
+            and bool(values)
+            and all(np.isfinite(v) and v <= 1.0 for v in values))
 
 
 def rank_key(entry):
-    return (not entry["all_gates_pass"], entry["worst_ratio"], entry["mean_ratio"])
+    return (not entry["selection_gates_pass"],
+            entry["worst_ratio"], entry["mean_ratio"])
+
+
+def restore_paired_protocol(env, initial_task_state):
+    """Remove cross-candidate state before rollout() calls env.reset()."""
+    if initial_task_state is not None and hasattr(env, "load_checkpoint_state"):
+        env.load_checkpoint_state(initial_task_state)
+    for name in ("actions", "last_actions", "last_dof_vel", "torques"):
+        value = getattr(env, name, None)
+        if isinstance(value, torch.Tensor):
+            value.zero_()
+    if hasattr(env, "gait_process"):
+        env.gait_process.zero_()
+    if hasattr(env, "is_path_env"):
+        # Prevent the manual full reset from reporting the previous candidate's
+        # final path segment into the restored grid statistics.
+        env.is_path_env.zero_()
+    for name in ("track_ok_steps", "track_steps"):
+        value = getattr(env, name, None)
+        if isinstance(value, torch.Tensor):
+            value.zero_()
+    for name in ("goal_segment_id", "dist_event_serial"):
+        value = getattr(env, name, None)
+        if isinstance(value, torch.Tensor):
+            value.zero_()
+    env.common_step_counter = 0
+    if hasattr(env, "_path_advanced_at"):
+        env._path_advanced_at = -1
+    if hasattr(env, "_last_speed_adjust"):
+        env._last_speed_adjust = 0
 
 
 def evaluate_candidate(env, model, checkpoint, duration_s, cfg, config_path, task,
-                       num_envs, seed, authoritative, progress_every):
+                       num_envs, seed, authoritative, progress_every,
+                       initial_task_state=None):
     """One paired evaluation: identical seed, identical env, swapped weights."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
+    restore_paired_protocol(env, initial_task_state)
     device = cfg["basic"]["rl_device"]
     ev.load_policy(checkpoint, env, device, model=model, verbose=False)
     roll = ev.rollout(env, model, int(duration_s / env.dt), device,
@@ -132,6 +173,71 @@ def evaluate_candidate(env, model, checkpoint, duration_s, cfg, config_path, tas
     return results, roll
 
 
+def evaluate_hbatch_robustness(env, model, cfg, initial_task_state,
+                               disturbance_cfg, duration_s, seed):
+    """Paired short combined force+jitter screen for final H candidates."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    restore_paired_protocol(env, initial_task_state)
+
+    commands = cfg["commands"]
+    saved = {
+        "resampling_time_s": copy.deepcopy(commands["resampling_time_s"]),
+        "goal_dx": copy.deepcopy(commands["goal_dx"]),
+        "goal_dy": copy.deepcopy(commands["goal_dy"]),
+        "goal_categories": copy.deepcopy(commands.get("goal_categories")),
+        "goal_mode_mixture": copy.deepcopy(commands.get("goal_mode_mixture")),
+        "disturbance": copy.deepcopy(cfg["randomization"].get("disturbance")),
+        "path_share": getattr(env, "path_share", None),
+    }
+    try:
+        commands["resampling_time_s"] = [env.dt, 2.0 * env.dt]
+        commands["goal_dx"] = [-3.0, 3.0]
+        commands["goal_dy"] = [-3.0, 3.0]
+        if isinstance(commands.get("goal_categories"), dict):
+            commands["goal_categories"]["enabled"] = False
+        if isinstance(commands.get("goal_mode_mixture"), dict):
+            commands["goal_mode_mixture"] = {"waypoint": 1.0, "path": 0.0}
+        if hasattr(env, "path_share"):
+            env.path_share = 0.0
+        active_disturbance = copy.deepcopy(disturbance_cfg)
+        active_disturbance["enabled"] = True
+        active_disturbance["ramp_steps"] = 1
+        cfg["randomization"]["disturbance"] = active_disturbance
+        roll = ev.rollout(
+            env, model, int(duration_s / env.dt), cfg["basic"]["rl_device"],
+            progress_every=0, stress="jitter")
+    finally:
+        commands["resampling_time_s"] = saved["resampling_time_s"]
+        commands["goal_dx"] = saved["goal_dx"]
+        commands["goal_dy"] = saved["goal_dy"]
+        if saved["goal_categories"] is None:
+            commands.pop("goal_categories", None)
+        else:
+            commands["goal_categories"] = saved["goal_categories"]
+        if saved["goal_mode_mixture"] is None:
+            commands.pop("goal_mode_mixture", None)
+        else:
+            commands["goal_mode_mixture"] = saved["goal_mode_mixture"]
+        cfg["randomization"]["disturbance"] = saved["disturbance"]
+        if saved["path_share"] is not None:
+            env.path_share = saved["path_share"]
+
+    env_minutes = roll["env_minutes"]
+    ang_p90 = ev._hist_pct(
+        roll["angvel_hist"], roll["angvel_hist_max"], 90)
+    disturbance = roll.get("disturbance_eval") or {}
+    return {
+        "duration_s": duration_s,
+        "falls_per_env_min": roll["falls"] / max(env_minutes, 1.0e-9),
+        "body_angvel_p90": ang_p90,
+        "force_events": int(disturbance.get("events", 0)),
+        "force_survival_5s": (disturbance.get("overall") or {}).get(
+            "survival_5s", float("nan")),
+    }
+
+
 def render_selection(sel):
     md = []
     md.append("# 체크포인트 선택 결과 — {}".format(sel["date"]))
@@ -140,8 +246,11 @@ def render_selection(sel):
         len(sel["candidates"]), sel["total_checkpoints"], sel["tail_frac"] * 100))
     md.append("- 단계: {}".format(" → ".join(
         "{:.0f}s×{}개".format(s["duration_s"], s["n_candidates"]) for s in sel["stages"])))
-    md.append("- 조건: {} envs, seed {} 고정(모든 후보가 동일한 목표 시퀀스를 받음), 외란 OFF".format(
-        sel["num_envs"], sel["seed"]))
+    md.append("- 조건: {} envs, seed {} 고정(모든 후보가 동일한 목표 시퀀스를 받음), "
+              "clean screening".format(sel["num_envs"], sel["seed"]))
+    if sel.get("hbatch_robust_s", 0) > 0:
+        md.append("- HBatch 후반 후보에는 {:.0f}s paired combined force+jitter screen을 추가해 "
+                  "clean-only winner 편향을 막았다.".format(sel["hbatch_robust_s"]))
     md.append("- 총 벽시계 {:.1f}분 (전 후보 full-protocol 평가 대비 약 {:.1f}배 절약)".format(
         sel["wall_s"] / 60.0, sel["speedup_vs_bruteforce"]))
     md.append("")
@@ -155,7 +264,9 @@ def render_selection(sel):
     md.append("- iteration {} / 위치 median {:.1f} cm / p90 {:.1f} cm / heading {:.1f}° / 낙상 {}회".format(
         best["iteration"], best["pos_median"] * 100, best["pos_p90"] * 100,
         best["heading_median"], best["falls"]))
-    md.append("- 게이트: {}".format("✅ 전체 통과" if best["all_gates_pass"] else "❌ 미통과 있음"))
+    md.append("- 체크포인트 선택 screen: {} (direction/force-recovery/video/cross-arm은 "
+              "후속 full suite에서 별도 판정)".format(
+                  "✅ 통과" if best["selection_gates_pass"] else "❌ 미통과 있음"))
     if sel.get("tie_note"):
         md.append("- ⚠️ {}".format(sel["tie_note"]))
     if best["iteration"] != sel["final_iteration"]:
@@ -176,7 +287,7 @@ def render_selection(sel):
                 "{:.1f}".format(e["heading_median"]),
                 e["falls"],
                 "{:.2f}".format(e["worst_ratio"]),
-                "✅" if e["all_gates_pass"] else "—",
+                "✅" if e["selection_gates_pass"] else "—",
                 "진출" if e["advanced"] else "",
             ])
         md += ev._table(
@@ -212,6 +323,9 @@ def main():
     p.add_argument("--rl_device")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--progress_every", type=int, default=1000)
+    p.add_argument(
+        "--hbatch_robust_s", type=float, default=20.0,
+        help="paired combined force+jitter screen for final HBatch candidates")
     p.add_argument("--record_video", action="store_true",
                    help="after selecting, re-run eval_goal_pose.py on the winner to record an mp4")
     p.add_argument("--record_video_s", type=float, default=120.0)
@@ -254,6 +368,7 @@ def main():
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.load(f.read(), Loader=yaml.FullLoader)
     eval_cfg = cfg.setdefault("evaluation", {})
+    hbatch_profile = bool(eval_cfg.get("hbatch_gates"))
     num_envs = args.num_envs or eval_cfg.get("num_envs", 256)
     full_duration = eval_cfg.get("duration_s", 120.0)
 
@@ -281,6 +396,9 @@ def main():
         raise SystemExit("no checkpoints to evaluate")
 
     planned = len(candidates) * stages[0] + sum(k * d for k, d in zip(keep, stages[1:]))
+    if hbatch_profile and args.hbatch_robust_s > 0.0:
+        stage_counts = [len(candidates)] + keep
+        planned += args.hbatch_robust_s * sum(stage_counts[-2:])
     bruteforce = len(candidates) * full_duration
     print("candidates: {} (from {} checkpoints across {} run(s))".format(
         len(candidates), total_found, len(args.run_dir)))
@@ -291,12 +409,20 @@ def main():
 
     # ---- one environment, reused for every candidate ---------------------
     ev.prepare_cfg(cfg, args.task, num_envs, args.sim_device, args.rl_device)
+    # prepare_cfg replaces arm-specific training disturbances with HBatch's
+    # shared held-out exam profile.  Reuse that exact distribution for the
+    # paired combined screen so checkpoint selection and final cross-arm force
+    # reports do not test different policies at different difficulty levels.
+    common_eval_disturbance_cfg = copy.deepcopy(
+        cfg.get("randomization", {}).get("disturbance") or {})
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     env = ev.build_env(cfg, args.task)
     device = cfg["basic"]["rl_device"]
     model = ev.load_policy(candidates[0]["checkpoint"], env, device)
+    initial_task_state = (env.get_checkpoint_state()
+                          if hasattr(env, "get_checkpoint_state") else None)
 
     # ---- successive halving ----------------------------------------------
     alive = candidates
@@ -311,8 +437,54 @@ def main():
             print("  [{}/{}] iteration {} — {}".format(ci, len(alive), cand["iteration"], cand["checkpoint"]))
             results, roll = evaluate_candidate(
                 env, model, cand["checkpoint"], duration_s, cfg, config_path, args.task,
-                num_envs, args.seed, authoritative, args.progress_every)
-            worst, mean, ratios = score(results)
+                num_envs, args.seed, authoritative, args.progress_every,
+                initial_task_state=initial_task_state)
+            worst, mean, ratios, selection_gates_pass = score(results)
+            robust_screen = None
+            if (hbatch_profile and si >= max(0, len(stages) - 2)
+                    and args.hbatch_robust_s > 0.0):
+                robust_screen = evaluate_hbatch_robustness(
+                    env, model, cfg, initial_task_state,
+                    common_eval_disturbance_cfg, args.hbatch_robust_s,
+                    args.seed + 100003)
+                gates = eval_cfg.get("hbatch_gates") or {}
+
+                def robust_upper(value, limit):
+                    try:
+                        value, limit = float(value), float(limit)
+                    except (TypeError, ValueError):
+                        return float("inf")
+                    return (value / max(limit, 1.0e-9)
+                            if np.isfinite(value) and np.isfinite(limit)
+                            else float("inf"))
+
+                def robust_lower(value, limit):
+                    try:
+                        value, limit = float(value), float(limit)
+                    except (TypeError, ValueError):
+                        return float("inf")
+                    return (limit / max(value, 1.0e-9)
+                            if np.isfinite(value) and np.isfinite(limit)
+                            else float("inf"))
+
+                ratios.update({
+                    "h_combined_falls": robust_upper(
+                        robust_screen["falls_per_env_min"],
+                        gates.get("combined_falls_per_env_min_max", 0.50)),
+                    "h_combined_angvel": robust_upper(
+                        robust_screen["body_angvel_p90"],
+                        gates.get("combined_body_angvel_p90_max", 3.0)),
+                    "h_combined_force_events": (
+                        0.0 if robust_screen["force_events"] > 0 else float("inf")),
+                    "h_combined_force_survival": robust_lower(
+                        robust_screen["force_survival_5s"],
+                        gates.get("force_survival_5s_min", 0.98)),
+                })
+                values = list(ratios.values())
+                worst, mean = float(max(values)), float(np.mean(values))
+                selection_gates_pass = (
+                    selection_gates_pass
+                    and all(np.isfinite(v) and v <= 1.0 for v in values))
             entry = dict(cand)
             entry.update({
                 "segments": results["segments_completed"],
@@ -321,10 +493,11 @@ def main():
                 "heading_median": results["heading_err_deg"]["median"],
                 "falls": results["falls"],
                 "success_rate_strict": results["success_rate_strict"],
-                "all_gates_pass": results["all_gates_pass"],
+                "selection_gates_pass": selection_gates_pass,
                 "worst_ratio": worst,
                 "mean_ratio": mean,
                 "gate_ratios": ratios,
+                "hbatch_robust_screen": robust_screen,
                 "ci95_pos_median": results["ci95"]["pos_median"],
                 "advanced": False,
                 "_results": results,
@@ -334,6 +507,13 @@ def main():
             print("    -> 위치 median {:.1f} cm, p90 {:.1f} cm, heading {:.1f}°, 낙상 {}, worst비 {:.2f}".format(
                 entry["pos_median"] * 100, entry["pos_p90"] * 100, entry["heading_median"],
                 entry["falls"], worst))
+            if robust_screen is not None:
+                print("       combined screen: falls {:.3f}/env-min, |omega| p90 {:.2f}, "
+                      "force events {}, 5s survival {:.1%}".format(
+                          robust_screen["falls_per_env_min"],
+                          robust_screen["body_angvel_p90"],
+                          robust_screen["force_events"],
+                          robust_screen["force_survival_5s"]))
 
         entries.sort(key=rank_key)
         n_keep = keep[si] if si < len(keep) else 1
@@ -376,6 +556,7 @@ def main():
         "task": args.task,
         "num_envs": num_envs,
         "seed": args.seed,
+        "hbatch_robust_s": args.hbatch_robust_s if hbatch_profile else 0.0,
         "tail_frac": args.tail_frac,
         "total_checkpoints": total_found,
         "candidates": [{"iteration": c["iteration"], "checkpoint": c["checkpoint"]} for c in candidates],

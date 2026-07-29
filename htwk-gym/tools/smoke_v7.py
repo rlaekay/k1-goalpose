@@ -7,7 +7,7 @@ fails LOUDLY for a specific bug rather than producing plausible-looking garbage:
   * path mode advancing more than once per control step (the goal would move at
     a multiple of the commanded speed and the speed curriculum would calibrate
     against a number that was never real)
-  * the leash not holding (goal runs away, gradient dies)
+  * the 2-D floor/leash projection or world-step rate bound being violated
   * goal_segment_id ticking every step (eval would record one "segment" per
     control step and every aggregate would be meaningless)
   * the two disturbance classes not firing, or firing at the wrong magnitude
@@ -42,7 +42,8 @@ CHECKS = []
 
 def check(name, ok, detail=""):
     CHECKS.append((name, bool(ok), detail))
-    print("{}  {:<46} {}".format("PASS" if ok else "FAIL", name, detail))
+    print("{}  {:<46} {}".format(
+        "PASS" if ok else "FAIL", name, detail), flush=True)
     if not ok:
         FAILURES.append((name, detail))
 
@@ -57,7 +58,7 @@ def note(name, detail=""):
     end-of-run occupancy or bank count reflects "this policy hasn't learned
     the new task yet," which is what training is FOR, not a mechanism defect.
     """
-    print("NOTE  {:<46} {}".format(name, detail))
+    print("NOTE  {:<46} {}".format(name, detail), flush=True)
 
 
 def main():
@@ -101,6 +102,10 @@ def main():
         model = ActorCritic(env.num_actions, env.num_obs, env.num_privileged_obs).to(device)
         sd = torch.load(args.checkpoint, map_location=device, weights_only=True)
         res = model.load_state_dict(sd["model"], strict=False)
+        # Deliberately do not restore sd["env_state"] here.  Smoke verifies the
+        # generated config's frozen launch distribution; Runner restores task
+        # state for an actual training resume, while eval exposes an explicit
+        # --restore_task_state diagnostic when native state is desired.
         model.eval()
         # A shape mismatch here is the warm-start canary: it means v7 moved the
         # obs/action layout and every armB weight is being silently discarded.
@@ -155,6 +160,21 @@ def main():
         check("episode-constant motor-target offset sampled",
               float(env.joint_target_offset.abs().max().item()) > 0.0)
 
+    if hasattr(env, "get_checkpoint_state") and hasattr(env, "load_checkpoint_state"):
+        task_state = env.get_checkpoint_state()
+        before_active = (env.grid_active.clone()
+                         if getattr(env, "grid_on", False) else None)
+        env.load_checkpoint_state(task_state)
+        state_ok = (
+            isinstance(task_state, dict)
+            and "speed_level" in task_state
+            and "keepup_ema" in task_state
+            and (before_active is None
+                 or ("path_grid" in task_state
+                     and torch.equal(before_active, env.grid_active)))
+        )
+        check("task curriculum checkpoint state round-trips", state_ok)
+
     pcfg = cfg["commands"].get("path", {})
     share = cfg["commands"].get("goal_mode_mixture", {}).get("path", 0.0)
     n_path = int(env.is_path_env.sum().item())
@@ -192,26 +212,151 @@ def main():
               bool((init_margin >= -0.02).all()),
               "minimum gap-floor margin {:.3f} m".format(float(init_margin.min().item())))
 
+    if (n_path > 0
+            and pcfg.get("constraint_mode") == "radial_rate_limited"
+            and hasattr(env, "_bounded_annulus_delta")):
+        # Pure controller fixtures: no policy, physics, disturbance or reset is
+        # involved.  These are the mechanism gates the rollout occupancy could
+        # never provide.  Row 1 is an angular/tangent deficit, row 2 is above
+        # the leash, row 3 is a large deficit under a 0.10 m rate budget, and
+        # row 4 exercises the zero-vector fallback direction.
+        dev = env.device
+        old = torch.tensor([
+            [0.04, 0.0], [1.50, 0.0], [0.04, 0.0], [0.0, 0.0], [0.75, 0.0]],
+            device=dev)
+        robot = torch.zeros(5, 2, device=dev)
+        nominal = torch.tensor([
+            [0.0, 0.02], [0.0, 0.0], [0.0, 0.0], [0.0, 0.0], [0.01, 0.0]],
+            device=dev)
+        l_min = torch.full((5,), 0.50, device=dev)
+        l_max = torch.full((5,), 1.00, device=dev)
+        max_step = torch.tensor([1.0, 1.0, 0.10, 1.0, 1.0], device=dev)
+        fallback = torch.tensor([[1.0, 0.0]] * 5, device=dev)
+        delta = env._bounded_annulus_delta(
+            old, robot, nominal, l_min, l_max, max_step, fallback)
+        new_gap = torch.norm(old + delta - robot, dim=-1)
+        delta_norm = torch.norm(delta, dim=-1)
+        fixture_ok = (
+            torch.allclose(new_gap[:2], torch.tensor([0.50, 1.00], device=dev), atol=1e-5)
+            and abs(float(delta_norm[2].item()) - 0.10) < 1e-5
+            and 0.04 < float(new_gap[2].item()) < 0.50
+            and abs(float(new_gap[3].item()) - 0.50) < 1e-5
+            and torch.allclose(delta[4], nominal[4], atol=1e-6)
+            and abs(float(new_gap[4].item()) - 0.76) < 1e-5
+            and bool((delta_norm <= max_step + 1e-6).all())
+        )
+        check("radial floor/leash controller fixtures", fixture_ok,
+              "new gaps {} m, steps {} m".format(
+                  [round(float(x), 3) for x in new_gap.tolist()],
+                  [round(float(x), 3) for x in delta_norm.tolist()]))
+
+    # Reward activation fixtures: method existence alone cannot catch an
+    # always-false mask that would waste an entire training run.
+    if (float(cfg["rewards"]["scales"].get("high_speed_stability", 0.0)) != 0.0
+            and hasattr(env, "_reward_high_speed_stability")):
+        names = ("filtered_lin_vel", "last_stability_vel",
+                 "stability_accel_filtered", "projected_gravity",
+                 "base_ang_vel", "base_lin_vel")
+        saved = {name: getattr(env, name).clone() for name in names}
+        try:
+            env.filtered_lin_vel.zero_()
+            env.filtered_lin_vel[:, 0] = 1.0
+            env.last_stability_vel.copy_(env.filtered_lin_vel)
+            env.stability_accel_filtered.zero_()
+            env.base_ang_vel.zero_()
+            env.base_lin_vel.zero_()
+            tilt = 0.20
+            env.projected_gravity.zero_()
+            env.projected_gravity[:, 0] = -np.sin(tilt)
+            env.projected_gravity[:, 2] = -np.cos(tilt)
+            steady = env._reward_high_speed_stability().clone()
+
+            env.stability_accel_filtered.zero_()
+            env.last_stability_vel.zero_()
+            accelerating = env._reward_high_speed_stability().clone()
+            check("H2 stability reward activates only in steady fast motion",
+                  bool(torch.isfinite(steady).all())
+                  and float(steady.mean().item()) > 1.0e-4
+                  and float(accelerating.mean().item())
+                  < 0.25 * float(steady.mean().item()),
+                  "steady mean {:.6f}, high-accel mean {:.6f}".format(
+                      float(steady.mean().item()),
+                      float(accelerating.mean().item())))
+        finally:
+            for name, value in saved.items():
+                getattr(env, name).copy_(value)
+
+    if (float(cfg["rewards"]["scales"].get("heel_strike_ahead", 0.0)) != 0.0
+            and hasattr(env, "_reward_heel_strike_ahead")):
+        names = ("feet_contact", "last_feet_contact", "base_lin_vel",
+                 "base_pos", "base_quat", "feet_pos", "feet_quat",
+                 "is_path_env")
+        saved = {name: getattr(env, name).clone() for name in names}
+        try:
+            env.feet_contact.zero_()
+            env.feet_contact[:, 0] = True
+            env.last_feet_contact.zero_()
+            env.base_lin_vel.zero_()
+            env.base_lin_vel[:, 0] = 1.0
+            env.base_pos.zero_()
+            env.base_quat.zero_()
+            env.base_quat[:, 3] = 1.0
+            env.feet_pos.zero_()
+            # local heel x=-0.1015, so foot-link x=0.1815 puts heel at 0.08 m.
+            env.feet_pos[:, :, 0] = 0.1815
+            env.feet_quat.zero_()
+            env.feet_quat[:, :, 3] = 1.0
+            env.is_path_env[:] = True
+            active = env._reward_heel_strike_ahead().clone()
+            env.last_feet_contact.copy_(env.feet_contact)
+            inactive = env._reward_heel_strike_ahead().clone()
+            check("H3 heel reward activates only at eligible first contact",
+                  bool(torch.isfinite(active).all())
+                  and float(active.mean().item()) > 0.5
+                  and float(inactive.abs().max().item()) == 0.0,
+                  "eligible mean {:.4f}, held-contact max {:.4f}".format(
+                      float(active.mean().item()),
+                      float(inactive.abs().max().item())))
+        finally:
+            for name, value in saved.items():
+                getattr(env, name).copy_(value)
+
     # ---- run ---------------------------------------------------------------
     gaps, seg_ticks, rew_bad = [], 0, 0
-    gap_dwell, gap_run = [], []
+    gap_dwell_ratio, gap_run_ratio = [], []
+    floor_deficit_run, leash_excess_run = [], []
     goal_step_move = []
+    goal_step_move_run = []
+    goal_step_budget = []
+    goal_step_dwell = []
+    goal_heading_step_dwell = []
     push_f_seen, push_t_seen, push_active_steps = [], [], 0
     disturbance_bodies_seen, disturbance_kinds_seen = set(), set()
+    disturbance_max_active_bodies = 0
+    disturbance_body_mismatch = 0
+    disturbance_clear_transitions = 0
     has_segment_id = hasattr(env, "goal_segment_id")
     prev_seg = env.goal_segment_id.clone() if has_segment_id else None
     prev_goal = env.goal_pos_world.clone()
+    prev_goal_heading = env.goal_heading_world.clone()
     prev_path_mask = env.is_path_env.clone()
+    prev_dwell_mask = ((env.path_dwell_left > 0) & env.is_path_env
+                       if hasattr(env, "path_dwell_left") else
+                       torch.zeros(env.num_envs, dtype=torch.bool, device=env.device))
+    prev_force_any = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
 
     falls = 0
     dwell_seen = 0
+    dwell_streak = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    max_dwell_streak = 0
+    dwell_gait_bad = 0
+    resumed_gait_bad = 0
     seq_adv = 0
     seq_look_max = 0.0
     seq_r_all_finite = True
     seq_r_max = 0.0
     seq_r_seen = False
     arm_blend_lo, arm_blend_hi = 1.0, 0.0
-    robot_speed = []
     seq_prev = env.seq_idx.clone() if hasattr(env, "seq_idx") else None
     for i in range(args.steps):
         if model is not None:
@@ -220,7 +365,10 @@ def main():
         else:
             act = torch.zeros(env.num_envs, env.num_actions, device=env.device)
         obs, rew, done, infos = env.step(act)
-        falls += int((done & ~infos["time_outs"].to(done.device)).sum().item())
+        physical = infos.get("physical_failures")
+        fell = (done & physical.to(done.device) if physical is not None
+                else done & ~infos["time_outs"].to(done.device))
+        falls += int(fell.sum().item())
 
         if not torch.isfinite(rew).all() or not torch.isfinite(obs).all():
             rew_bad += 1
@@ -234,27 +382,72 @@ def main():
         alive = ~done
         path_mask = env.is_path_env.clone()
         if path_mask.any():
+            if hasattr(env, "path_dwell_left"):
+                current_dwell = (env.path_dwell_left > 0) & path_mask
+                dwell_streak = torch.where(
+                    current_dwell & alive,
+                    dwell_streak + 1,
+                    torch.zeros_like(dwell_streak),
+                )
+                max_dwell_streak = max(
+                    max_dwell_streak, int(dwell_streak.max().item()))
+                if bool(pcfg.get("pause_gait_during_dwell", False)):
+                    dwell_gait_bad += int((
+                        current_dwell & alive
+                        & (env.gait_frequency.abs() > 1.0e-8)).sum().item())
+                    resumed_now = (prev_dwell_mask & prev_path_mask & path_mask
+                                   & alive & ~current_dwell)
+                    resumed_gait_bad += int((
+                        resumed_now & (env.gait_frequency < 1.8)).sum().item())
+                stable_dwell = (prev_path_mask & path_mask & alive
+                                & prev_dwell_mask & current_dwell)
+                if bool(stable_dwell.any()):
+                    goal_step_dwell.append(torch.norm(
+                        env.goal_pos_world[stable_dwell] - prev_goal[stable_dwell],
+                        dim=-1).cpu().numpy())
+                    heading_step = torch.abs(
+                        (env.goal_heading_world[stable_dwell]
+                         - prev_goal_heading[stable_dwell] + torch.pi)
+                        % (2 * torch.pi) - torch.pi)
+                    goal_heading_step_dwell.append(heading_step.cpu().numpy())
             # Only measure steady path-carrot motion. Resets can switch goal mode,
             # and segment rerolls deliberately teleport/re-anchor the carrot.
             m = prev_path_mask & path_mask & alive & ~seg_changed
             if bool(m.any()):
-                gaps.append(torch.norm(
-                    env.goal_pos_world[m] - env.base_pos[m, :2], dim=-1).cpu().numpy())
+                gsel = torch.norm(
+                    env.goal_pos_world[m] - env.base_pos[m, :2], dim=-1)
+                gaps.append(gsel.cpu().numpy())
                 moved = torch.norm(env.goal_pos_world[m] - prev_goal[m], dim=-1)
                 goal_step_move.append(moved.cpu().numpy())
+                if hasattr(env, "path_goal_rate_limit"):
+                    goal_step_budget.append(
+                        (env.path_goal_rate_limit[m] * env.dt).cpu().numpy())
                 if hasattr(env, "path_dwell_left"):
                     dw_m = env.path_dwell_left[m] > 0
-                    gsel = torch.norm(env.goal_pos_world[m] - env.base_pos[m, :2], dim=-1)
+                    look = env.lookahead[m].clamp(min=1.0e-6)
+                    ratio = gsel / look
                     if bool(dw_m.any()):
-                        gap_dwell.append(gsel[dw_m].cpu().numpy())
+                        gap_dwell_ratio.append(ratio[dw_m].cpu().numpy())
                     if bool((~dw_m).any()):
-                        gap_run.append(gsel[~dw_m].cpu().numpy())
+                        goal_step_move_run.append(moved[~dw_m].cpu().numpy())
+                        run_gap = gsel[~dw_m]
+                        run_look = look[~dw_m]
+                        run_leash = torch.clamp(
+                            run_look * float(pcfg.get("leash_ratio", 1.6)),
+                            max=float(pcfg.get("lookahead_max_m", 3.5)))
+                        gap_run_ratio.append((run_gap / run_look).cpu().numpy())
+                        floor_deficit_run.append(
+                            (run_look - run_gap).clamp(min=0.0).cpu().numpy())
+                        leash_excess_run.append(
+                            (run_gap - run_leash).clamp(min=0.0).cpu().numpy())
         if has_segment_id:
             prev_seg = env.goal_segment_id.clone()
         prev_path_mask = path_mask
         prev_goal = env.goal_pos_world.clone()
-
-        robot_speed.append(torch.norm(env.root_states[:, 7:9], dim=-1).cpu().numpy())
+        prev_goal_heading = env.goal_heading_world.clone()
+        prev_dwell_mask = ((env.path_dwell_left > 0) & path_mask
+                           if hasattr(env, "path_dwell_left") else
+                           torch.zeros_like(path_mask))
 
         if seq_prev is not None:
             seq_adv += int((env.seq_idx > seq_prev).sum().item())
@@ -282,8 +475,30 @@ def main():
 
         # HBatch distributes artificial hits over several rigid bodies.  The
         # former base-only readout falsely reported that those events never fired.
-        f = torch.norm(env.pushing_forces, dim=-1).amax(dim=-1)
-        t = torch.norm(env.pushing_torques, dim=-1).amax(dim=-1)
+        force_by_body = torch.norm(env.pushing_forces, dim=-1)
+        torque_by_body = torch.norm(env.pushing_torques, dim=-1)
+        force_body_active = force_by_body > 1e-3
+        torque_body_active = torque_by_body > 1e-3
+        active_counts = force_body_active.sum(dim=-1)
+        disturbance_max_active_bodies = max(
+            disturbance_max_active_bodies, int(active_counts.max().item()))
+        force_any = active_counts > 0
+        disturbance_clear_transitions += int((prev_force_any & ~force_any).sum().item())
+        prev_force_any = force_any
+        paired = force_any | (torque_body_active.sum(dim=-1) > 0)
+        if bool(paired.any()):
+            force_idx = torch.argmax(force_by_body, dim=-1)
+            torque_idx = torch.argmax(torque_by_body, dim=-1)
+            mismatch = paired & (
+                (force_body_active.sum(dim=-1) != 1)
+                | (torque_body_active.sum(dim=-1) != 1)
+                | (force_idx != torque_idx))
+            if hasattr(env, "dist_active_body"):
+                mismatch |= paired & (force_idx != env.dist_active_body)
+            disturbance_body_mismatch += int(mismatch.sum().item())
+
+        f = force_by_body.amax(dim=-1)
+        t = torque_by_body.amax(dim=-1)
         act_mask = f > 1e-3
         if bool(act_mask.any()):
             push_active_steps += 1
@@ -298,7 +513,16 @@ def main():
 
     check("rewards and observations stay finite", rew_bad == 0,
           "{} bad steps".format(rew_bad))
-    if hasattr(env, "dist_event_serial"):
+    disturbance_enabled = bool(
+        (cfg["randomization"].get("disturbance") or {}).get("enabled", False))
+    if hasattr(env, "dist_event_serial") and disturbance_enabled:
+        expected_apply_calls = args.steps * int(cfg["control"]["decimation"])
+        check("disturbance wrench is submitted on every physics substep",
+              int(getattr(env, "dist_wrench_apply_calls", -1)) == expected_apply_calls,
+              "{} calls, expected {} = {} control steps x {} decimation".format(
+                  int(getattr(env, "dist_wrench_apply_calls", -1)),
+                  expected_apply_calls, args.steps,
+                  int(cfg["control"]["decimation"])))
         check("all configured disturbance bodies receive events",
               disturbance_bodies_seen == set(int(x) for x in env.dist_body_indices.cpu().tolist()),
               "seen {} expected {}".format(
@@ -307,74 +531,73 @@ def main():
         check("collision and support event classes both fire",
               disturbance_kinds_seen == {1, 2},
               "event kinds seen {}".format(sorted(disturbance_kinds_seen)))
+        check("at most one disturbance body is active per env",
+              disturbance_max_active_bodies <= 1,
+              "maximum active bodies in one env: {}".format(disturbance_max_active_bodies))
+        check("force and torque stay on the declared event body",
+              disturbance_body_mismatch == 0,
+              "{} mismatched env-steps".format(disturbance_body_mismatch))
+        check("expired disturbance wrench clears",
+              disturbance_clear_transitions > 0,
+              "{} active-to-clear transitions".format(disturbance_clear_transitions))
 
     # ---- path mode ---------------------------------------------------------
     if n_path > 0 and goal_step_move and gaps:
         move = np.concatenate(goal_step_move)
-        move = move[move < 1.0]                     # drop re-roll/reset teleports
-        speed_lo, speed_hi = pcfg.get("speed_range_mps", [0.3, 1.6])
-        lvl = getattr(env, "speed_level", 1.0)
-        cmd_hi = speed_lo + (speed_hi - speed_lo) * lvl
-        observed = np.percentile(move, 99) / env.dt if len(move) else float("nan")
-        # The carrot may legitimately exceed the commanded pace: at the distance
-        # floor a robot running faster than the pace drags it along at the
-        # ROBOT's speed. So the bound is max(pace, robot speed) * catchup_ratio,
-        # not the pace alone -- comparing against the pace alone would fail every
-        # run in which the policy is doing well.
-        catch = float(pcfg.get("catchup_ratio", 1.5))
-        v99 = np.percentile(np.concatenate(robot_speed), 99) if robot_speed else 0.0
-        bound = max(cmd_hi, v99) * catch + 0.05
-        check("path goal speed within the rate limit (no teleport)",
-              observed <= bound * 1.25,
-              "observed p99 {:.2f} m/s vs bound {:.2f} (pace<={:.2f}, robot p99 {:.2f}, x{:.1f})".format(
-                  observed, bound, cmd_hi, v99, catch))
+        # Reset/reroll samples were already excluded by alive & ~seg_changed.
+        # Never discard large moves here: those are exactly the untagged
+        # teleports this hard invariant is meant to catch.
+        if goal_step_budget:
+            budget = np.concatenate(goal_step_budget)
+            excess = move - budget
+            check("every path goal step obeys its per-env rate limit",
+                  bool(np.all(excess <= 1.0e-4)),
+                  "max move {:.4f} m, max budget excess {:.6f} m".format(
+                      float(move.max()), float(excess.max())))
+        else:
+            check("every path goal step obeys its per-env rate limit", False,
+                  "environment did not expose path_goal_rate_limit")
+        if goal_step_move_run:
+            move_run = np.concatenate(goal_step_move_run)
+            moving_share = float((move_run > 1.0e-5).mean())
+            check("running path carrot is not frozen",
+                  moving_share > 0.50,
+                  "{:.1%} of non-dwell steady steps moved; p50 {:.6f} m".format(
+                      moving_share, float(np.percentile(move_run, 50))))
 
-        g = np.concatenate(gaps)
-        # Leash is now per-env: lookahead * leash_ratio, capped at lookahead_max_m.
-        # The old check compared against lookahead_max_m alone, which is only the
-        # cap and would pass even if the per-env leash were being ignored.
-        la_lo, la_hi = pcfg.get("lookahead_m", [0.5, 3.0])
-        # lookahead is now capped at lookahead_scale_frac * path_scale, so the
-        # widest achievable leash follows the largest curve, not the raw config.
-        frac = float(pcfg.get("lookahead_scale_frac", 0.6))
-        scale_hi = pcfg.get("scale_m", [1.5, 4.0])[1]
-        la_eff = min(la_hi, frac * scale_hi)
-        leash = min(la_eff * float(pcfg.get("leash_ratio", 1.6)),
-                    float(pcfg.get("lookahead_max_m", 3.5)))
-        check("leash holds the lookahead point",
-              np.percentile(g, 99) <= leash * 1.25,
-              "gap p50 {:.2f} p99 {:.2f} m, leash {:.2f}".format(
-                  np.percentile(g, 50), np.percentile(g, 99), leash))
+        # These are closed-loop policy outcomes, not code invariants.  Use each
+        # env's sampled lookahead/leash (the former global 0.375 m floor and
+        # widest global leash did not test what their labels claimed), preserve
+        # the numbers in the log, and judge them after training.
+        if gap_run_ratio:
+            ratio = np.concatenate(gap_run_ratio)
+            deficit = np.concatenate(floor_deficit_run)
+            leash_excess = np.concatenate(leash_excess_run)
+            note("running lookahead occupancy (post-train metric)",
+                 "gap/lookahead p2 {:.2f} p50 {:.2f}; below 0.75 {:.1%}; "
+                 "floor deficit p90 {:.3f} m".format(
+                     np.percentile(ratio, 2), np.percentile(ratio, 50),
+                     float((ratio < 0.75).mean()), np.percentile(deficit, 90)))
+            note("running leash occupancy (post-train metric)",
+                 "outside per-env leash {:.1%}; excess p99 {:.3f} m".format(
+                     float((leash_excess > 1.0e-4).mean()),
+                     np.percentile(leash_excess, 99)))
 
-        # The floor is the fix for the defect that made the goal drift onto the
-        # robot (measured gap median 0.41 m against a configured 0.5 m minimum),
-        # flattening the reward exactly where the robot was. While NOT dwelling
-        # the gap must stay at or above the smallest configured lookahead.
-        # Split by dwell state instead of thresholding a pooled fraction. Pooling
-        # conflates "the floor is broken" with "the carrot is parked, which
-        # releases the floor on purpose", and the pooled number then moves
-        # whenever the dwell duty cycle is retuned -- a check that shifts under
-        # unrelated config changes is not measuring what it claims to.
-        gd = np.concatenate(gap_dwell) if gap_dwell else np.array([])
-        gr = np.concatenate(gap_run) if gap_run else np.array([])
-        la_floor = min(la_lo, frac * pcfg.get("scale_m", [1.5, 4.0])[0])
-        if len(gr):
-            frac_bad = float((gr < la_floor * 0.75).mean())
-            # Soft target, not a guarantee: the goal-speed rate limit takes
-            # precedence, so the carrot may lag the floor briefly while catching
-            # up. Measured steady-state miss rate is 11%; this trips only if the
-            # floor has stopped working altogether.
-            floor_detail = (
-                "{:.0%} of running steps inside the floor, gap p2 {:.2f} vs floor {:.2f}"
-                .format(frac_bad, np.percentile(gr, 2), la_floor))
-            check("lookahead floor mostly holds while running (soft target)",
-                  frac_bad < 0.30, floor_detail)
         dwell_cfg = pcfg.get("dwell") or {}
-        if dwell_cfg.get("enabled", False):
-            check("dwell actually releases the floor",
-                  len(gd) > 0 and float((gd < la_floor * 0.75).mean()) > 0.2,
-                  "{:.0%} of dwelling steps inside the floor (should be most of them)".format(
-                      float((gd < la_floor * 0.75).mean()) if len(gd) else 0.0))
+        if dwell_cfg.get("enabled", False) and gap_dwell_ratio:
+            gd_ratio = np.concatenate(gap_dwell_ratio)
+            note("dwell arrival occupancy (post-train metric)",
+                 "gap/lookahead below 0.75 on {:.1%} of dwelling samples".format(
+                     float((gd_ratio < 0.75).mean())))
+        if dwell_cfg.get("enabled", False) and goal_step_dwell:
+            dwell_move = np.concatenate(goal_step_dwell)
+            dwell_heading = (np.concatenate(goal_heading_step_dwell)
+                             if goal_heading_step_dwell else np.array([np.inf]))
+            check("dwell parks the full world-frame goal pose",
+                  float(dwell_move.max()) <= 1.0e-5
+                  and float(dwell_heading.max()) <= 1.0e-5,
+                  "max position step {:.7f} m, heading step {:.7f} rad".format(
+                      float(dwell_move.max()), float(dwell_heading.max())))
     elif n_path > 0:
         check("path-mode samples collected", False,
               "no surviving path envs in {} steps -- policy may be falling immediately".format(args.steps))
@@ -385,7 +608,7 @@ def main():
         # dwell is the repair for path training wrecking waypoint accuracy
         # (6.3 cm -> 37.9 cm in the v7 batch). If the carrot never actually
         # stops, the repair is absent and the next batch reproduces the fault.
-        check("dwell fires (carrot actually stops)", dwell_seen > 0,
+        check("dwell counter fires", dwell_seen > 0,
               "{} env-steps spent dwelling out of {}".format(dwell_seen, args.steps * n_path))
         lo, hi = dwell_cfg.get("interval_s", [4.0, 10.0])
         dur_lo, dur_hi = dwell_cfg.get("duration_s", [1.5, 3.0])
@@ -394,6 +617,16 @@ def main():
         check("dwell duty cycle is in the configured ballpark",
               observed <= expect * 3.0 + 0.02,
               "observed {:.1%} vs configured ~{:.1%}".format(observed, expect))
+        minimum_streak = max(1, int(dur_lo / env.dt) - 2)
+        check("at least one dwell survives its configured minimum duration",
+              max_dwell_streak >= minimum_streak,
+              "longest {} steps, required at least {}".format(
+                  max_dwell_streak, minimum_streak))
+        if bool(pcfg.get("pause_gait_during_dwell", False)):
+            check("dwell gait clock pauses and resumes",
+                  dwell_gait_bad == 0 and resumed_gait_bad == 0,
+                  "{} dwelling nonzero-Hz and {} resumed below-1.8-Hz env-steps".format(
+                      dwell_gait_bad, resumed_gait_bad))
 
     # ---- scripted arms ------------------------------------------------------
     if getattr(env, "arm_script_on", False):
@@ -474,11 +707,18 @@ def main():
     if getattr(env, "grid_on", False):
         active = int(env.grid_active.sum().item())
         total = int(env.grid_active.numel())
-        # Seeded at exactly one cell (slowest, straightest). If it were already
-        # wide open the curriculum would be doing nothing -- which is the
-        # no-curriculum condition Margolis et al. report as a total failure.
-        check("speed grid seeded small", 1 <= active < total,
-              "{}/{} cells active after {} steps".format(active, total, args.steps))
+        initial = (pcfg.get("speed_grid") or {}).get("initial_active", "seed")
+        if initial == "all":
+            # H warm-starts from the late G1 policy, whose eval exercised the
+            # full grid. Historical checkpoints did not serialize task state,
+            # so H freezes that distribution explicitly instead of silently
+            # restarting at the 0.3 m/s straight seed cell.
+            check("speed grid restores the full H warm-start distribution",
+                  active == total,
+                  "{}/{} cells active after {} steps".format(active, total, args.steps))
+        else:
+            check("speed grid seeded small", 1 <= active < total,
+                  "{}/{} cells active after {} steps".format(active, total, args.steps))
         print("     grid speeds {} x curvatures {}".format(
             [round(float(x), 2) for x in env.grid_speeds.tolist()],
             [round(float(x), 2) for x in env.grid_curvs.tolist()]))

@@ -9,11 +9,38 @@
 ## 데이터가 말하는 현재 best
 
 - 정확도 best: E0@6200, `2.72/5.01 cm`, heading `2.52°`, strict `89.29%`, falls 2.
-- speed best: G1@10700, path mean-speed median `1.038 m/s`, body p90 `1.50 m/s`.
+- 사용 가능한 speed/path best: G1@10700, path-segment mean-speed median `1.038 m/s`, body p90 `1.50 m/s`. G3/G4의 raw speed 일부는 더 높지만 overspeed·정확도 붕괴·낙상이 함께 나타나므로 winner가 아니다. 기존 one-sided `path_lag/grid success`도 추종 품질 증거에서 제외한다.
 - G1의 비용: waypoint `5.52/7.42 cm`, strict `34.22%`, falls 38 중 path 34.
 - robust 실패 경고: E2 body p90 `0.32 m/s`, never-arrived `53.34%`; G2 body p90 `0.19 m/s`, never-arrived `63.27%`.
 
-따라서 H의 출발점은 G1이고, E0 수치는 clean accuracy reject gate로 사용한다. E0와 G1을 weight-level에서 동시에 “합치는” 것은 불가능하므로, G1이 잃은 waypoint 정확도를 dwell/selection gate로 되찾는 방식이다.
+따라서 H의 출발점은 G1이다. E0 수치는 되찾아야 할 accuracy 목표/reference이고, 1차 reject gate는 G1의 waypoint median/p90/heading을 악화시키지 않는 것이다. E0와 G1을 weight-level에서 동시에 “합치는” 것은 불가능하므로, G1이 잃은 waypoint 정확도를 dwell과 checkpoint selection으로 단계적으로 되찾는다.
+
+### E2 robust가 느려진 이유와 재발 방지
+
+E0와 E2의 waypoint 요구속도 median/p90은 `0.119/0.312` 대 `0.121/0.310 m/s`로 사실상 같았다. 과제가 느려진 것이 아닌데 body-speed p90은 `0.58→0.32 m/s`(−44.8%), never-arrived는 `0→53.34%`, overshoot share는 `45.9→8.9%`가 되어 E2 시도의 **91.1%가 undershoot**였다. 따라서 “조금 더 안정적”이 아니라 목표 입력에 약하게 반응하는 저속 collapse다.
+
+원인 해석은 단일 ablation이 없어 인과 확정은 못 하지만, E2가 처음부터 no-ramp collision/support와 goal jitter+bias+hold+flicker를 한꺼번에 켰고, `action_rate=-1.5`, `goal_progress=0`인 feed-forward policy에서 입력 변화에 둔감한 저이득 행동이 쉬운 해였다는 설명이 데이터와 가장 잘 맞는다. 더구나 당시 외력은 physics substep 적용 오류로 명목 impulse의 약 1/10이었고 force-ON eval도 없었으므로, 느려진 대가로 실제 충돌 강건성을 얻었다는 증거도 없다.
+
+H에서는 이 실수를 다음처럼 막는다: low-dose H0에서 시작하고 force는 ramp하며 새 변경을 사전 정의한 arm별 bundle로 분리한다. warm-start `model_0`과 100/200/... 초기 checkpoint를 모두 후보에 넣고, selector가 G1 waypoint `5.52/7.42 cm, 2.54°`, never-arrived≤`1.5%`, path speed≥`0.95 m/s`, from-rest 도달률/시간, 전체·waypoint·path fall rate를 직접 reject한다. 최종 평가는 arm별 학습 외란이 아니라 공통 held-out force-ON+jitter 시험을 사용한다. 즉 reward가 좋아 보여도 E2형 저속화는 selection 단계에서 탈락한다.
+
+### 2026-07-30 smoke 재감사: 42–45% 실패의 실제 의미
+
+외란 body-name과 event-overlap을 고친 뒤에도 서버 smoke는 네 arm 모두 31개 중 30개를 통과하고 running lookahead occupancy 하나만 실패했다. H0/H3는 floor 안쪽 sample이 45%, H1은 43%와 2 falls, H2는 42%와 2 falls였다. 외란은 300 step 중 118–151 step에서 실제 활성화됐고 force/torque class·크기·body 검사는 통과했다. 따라서 이 실패를 다시 외란 cadence 탓으로 돌리거나 `30%→50%`로 완화하는 것은 틀리다.
+
+공통 V7 path 구현을 다시 추적해 다음 네 원인을 확인했다.
+
+- `path_lag=max(gap-lookahead,0)`는 carrot을 추월해 `gap<lookahead`가 된 실패를 **0 오차**로 만들었다. grid promotion도 이 one-sided 값만 사용해 floor 붕괴를 성공으로 학습했다.
+- G1 checkpoint는 `grid_active/trials/success`를 저장하지 않았다. report의 `30/30 active`는 eval 프로세스 끝 snapshot일 뿐 resume state가 아니어서, H는 매 프로세스마다 0.3 m/s 한 cell에서 재시작했다.
+- `min(robot_speed,path_speed)` drag와 leader-heading 방향 scalar 보정은 빠른 warm-start가 느린 carrot을 추월했을 때 floor를 충분히 복구하지 못했다. 특히 tangent 방향에서는 `step += shortfall`이 2-D 거리 floor를 수학적으로 만족하지 않는다.
+- dwell timer를 4–8 s path reroll마다 다시 끊었고, dwell 종료 복구를 즉시 running 실패로 셌으며, running path에서도 `goal_reached/stand_posture`가 catch-and-stop을 보상했다.
+
+수정은 threshold가 아니라 의미 자체를 바로잡는다. H는 exact 2-D radial annulus projection을 3.2 m/s의 world-step 상한 아래에서 사용하고, 정상 robot drag는 2.1 m/s에서 clip한다. dwell-resume은 2.1 m/s 이상의 제한된 recovery rate를 써 최대 sampled floor 2.4 m를 1.15초 안에 복구하며 teleport하지 않는다. curriculum 성공은 signed `gap-lookahead`의 양쪽을 검사하고 dwell 및 명시적 recovery를 제외하며, fall은 강제 실패로 기록한다. zero-step 초기 segment는 trial로 세지 않는다. dwell 중 world carrot pose와 gait clock을 멈추고, arrival/stand reward는 waypoint 또는 dwell에서만 켠다. active dwell은 path reroll에도 timer와 parked pose를 보존한다.
+
+단, recovery 제외가 실패를 영구히 숨기면 안 된다. 그래서 dwell 종료 recovery 표시는 최대 2.0초 뒤 강제로 끝나며, 그때도 floor가 회복되지 않았다면 이후 step은 일반 floor 실패와 grid trial로 채점된다. post-train gate는 recovery 제외 steady sample이 실제로 1개 이상 있어야 하므로 “전 구간 recovery 처리”도 통과할 수 없다.
+
+또 하나의 공통 오류는 timeout mask였다. 이전 코드는 `time_out_buf` tensor를 매 step 새로 만들면서 `extras["time_outs"]`는 reset 때만 갱신했고, physical fall과 goal-resample이 같은 step이면 timeout이 fall을 가렸다. 이제 episode timeout/segment boundary/physical failure를 분리하고, physical failure가 항상 우선하며, PPO와 eval에 매 step 같은 최신 mask를 전달한다.
+
+H의 `initial_active: all`은 G1이 30개 cell을 실제로 **노출받았던 학습 분포**를 복원하는 장치이지 30개를 숙련했다는 주장이 아니다. 이후 checkpoint는 grid state와 scalar speed/EMA를 함께 저장·resume한다. 기존 G1 checkpoint에는 이 state가 없으므로 명시적 `all`이 필요하다. 일반 selection/eval은 후보마다 동일한 config protocol을 보장하기 위해 task state를 의도적으로 복원하지 않는다. checkpoint 고유 curriculum을 재현하는 진단만 `eval_goal_pose.py --restore_task_state`를 명시한다.
 
 ## H0–H3 frozen 정의
 
@@ -21,25 +48,26 @@
 
 - task `K1/Goal_Pose_HBatch`, observation/action `54/12` 유지.
 - warm start G1@10700.
-- waypoint/path `0.65/0.35`, G1 speed×curvature grid+dwell 유지.
+- waypoint/path `0.65/0.35`, G1 speed×curvature 분포를 유지하되 위에서 감사한 floor/dwell/curriculum 의미는 수정.
 - legacy synchronized velocity kick는 0으로 끈다.
 - 새 팔 asset `K1_locomotion_hbatch-codex.urdf` 사용, arm script와 16-DOF armswing은 사용하지 않는다.
 - 모든 버전에 goal observation jitter, segment bias, 2–3 step hold, rare flicker와 multi-body force를 nonzero로 넣는다.
 - 모든 버전에 reset pose DR + episode-constant encoder bias + motor-target offset을 넣는다.
+- H0/H3는 mirror loss와 mirror transition augmentation가 모두 0인 control이고, H1/H2만 두 항을 함께 켠다.
 
 | 버전 | modification | 가설 | 다른 버전과의 차이 |
 |---|---|---|---|
 | **H0** | G1 + 정확한 팔 + low-dose 외란/jitter + mild joint offsets | 현재 best speed를 최소 필수 robustness와 함께 보존 가능한가 | 통합 기준선 |
 | **H1** | H0 + y mirror transition augmentation + mirror loss + stronger joint offset DR | 좌우 편향과 calibration gap을 nominal speed 손실 없이 줄이는가 | stability/gait reward 없음 |
-| **H2** | H1 + steady-high-speed stability reward + 더 긴 disturbance ramp | 가속 lean/가속시간은 유지하면서 순항 pitch/roll/ωxy를 낮추는가 | H1 대비 stability 하나가 핵심 |
+| **H2** | H1 + steady-high-speed stability reward + 더 느린 ramp이지만 최종적으로 더 잦고 high-speed-biased인 disturbance + flicker 2배 | 가속 lean/가속시간은 유지하면서 강화된 고속 안정화 bundle이 순항 pitch/roll/ωxy와 외력회복을 낮추는가 | reward 단일 ablation이 아니라 명시적인 stability/robustness bundle |
 | **H3** | H0 + forward-path touchdown placement reward 하나 | heel/capture-point형 foot placement가 고속 낙상을 줄이는가 | H1/H2를 상속하지 않는 gait-only ablation |
 
 정확한 config:
 
 - H0 force: interval 8–14 s, event probability 0.25, collision share 0.25, collision `40–100 N`, `3–12 N·m`, `0.05–0.10 s`, support `3–8 N`, `0.2–1 N·m`, `0.5–1.5 s`.
 - H1: H0 force 그대로, encoder bias ±0.025 rad, target offset ±0.020 rad, init q σ 0.075 rad, mirror augmentation 0.5, mirror loss 0.5.
-- H2: interval 6–12 s, base probability 0.35, collision share 0.35, 72,000 control-step ramp; path `v≥0.8 m/s`에서는 event probability를 2배(상한 1.0)로 높이고 high-speed stability scale은 −0.5.
-- 학습 ramp는 학습에만 적용한다. `--keep_perturbations` 평가는 새 프로세스의 step 0에서 시작하므로, 평가 시 `ramp_steps=1`로 덮어써 설정된 최종 외란 분포를 실제로 검사한다.
+- H2: interval 6–12 s, base probability 0.35, collision share 0.35, 72,000 control-step ramp; path `v≥0.8 m/s`에서는 event probability를 2배(상한 1.0)로 높이고, goal flicker를 0.001→0.002/step, high-speed stability scale을 −0.5로 바꾼다. 따라서 H2가 이겨도 reward 하나의 인과효과가 아니라 이 세 요소의 bundle 효과로 해석한다.
+- 위 차이는 **학습 분포**다. 최종 cross-arm 평가는 arm별 설정을 그대로 시험하지 않는다. 네 arm 모두 같은 held-out profile(`interval 6–12 s`, probability 0.50, collision share 0.35, high-speed probability boost 2.0, ramp 1; encoder ±0.025 rad, target ±0.020 rad, init q σ 0.075 rad; goal flicker 0.001/step)을 강제한다. 그렇지 않으면 H2의 정책 효과와 더 어려운 시험지가 섞인다. 실제 적용된 commands/noise/randomization 전체를 SHA-256으로 report에 기록하고 report별 hash가 H0와 다르면 비교를 거부한다.
 - H3: H0와 같고 `heel_strike_ahead=+0.10`만 추가.
 
 생성물은 `htwk-gym/sweeps/hbatch/H0-codex.yaml`부터 `H3-codex.yaml`까지다.
@@ -75,7 +103,7 @@ H3는 다음처럼 보수적으로 제한한다.
 
 ## 외란: 크기는 충돌급이었나, 실제로 괜찮았나, 한 곳에만 주나?
 
-기존 V7의 collision은 `40–150 N × 0.05–0.15 s`, 즉 충격량 `2–22.5 N·s`로 **크기 자체는 robot collision급**이다. 그러나 다음 이유로 실제 robot–robot collision이라 부르면 안 된다.
+기존 V7의 collision 설정은 `40–150 N × 0.05–0.15 s`, 즉 명목 충격량 `2–22.5 N·s`였다. 그러나 Isaac Gym의 rigid-body force는 immediate physics timestep에만 유효한데, 기존 코드는 decimation 10개 중 한 번만 submit했다. 따라서 실제 적분 충격량은 명목값의 약 1/10인 `0.2–2.25 N·s`였고, 당시 eval도 control `dt=0.02 s`로 적분해 이를 10배 과대보고했다. **기존 외란이 충분히 컸다는 결론은 낼 수 없다.**
 
 - 기존 구현은 `Trunk/base_indice` 한 rigid-body COM에만 force와 독립 random torque를 `LOCAL_SPACE`로 가했다.
 - 두 번째 로봇 actor, 형상 접촉, 팔/다리 타격, 접촉점 moment arm, 상대 로봇 dynamics가 없다.
@@ -88,6 +116,7 @@ HBatch는 다음을 수정했다.
 
 - Trunk, 양 hip-roll, 양 shank body 중 하나를 event마다 선택한다. Isaac Gym은 knee joint 이름이 아니라 그 child rigid-body인 `Left_Shank`/`Right_Shank`를 노출한다. fixed 팔 link는 `collapse_fixed_joints=true`에서 Trunk로 합쳐지므로 upper-arm을 별도 body로 거짓 계수하지 않았다. 로드 후 5개 이름 중 하나라도 없으면 env 생성을 즉시 실패시킨다.
 - ENV_SPACE force로 world 방향을 유지.
+- event 생성·만료는 50 Hz control step에서 한 번만 처리하되 held wrench를 500 Hz physics의 decimation 10개 직전에 모두 다시 submit한다. duration은 control step 단위로 올림 양자화되므로 H collision의 실제 범위는 `40–100 N × 0.06–0.10 s = 2.4–10 N·s`, support는 `3–8 N × 0.5–1.5 s = 1.5–12 N·s`다. report의 expected impulse도 요청 duration이 아니라 이 실제 적용 duration으로 계산한다.
 - reset 시 해당 env의 모든 force/torque/timer를 clear.
 - 외란을 ramp하며 event probability로 clean sample 비중을 보존.
 - eval report에 force event 수, active share, force 중 fall을 기록. event 0이면 보고서가 자동으로 “robust 근거 아님”을 표시.
@@ -119,7 +148,7 @@ HBatch는 다음을 수정했다.
 - mirrored obs와 action으로 PPO log-prob를 다시 계산한다. 원 sample의 old log-prob를 재사용하지 않는다.
 - reward/done/advantage/return은 reflection에서 보존한다.
 - asymmetric critic의 14 privileged channels도 mirror한다: COM-y, linear-vy, force-y sign flip; torque는 axial vector라 Tx/Tz sign flip, Ty 유지.
-- H0/H3는 G1 계보의 기존 mirror loss는 유지하지만 transition augmentation는 0. H1/H2에서 augmentation 순효과를 본다.
+- H0/H3는 mirror loss와 transition augmentation를 모두 0으로 되돌린 비-mirror control이다. H1/H2만 loss `0.5`와 augmentation `0.5`를 함께 켜 사용자 요청의 전체 mirror intervention을 검증한다.
 
 NVIDIA Isaac Lab도 data augmentation와 mirror loss를 별도 switch로 정의한다: [Isaac Lab symmetry configuration](https://isaac-sim.github.io/IsaacLab/main/_modules/isaaclab_rl/rsl_rl/symmetry_cfg.html).
 
@@ -141,7 +170,8 @@ NVIDIA Isaac Lab도 data augmentation와 mirror loss를 별도 switch로 정의�
 공통 core:
 
 - waypoint 위치 median/p90, heading, strict/loose, never-arrived, undershoot/overshoot, falls.
-- path-only commanded/achieved speed, lag, keepup, falls per attempt.
+- path-only commanded/achieved speed, falls per attempt.
+- 매 control step의 per-env signed `gap-lookahead`: `gap/lookahead` p2/p50, floor deficit p50/p90, behind lag p50/p90, 실제 per-env leash 이탈률. 의도된 dwell-resume recovery 비율을 따로 기록하고, 이를 포함한 floor-collapse와 제외한 floor-collapse를 모두 낸다. 기존 one-sided segment `path_lag`는 backward-compatible 참고값일 뿐 채택 근거가 아니다.
 - reset 뒤 0.25 s를 제외한 pose-difference speed. path category가 아닌 sample은 speed-tracking에서 강제 제외.
 
 고속 phase:
@@ -153,19 +183,21 @@ NVIDIA Isaac Lab도 data augmentation와 mirror loss를 별도 switch로 정의�
 외란:
 
 - event count/active duty, force body/direction/magnitude, force-active falls.
-- impulse/torque-impulse, max tilt, speed loss, 90% speed recovery time·≤5 s recovery share, 2/5 s survival을 collision/support별로 분리해 report에 저장한다. event와 5 s outcome record 수가 다르면 censored/overlap로 명시한다.
+- 실제 physics substep에 적용된 impulse/torque-impulse, max tilt, speed loss, 90% speed recovery time·≤5 s recovery share, 2/5 s survival을 전체/high-speed/collision/support별로 분리해 report에 저장한다. episode timeout과 rollout 종료는 각 2 s/5 s horizon의 관측 가능성에 맞게 right-censor하고, event와 outcome record 수가 다르면 overlap로 명시한다.
 
 방향전환:
 
 - `--goal_pattern lateral`, `--goal_pattern reverse`를 별도 실행.
 - lateral은 근접 0 m 목표가 섞이지 않게 좌/우 부호를 무작위로 고른 `|dy|=1–2 m`, reverse는 `dx=−1–−2 m`로 고정한다. 둘 다 `dtheta=0`이다.
-- switch 후 0–2 s min speed, time-to-0.5/0.8/1.0, initial bearing, gait-phase quarter별 응답을 `segments.csv`/JSON에 저장한다. heading/travel alignment time-series는 추가 후속 지표다.
+- switch 후 0–2 s min speed, time-to-0.5/0.8/1.0, initial bearing, gait-phase quarter별 응답을 `segments.csv`/JSON에 저장한다. 임계 도달은 raw speed가 아니라 **새 goal의 최초 world direction으로 투영한 filtered velocity**로 계산한다. 옛 방향으로 빨리 달리는 것은 lateral/reverse 성공으로 세지 않는다.
 
 symmetry/DR:
 
 - mirror involution `M(Mx)=x`, action/obs permutation bijection, policy equivariance error.
 - fixed encoder bias grid와 joint-group별 성능 저하.
-- feet fore-aft asymmetry, lateral offset, hip-yaw bias는 마지막 snapshot이 아니라 rollout time-series로 승격해야 한다.
+- forward path의 첫 접지 transition을 rollout 전체에서 streaming histogram으로 수집한다. heel body-x p10/median/p90, trunk 앞 접지 비율, 동적 target±1σ 비율, overstride, 접지 직전 하강속도 p90, contact-force p90, 좌/우 heel median 차이를 낸다. H1은 policy equivariance와 좌우 접지 bias를 함께 보고, H3는 heel target 개선과 impact 비열세를 직접 검증한다.
+
+외력 outcome의 시간 정렬도 다시 검사했다. HBatch의 새 wrench는 `simulate` 뒤에 설치되어 **다음 control step의 모든 physics substep**부터 작용한다. 따라서 설치와 같은 step에 이미 reset된 event는 `cancelled_before_application`으로 빼고, force 낙상과 impulse는 pre-step에 실제 active였던 wrench만 센다. recovery baseline은 설치 직후/적용 직전의 goal-progress speed다. 미회복 상태에서 segment가 바뀌거나 dwell/floor-recovery가 시작되면 recovery만 right-censor하고 survival은 계속 추적한다. episode timeout과 rollout 종료는 2 s/5 s survival denominator에서 관측 가능한 horizon만 남기며, physical fall은 censor가 아니라 회복 실패로 남긴다.
 
 ## 영상: top view 대신 simulator 시점에 표시
 
@@ -178,26 +210,31 @@ symmetry/DR:
 - path mode에는 별도 “final goal”이 없으므로 존재하지 않는 goal을 거짓으로 그리지 않는다.
 - H config에서 top-down constellation inset은 끄고 실제 simulator perspective overlay를 사용한다.
 
-2초 RGBA video smoke는 학습 전 실행되며 mp4 존재와 force event>0을 검사한다. 이는 과거 RGB/RGBA와 “record_video를 env build 뒤 켜서 graphics device가 −1이 된” 실패를 조기에 막는다.
+6초 RGBA video smoke는 학습 전 실행된다. 첫 외란이 3–4초에 오므로 2초 영상은 빨간 화살표를 구조적으로 담을 수 없었다. 이제 mp4/report 존재와 전체 force event뿐 아니라 **실제로 기록된 env0 force-active frame>0**을 검사한다. 이는 과거 RGB/RGBA, graphics device −1, “report에는 event가 있지만 영상에는 화살표가 없는” 실패를 함께 막는다.
 
 ## train + eval 단일 하네스
 
 `tools/run_hbatch_suite.sh`:
 
-1. H0–H3 config 생성.
-2. arm별 static → 300-step dynamic → 2 s perspective video smoke를 독립 실행.
-3. 통과한 arm만 GPU에 올린다.
-4. 성공 smoke log는 삭제하고, 실패한 arm만 `logs/hbatch/smoke_failures/Hx-codex.log`에 남긴다.
+1. committed H0–H3 config가 generator와 semantic하게 같은지 `--check`한다. **실행 중 tracked YAML을 다시 쓰지 않는다.** 과거 launcher가 YAML을 재생성해 서버 worktree를 dirty하게 만들고 다음 `git pull`을 막았던 문제를 제거했다.
+2. `[STATIC]`: task/interface/URDF와 새 path controller, full-grid restore, arrival/dwell, post-train reject gate를 exact 값으로 고정한다.
+3. `[PATH_MECHANICS]`: H event와 legacy push/kick를 모두 0으로 한 뒤 300-step rollout을 실행한다. per-env 초기 floor, deterministic radial floor/leash fixture, 모든 비-reroll step의 analytic rate budget, dwell world pose 정지·최소 지속시간·gait clock pause/resume, finite obs/reward, checkpoint-state round-trip을 hard gate로 검사한다.
+4. `[TRAIN_UPDATE]`: 64 env × horizon 24 × PPO 1 iteration의 disposable 학습을 실제로 수행한다. H1/H2 mirror transition augmentation, mirrored critic, backward/autograd와 각 arm reward가 본 학습 전에 한 번은 실행된다. 고유 tag로 생긴 smoke log directory만 종료 후 삭제한다.
+5. `[DISTURBANCE]`: path/grid/goal noise를 끈 별도 rollout에서 interval `3–4 s`, probability 1, ramp 1로 collision/support 두 class, 다섯 body, 크기 상한, force/torque 동일 body, env당 동시 active body≤1, 만료 clear를 검사한다. 추가로 force-active control step이 실제로 존재하고 wrench submit 호출 수가 정확히 `control steps × decimation`인지 검사해 1/10 impulse 회귀를 막는다. production hook에는 substep별 GPU→CPU 동기화가 없다.
+6. `[VIDEO]`: support-only 외란으로 10초 평가·앞 6초 녹화를 하고 실제 env0 force-active frame, renderer-confirmed 빨간 화살표, path carrot과 움직인 trace를 모두 요구한다.
+7. 다섯 stage를 가능한 끝까지 실행해 실패 원인을 한 로그에 모으고, 모두 통과한 arm만 GPU에 올린다. 성공 log는 삭제하고 실패 arm만 `logs/hbatch/smoke_failures/Hx-codex.log`에 남긴다.
 
-동적 smoke는 짧은 시간 안에 collision/support 두 class와 다섯 body를 모두 실행하기 위해 임시 config에서 외란 주기를 `3–4 s`, 확률을 `1.0`, ramp를 1 step으로 바꾼다. 6초×256 env에서 env당 첫 이벤트 약 1회면 coverage에 충분하고, 최대 1.5초인 support보다 주기가 길어 이벤트가 겹치지 않는다. 최초 구현의 `0.2–0.6 s`는 아직 외란을 학습하지 않은 G1 warm-start에 실제 H 학습 설정보다 약 64–110배 높은 event rate를 가했고, support 종료 전 새 body event를 생성해 무관한 lookahead-floor gate까지 실패시켰다. 판정 기준은 완화하지 않았다. per-env floor 초기화, rollout floor occupancy, goal rate limit, leash, finite reward/observation, force/torque 상한, 두 event class와 다섯 body coverage가 모두 hard gate다. runtime도 새 event 직전에 해당 env의 기존 force/torque 전체를 지워 한 번에 한 body에만 외란이 남도록 이중 방어한다.
+정책 성능과 코드 불변식을 섞지 않는다. frozen G1의 running floor occupancy와 dwell 도착률은 숫자를 그대로 `NOTE`로 남기지만 pre-training launch gate가 아니다. 반대로 floor controller의 2-D projection/rate limit/dwell 정지는 policy·외란과 무관한 hard gate다. 학습 뒤에는 `gap/lookahead<0.75`가 dwell-resume recovery를 제외하고 10% 이하, per-env leash 이탈이 1% 이하인지 reject gate로 판정한다. 이는 30% 기준을 50%로 완화한 것이 아니라 잘못된 pre-training 질문을 deterministic mechanics 검사와 post-training 성능 검사로 분리한 것이다.
+
+외란 stage의 6초×256 env에서 env당 첫 이벤트 약 1회면 coverage에 충분하고 최대 1.5초 support보다 주기가 길어 겹치지 않는다. 최초 구현의 `0.2–0.6 s`는 아직 외란을 학습하지 않은 G1 warm-start에 실제 H 학습 설정보다 약 64–110배 높은 event rate를 가했다. runtime도 새 event 직전에 해당 env의 기존 force/torque 전체를 지워 한 번에 한 body에만 외란이 남도록 이중 방어한다.
 
 `tools/train_and_eval_hbatch.sh`:
 
 1. train.
-2. warm-start를 `model_0.pth` 후보로 넣고 100/200/… 초기 checkpoint까지 selection에 강제 포함한다. 기존 tail 60% 편향을 제거한다.
-3. clean, force ON, goal-jitter, jitter+force, lateral, reverse, perspective force-video를 같은 run config로 평가한다.
-4. selection/report/segments/video를 arm별 공유 결과 폴더로 묶는다.
-5. 완료된 최신 H0–H3를 lock 하에 다시 비교해 `shared_eval_videos/hbatch/hbatch-comparison-codex.md`/`.json`을 갱신한다. H1/H2의 95% speed 비열세·10% 가속시간 회귀·순항 안정성, H3의 H0 대비 path fall 감소를 여기서 cross-arm gate로 판정한다.
+2. warm-start를 `model_0.pth` 후보로 넣고 100/200/… 초기 checkpoint까지 selection에 강제 포함한다. 기존 tail 60% 편향을 제거한다. 후보마다 seed뿐 아니라 task-grid/counter/optimizer와 무관한 env state를 같은 protocol로 되돌린다. H1/H2는 cruise sample coverage와 touchdown 좌우 bias, H2는 순항 안정성, H3는 touchdown target/overstride를 selection ratio에 직접 포함한다. 후반 두 stage에는 **공통 held-out 외력 profile**의 paired combined force+jitter screen도 붙인다. 이 판정은 `selection_gates_pass`이며 direction/force-recovery/video/cross-arm까지 통과했다는 뜻은 아니다.
+3. clean, force ON, goal-jitter, jitter+force, lateral, reverse, perspective force-video를 평가한다. 각 run config는 정책/구조를 재현하는 입력일 뿐이고, 시험 난이도를 정하는 noise/joint DR/disturbance는 모든 arm에 동일한 `hbatch_common_eval`로 교체된다.
+4. selection/report/segments/video를 먼저 `*-partial-<pid>`에 복사하고 모든 report와 nonempty mp4 검증 뒤 `COMPLETE` marker를 쓰고 원자적으로 최종 이름으로 바꾼다. 중간 실패 폴더는 비교 대상이 아니다.
+5. 완료된 최신 H0–H3만 lock 하에 다시 비교해 `shared_eval_videos/hbatch/hbatch-comparison-codex.md`/`.json`을 갱신한다. 각 report의 HBatch protocol version, env/eval code SHA, **effective test-config SHA**, seed, duration, env 수, task-state protocol이 H0와 정확히 같지 않으면 cross-arm PASS를 금지한다. H1은 H0 대비 mirror error와 좌우 touchdown bias, H2는 H1 대비 95% speed/cruise coverage 비열세·10% 가속시간 회귀 제한·세 순항 안정성 지표의 절대 상한과 non-worse/최소 하나 strict improvement, high-speed force recovery 비열세/최소 하나 strict improvement를 판정한다. H3는 H0 대비 heel target 개선·overstride/impact 비열세를 판정하고, path fall은 strict 감소 또는 둘 다 0을 요구한다.
 
 서버 실행:
 
@@ -207,20 +244,37 @@ conda activate k1goalpose
 bash tools/run_hbatch_suite.sh
 ```
 
+이전 launcher가 바꾼 네 YAML 때문에 `git pull`이 막힌 서버는 먼저 그 네 파일만 보존적으로 stash한다. 이 stash는 옛 generator 부산물이므로 새 config 위에 pop하지 않는다.
+
+```bash
+cd /mnt/DATA/workspace/ws_eungkyu/k1-goalpose
+git stash push -m "server-hbatch-yaml-before-codex-fix" -- \
+  htwk-gym/sweeps/hbatch/H0-codex.yaml \
+  htwk-gym/sweeps/hbatch/H1-codex.yaml \
+  htwk-gym/sweeps/hbatch/H2-codex.yaml \
+  htwk-gym/sweeps/hbatch/H3-codex.yaml
+git pull --ff-only
+cd htwk-gym
+bash tools/run_hbatch_suite.sh
+```
+
 현재 로컬에는 Isaac Gym/CUDA/PyYAML runtime이 없어 GPU dynamic/video smoke와 학습은 실행하지 않았다. Python syntax, shell syntax, config/URDF static invariant는 로컬에서 검사한다. 실제 GPU launch는 위 하네스가 smoke 통과 arm에만 수행한다.
 
 ## H 버전별 채택 기준
 
 | 판정 축 | H0 | H1 | H2 | H3 |
 |---|---|---|---|---|
-| waypoint | G1 5.52/7.42 cm보다 악화 금지, 목표는 median≤5 cm | H0 비열세 | H1 비열세 | H0 비열세 |
+| waypoint | G1 median/p90/heading `5.52/7.42 cm, 2.54°`보다 악화 금지, never-arrived≤1.5%; E0는 회복 목표 | H0의 세 지표 5% 이내, never-arrived≤1.5% | H1의 세 지표 5% 이내, never-arrived≤1.5% | H0의 세 지표 5% 이내, never-arrived≤1.5% |
 | speed | path mean median ≥0.95 m/s | H0의 95% 이상 | H1의 95% 이상; time-to-1.0 퇴화≤10% | H0의 95% 이상 |
-| falls | G1 path fall 2.06%보다 감소 | H0 비열세 | H1보다 감소 | H0보다 감소해야 gait 가설 지지 |
-| force | event>0, 5 s survival 목표≥98% | 동일 | speed-conditioned recovery 개선 | H0와 동일 |
-| stability | baseline 확보 | symmetry만 개선 | cruise pitch/roll/ωxy 개선, accel pitch 허용 | touchdown/impact만 개선 |
-| symmetry | 기록 | mirror error p90≤0.10 및 gait 좌우 bias 감소 | H1 유지 | 가설 아님 |
+| path floor/leash | recovery 제외 `gap/lookahead<0.75` ≤10%, leash 밖 ≤1% | 동일 | 동일 | 동일 |
+| falls | fall-context 전수 분류, 전체≤5/1000·waypoint≤2/1000 공통; G1 path 20.6/1000에서 path≤5/1000 | H0 path 비열세 | H1 path 비열세 | H0 path보다 감소; 둘 다 0이면 별도 필수 gate인 heel-target strict 개선과 impact 비열세로 gait 가설 판정 |
+| force | event>0, 5 s survival≥98%, recovery≤5 s share≥90%·p90≤2 s | 동일하며 high-speed reference 확보 | high-speed recovery share/p90 모두 H1 비열세, 하나 이상 strict 개선 | H0와 동일 |
+| stability/gait | baseline first-contact 분포 확보 | mirror p90≤0.10, H0 대비 policy equivariance strict 개선, 좌우 heel median 차이 개선 또는 이미 ≤5 mm | cruise coverage≥5% 및 H1의 95% 이상; pitch≤20°/roll≤15°/ωxy≤3 rad/s, 세 지표 모두 H1 비열세이고 하나 이상 strict 개선; accel pitch 허용 | touchdown 표본≥100, target±1σ≥40%이면서 H0보다 strict 개선, overstride≤10%·impact 비열세·path fall 감소 |
+| symmetry | 기록 | 좌우 touchdown bias 절대값≤2 cm | H1의 mirror/bias 보존 | 가설 아님 |
 
-H0가 G1 speed/accuracy를 보존하지 못하면 H1–H3의 해석 전에 dose를 더 낮춘다. H1이 speed를 해치면 mirror coefficient를 0.5→0.25로 낮춘다. H2가 가속을 10% 이상 늦추면 global pitch를 만지지 않고 steady gate/scale만 낮춘다. H3는 H0 대비 fall/impact 개선이 없으면 폐기한다.
+일반 `report.json`의 legacy `all_gates_pass`(waypoint median 5 cm, 전체 fall 0)는 참고로 계속 남긴다. 그러나 H selector/비교기가 이것을 위 H 전용 gate와 **동시에** 요구하지는 않는다. 그렇게 하면 H0의 명시적 G1 보존선 5.52 cm와 nonzero rate budget을 만족해도 legacy 5 cm/0 fall 때문에 구조적으로 FAIL이 되어 표의 기준과 모순된다. H checkpoint selection은 G1 waypoint `5.52/7.42 cm, 2.54°`와 H 절대/arm별 ratio만 사용하고, cross-arm 채택은 authoritative report 여부와 위 절대·상대 H gate를 직접 판정한다. 낙상은 완료구간만 세는 survivor bias를 피하려고 `(falls)/(completed+falls)×1000`으로 전체/waypoint/path를 각각 계산하며, 모든 fall context가 분류되지 않으면 통과시키지 않는다.
+
+H0가 G1 speed/accuracy를 보존하지 못하면 H1–H3의 해석 전에 dose를 더 낮춘다. H1이 speed를 해치면 mirror coefficient를 0.5→0.25로 낮춘다. H2가 가속을 10% 이상 늦추면 global pitch를 만지지 않고 steady gate/scale만 낮춘다. H3는 H0 대비 fall 감소가 없을 때 두 arm 모두 0 fall이 아니라면 폐기한다. 둘 다 0 fall이면 heel-target share가 strict 개선되고 impact가 비열세인 경우에만 gait 가설을 지지한다.
 
 ## humanoid locomotion sim-to-real에서 가장 자주 부딪히는 문제
 
@@ -250,11 +304,12 @@ H0가 G1 speed/accuracy를 보존하지 못하면 H1–H3의 해석 전에 dose�
 ## 최종 질문별 짧은 답
 
 - 고속 lean은 나쁜가? **가속 중 lean은 허용, steady cruise lean/ωxy만 줄인다.**
-- 기존 collision force는 충분히 컸나? **크기는 충돌급이나 trunk 한 점 wrench라 현실성은 부족하다.**
+- 기존 collision force는 충분히 컸나? **명목 설정은 컸지만 substep 적용 오류로 실제 impulse는 약 1/10이어서 충분했다고 볼 수 없다. H부터 전 substep 적용으로 수정했다.**
 - 그 force에도 괜찮았나? **외력 ON 평가가 없어 모른다.**
 - 외력은 한 군데였나? **기존은 Trunk 한 곳. H는 5개 body 중 하나로 분산한다.**
 - heel-ahead reward로 8번이 해결되나? **보장 못 하며 overstride 위험이 있어 H3로만 격리한다.**
 - joint position DR은 충분했나? **아니다. persistent encoder/motor offset이 빠져 있어 추가했다.**
-- 옆/뒤 goal에서 왜 느린가? **pose goal의 이동방향과 final heading이 분리되고 constellation이 둘을 묶어, 빠른 몸회전보다 느린 side/back-step이 보상상 합리적이기 때문이다.**
-- G1 압승인가? **G군 내부 yes, E0 대비 accuracy/falls는 열세.**
+- 옆/뒤 goal에서 왜 느리고 같은 방향인데도 가끔 빠른가? **pose goal의 이동방향과 final heading이 분리되고 constellation이 둘을 묶어, 빠른 몸회전보다 느린 side/back-step이 보상상 합리적이기 때문이다. 반대로 path heading/combined `dtheta`가 진행방향과 맞거나 현재 yaw·momentum·gait phase가 이미 유리하면 빠르다. viewer의 world 방향과 robot-local goal 방향이 다른 것도 육안상 “같은 방향” 편차를 만든다.**
+- G1 압승인가? **G군 내부에서 정확도와 속도를 함께 유지한 usable arm으로는 yes. raw speed만 보면 G3/G4 일부 수치가 더 높지만 overspeed·정확도 붕괴·낙상 때문에 winner가 아니다. E0 대비 accuracy/falls는 열세이고 기존 path_lag/grid로 숙련까지 주장할 수 없다.**
 - E1/E0가 좋은가? **E0는 종합 accuracy 1위, E1은 구형 path 속도 1위지만 현재 deploy winner 근거는 없다.**
+- E2 robust는 왜 느려졌고 H에서 어떻게 막나? **요구속도는 같았는데 body p90이 44.8% 줄고 53.34%가 never-arrived한 저이득 collapse다. bundled no-ramp robustness와 action-rate/progress 구조가 가장 유력하며, H는 low-dose/ramp, early-checkpoint selection, 1.5% never-arrived·speed/acceleration gate와 공통 force-ON eval로 재발을 막는다.**

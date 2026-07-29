@@ -1,5 +1,6 @@
 #!/bin/bash
-# Generate -> independent static/dynamic/video smoke -> launch only passing arms.
+# Verify frozen configs -> independent mechanics/train/disturbance/video smoke
+# -> launch only passing arms.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,7 +19,10 @@ if [ ! -f "$CKPT" ]; then
   echo "!!! G1@10700 warm start missing: $CKPT" >&2
   exit 1
 fi
-python tools/make_hbatch_configs.py >/dev/null
+# The committed configs are frozen experiment inputs.  Verify generator
+# agreement without rewriting tracked YAMLs (which previously dirtied the
+# server worktree and made the next git pull abort).
+python tools/make_hbatch_configs.py --check >/dev/null
 
 PASS=()
 for arm in H0 H1 H2 H3; do
@@ -34,7 +38,9 @@ for arm in H0 H1 H2 H3; do
     mv "$log" "$FAIL_DIR/${arm}-codex.log"
     echo "FAIL $arm -> $FAIL_DIR/${arm}-codex.log" >&2
     echo "--- $arm failure tail ---" >&2
-    tail -n 35 "$FAIL_DIR/${arm}-codex.log" >&2
+    # Staged smoke prints the failing stage and its detailed invariant report;
+    # keep enough context that the server log is actionable in one paste.
+    tail -n 80 "$FAIL_DIR/${arm}-codex.log" >&2
   fi
 done
 

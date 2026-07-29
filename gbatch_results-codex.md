@@ -4,7 +4,7 @@
 
 ## 결론
 
-- **G군 내부에서는 G1이 수치상 압승**이다. 위치, heading, strict success, 실제 이동속도가 모두 G2–G4보다 낫다.
+- **G군 내부의 배포 가능한 균형에서는 G1이 수치상 압승**이다. 위치, heading, strict success와 commanded-speed 추종을 함께 유지한 유일한 arm이다. raw path mean-speed median은 G3/G4 `1.212/1.190 m/s`가 G1 `1.038 m/s`보다 높고 body p90도 G4 `1.58`이 G1 `1.50 m/s`보다 높지만, 이들은 overspeed·정확도 붕괴·낙상을 동반하므로 “더 좋은 속도”가 아니다.
 - 그러나 G1은 E0보다 위치오차와 낙상이 악화됐다. G1은 Hbatch의 speed warm-start이지 곧바로 배포 winner는 아니다.
 - G2는 “안 움직여서 살아남는” 저속 collapse다. 외력 ON 평가가 없어 robust 성공으로 볼 수 없다.
 - G3와 G4는 문서의 ablation과 실제 config가 다르다. G3는 G1+G2가 아니며, G4는 순수 SmoothTurn 실험이 아니다.
@@ -41,7 +41,9 @@ G1은 G2/G3/G4 대비 위치 median이 각각 78.7/88.7/86.9% 낮고, p90도 91.
 - falls 38회 중 path 34회(89.5%). 완료+fall을 단순 attempt로 근사하면 path fall `34/(1613+34)=2.06%`, waypoint `4/(3019+4)=0.132%`, 약 **15.6배**다.
 - position gate 5 cm는 `5.52 cm`로 FAIL이다. speed 증가는 명백하지만 지속가능 1.3–1.5 m/s 상한은 현 데이터로 증명하지 못했다.
 
-grid `30/30 active`, success `0.9796`은 숙련 증거로 쓰면 안 된다. promotion 조건 `path_lag<2 m`가 leash 최대 3.5 m에 비해 너무 느슨해 구조적으로 쉽게 통과하며, cell별 achieved speed/curvature/fall 자료가 없다.
+위 `1.038 m/s`와 body p90 `1.50 m/s`는 G1이 실제로 빠르게 움직였다는 증거다. 그러나 이것을 “carrot을 올바른 간격으로 추종했다”는 증거와 혼동하면 안 된다.
+
+grid `30/30 active`, success `0.9796`, 기존 `path_lag/keepup`은 숙련 증거로 사용할 수 없다. 당시 `path_lag=max(gap-lookahead,0)`였으므로 robot이 carrot을 추월해 `gap<lookahead`가 된 floor 붕괴는 오히려 `lag=0`의 완벽한 성공으로 기록됐다. promotion은 이 one-sided 값에 `2 m`라는 느슨한 기준을 적용했고 dwell도 섞였다. raw gap median은 `0.622 m`지만 각 step의 sampled lookahead와 짝지어진 값이 없어 이 수치만으로 floor 충족을 복원할 수도 없다. 또 checkpoint에는 `grid_active/trials/success`가 저장되지 않아 `30/30`은 report 프로세스의 종료 snapshot이지 resume 가능한 학습 상태가 아니다. 정확한 표현은 **“G1은 30개 cell에 노출되며 빠르게 움직였지만, 기존 report는 양방향 path 추종 품질을 측정하지 못했다”**이다.
 
 ### G2 robust
 
