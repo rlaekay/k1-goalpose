@@ -86,7 +86,7 @@ H3는 다음처럼 보수적으로 제한한다.
 
 HBatch는 다음을 수정했다.
 
-- Trunk, 양 hip-roll, 양 knee body 중 하나를 event마다 선택한다. fixed 팔 link는 `collapse_fixed_joints=true`에서 Trunk로 합쳐지므로 upper-arm을 별도 body로 거짓 계수하지 않았다. 로드 후 5개 이름 중 하나라도 없으면 env 생성을 즉시 실패시킨다.
+- Trunk, 양 hip-roll, 양 shank body 중 하나를 event마다 선택한다. Isaac Gym은 knee joint 이름이 아니라 그 child rigid-body인 `Left_Shank`/`Right_Shank`를 노출한다. fixed 팔 link는 `collapse_fixed_joints=true`에서 Trunk로 합쳐지므로 upper-arm을 별도 body로 거짓 계수하지 않았다. 로드 후 5개 이름 중 하나라도 없으면 env 생성을 즉시 실패시킨다.
 - ENV_SPACE force로 world 방향을 유지.
 - reset 시 해당 env의 모든 force/torque/timer를 clear.
 - 외란을 ramp하며 event probability로 clean sample 비중을 보존.

@@ -33,6 +33,8 @@ for arm in H0 H1 H2 H3; do
   else
     mv "$log" "$FAIL_DIR/${arm}-codex.log"
     echo "FAIL $arm -> $FAIL_DIR/${arm}-codex.log" >&2
+    echo "--- $arm failure tail ---" >&2
+    tail -n 35 "$FAIL_DIR/${arm}-codex.log" >&2
   fi
 done
 

@@ -81,7 +81,7 @@ def common(base, name):
         # Fixed arm links are collapsed into Trunk by this asset.  Use five
         # bodies that remain independently addressable after asset loading.
         "body_names": ["Trunk", "Left_Hip_Roll", "Right_Hip_Roll",
-                       "Left_Knee_Pitch", "Right_Knee_Pitch"],
+                       "Left_Shank", "Right_Shank"],
         "collision": {"force_n": [40.0, 100.0], "torque_nm": [3.0, 12.0],
                       "duration_s": [0.05, 0.10]},
         "support": {"force_n": [3.0, 8.0], "torque_nm": [0.2, 1.0],

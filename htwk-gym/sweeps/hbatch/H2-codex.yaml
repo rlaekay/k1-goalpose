@@ -411,8 +411,8 @@ randomization:
     - Trunk
     - Left_Hip_Roll
     - Right_Hip_Roll
-    - Left_Knee_Pitch
-    - Right_Knee_Pitch
+    - Left_Shank
+    - Right_Shank
     collision:
       force_n:
       - 40.0

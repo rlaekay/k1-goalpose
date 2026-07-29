@@ -42,7 +42,7 @@ def static_checks(path):
             "mandatory external disturbance is nonzero")
     require(cfg["randomization"]["disturbance"]["body_names"] == [
                 "Trunk", "Left_Hip_Roll", "Right_Hip_Roll",
-                "Left_Knee_Pitch", "Right_Knee_Pitch"],
+                "Left_Shank", "Right_Shank"],
             "five independently loadable disturbance bodies are frozen")
     require(cfg["noise"]["goal_pos"]["range"][1] > 0 and
             cfg["noise"]["goal_bt_flicker"]["prob_per_step"] > 0,
