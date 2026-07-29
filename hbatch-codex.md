@@ -49,6 +49,19 @@ H에서는 이 실수를 다음처럼 막는다: low-dose H0에서 시작하고 
 
 H의 `initial_active: all`은 G1이 30개 cell을 실제로 **노출받았던 학습 분포**를 복원하는 장치이지 30개를 숙련했다는 주장이 아니다. 이후 checkpoint는 grid state와 scalar speed/EMA를 함께 저장·resume한다. 기존 G1 checkpoint에는 이 state가 없으므로 명시적 `all`이 필요하다. 일반 selection/eval은 후보마다 동일한 config protocol을 보장하기 위해 task state를 의도적으로 복원하지 않는다. checkpoint 고유 curriculum을 재현하는 진단만 `eval_goal_pose.py --restore_task_state`를 명시한다.
 
+### 2026-07-30 실제 launch에서 발견한 H1/H2 NaN과 재발 방지
+
+staged smoke가 네 arm을 모두 통과시킨 첫 실제 launch에서 H0/H3는 정상적으로 epoch를 진행했지만 H1/H2는 첫 PPO iteration 안에서 actor mean 전체가 NaN이 되어 종료됐다. 서버에서 G1@10700 checkpoint를 직접 읽은 결과 저장된 Adam LR는 `1.70859375e-4`였고, H YAML의 `5e-6`보다 **34.17배** 컸다. 기존 loader는 model뿐 아니라 이 optimizer state/LR를 복원하면서 controller scalar만 `5e-6`으로 남겨 첫 update를 숨은 고LR로 실행했다. H1/H2의 신규 reflected PPO score-gradient와 결합된 뒤 unclamped `exp(new_logprob-old_logprob)`가 overflow할 수 있었고, nonfinite gradient clipping도 fail-open이었다.
+
+기존 64-env 1-iteration smoke는 마지막 20번째 optimizer step 뒤 새 policy forward를 하지 않고 바로 정상 종료했으므로, 마지막 step이 NaN을 만들더라도 구조적으로 탐지하지 못하는 blind spot이 있었다. 수정 후에는 다음을 모두 hard gate로 둔다.
+
+- G1→H0–H3는 model과 task state만 같은 조건으로 warm-start하고 모두 fresh Adam `5e-6`에서 시작한다. 동일 H run의 진짜 resume에서만 optimizer 복원을 허용하며, 그때는 controller LR도 param-group LR와 동기화한다.
+- adaptive KL은 optimizer **후** original/mirrored policy를 다시 forward하고 둘 중 큰 KL로 제어한다. `KL=0`인 첫 pre-update 비교로 LR을 올리지 않으며 범위는 `1e-6–1e-5`다.
+- ordinary PPO는 전 arm에서, reflected PPO는 H1/H2에서 log-ratio exponent 입력을 ±10으로 제한한다. reflected action은 old mirrored Gaussian의 5σ support 안에서만 transition PPO에 쓰고 symmetry mean loss는 전체 표본에 유지한다.
+- rollout/return/logprob/loss/gradient/parameter/Adam state/post-update policy에 finite gate를 두고 `clip_grad_norm_(error_if_nonfinite=True)`로 최초 오염 지점에서 즉시 실패한다.
+- mirrored critic의 privileged COM-y는 실제 offset이 아니라 raw uniform latent `u∈[0,1]`였으므로 잘못된 `u→-u`를 물리적으로 맞는 `u→1-u`로 고쳤다. smoke는 original/mirrored latent가 모두 `[0,1]` support에 남는지 검사한다.
+- TRAIN_UPDATE는 production과 같은 `4096 env × horizon 24 × 5 epochs × 4 minibatches × 2 iterations`, 총 40 update와 마지막 post-update forward를 atomic health marker로 증명한다.
+
 ## H0–H3 frozen 정의
 
 공통:
@@ -60,6 +73,7 @@ H의 `initial_active: all`은 G1이 30개 cell을 실제로 **노출받았던 �
 - 새 팔 asset `K1_locomotion_hbatch-codex.urdf` 사용, arm script와 16-DOF armswing은 사용하지 않는다.
 - 모든 버전에 goal observation jitter, segment bias, 2–3 step hold, rare flicker와 multi-body force를 nonzero로 넣는다.
 - 모든 버전에 reset pose DR + episode-constant encoder bias + motor-target offset을 넣는다.
+- 모든 버전은 G1 model weight/task state만 warm-start하고 Adam state는 새로 시작한다. H 선언 LR은 `5e-6`, adaptive 범위는 `1e-6–1e-5`이며 네 arm이 같은 optimizer 출발점을 쓴다. 이 수정 이후 결과 protocol은 `2026-07-30-codex-v3`로 올려 예전 completed v2 suite가 새 arm과 비교되는 것을 금지한다.
 - H0/H3는 mirror loss와 mirror transition augmentation가 모두 0인 control이고, H1/H2만 두 항을 함께 켠다.
 
 | 버전 | modification | 가설 | 다른 버전과의 차이 |
@@ -72,7 +86,7 @@ H의 `initial_active: all`은 G1이 30개 cell을 실제로 **노출받았던 �
 정확한 config:
 
 - H0 force: interval 8–14 s, event probability 0.25, collision share 0.25, collision `40–100 N`, `3–12 N·m`, `0.05–0.10 s`, support `3–8 N`, `0.2–1 N·m`, `0.5–1.5 s`.
-- H1: H0 force 그대로, encoder bias ±0.025 rad, target offset ±0.020 rad, init q σ 0.075 rad, mirror augmentation 0.5, mirror loss 0.5.
+- H1: H0 force 그대로, encoder bias ±0.025 rad, target offset ±0.020 rad, init q σ 0.075 rad, mirror augmentation 0.5, mirror loss 0.5. reflected action이 frozen mirrored Gaussian에서 5σ 밖이면 tail PPO augmentation에서는 제외하되 mean-equivariance loss에는 남긴다. 매 update의 log-ratio는 `[-10,10]` 안에서 계산하고 유효 augmentation 표본이 10% 미만이면 실패한다.
 - H2: interval 6–12 s, base probability 0.35, collision share 0.35, 72,000 control-step ramp; path `v≥0.8 m/s`에서는 event probability를 2배(상한 1.0)로 높이고, goal flicker를 0.001→0.002/step, high-speed stability scale을 −0.5로 바꾼다. 따라서 H2가 이겨도 reward 하나의 인과효과가 아니라 이 세 요소의 bundle 효과로 해석한다.
 - 위 차이는 **학습 분포**다. 최종 cross-arm 평가는 arm별 설정을 그대로 시험하지 않는다. 네 arm 모두 같은 held-out profile(`interval 6–12 s`, probability 0.50, collision share 0.35, high-speed probability boost 2.0, ramp 1; encoder ±0.025 rad, target ±0.020 rad, init q σ 0.075 rad; goal flicker 0.001/step)을 강제한다. 그렇지 않으면 H2의 정책 효과와 더 어려운 시험지가 섞인다. 실제 적용된 commands/noise/randomization 전체를 SHA-256으로 report에 기록하고 report별 hash가 H0와 다르면 비교를 거부한다.
 - H3: H0와 같고 `heel_strike_ahead=+0.10`만 추가.
@@ -154,7 +168,7 @@ HBatch는 다음을 수정했다.
 
 - mirrored obs와 action으로 PPO log-prob를 다시 계산한다. 원 sample의 old log-prob를 재사용하지 않는다.
 - reward/done/advantage/return은 reflection에서 보존한다.
-- asymmetric critic의 14 privileged channels도 mirror한다: COM-y, linear-vy, force-y sign flip; torque는 axial vector라 Tx/Tz sign flip, Ty 유지.
+- asymmetric critic의 14 privileged channels도 mirror한다: COM-y raw latent는 `u→1-u`, linear-vy/force-y는 sign flip; torque는 axial vector라 Tx/Tz sign flip, Ty 유지.
 - H0/H3는 mirror loss와 transition augmentation를 모두 0으로 되돌린 비-mirror control이다. H1/H2만 loss `0.5`와 augmentation `0.5`를 함께 켜 사용자 요청의 전체 mirror intervention을 검증한다.
 
 NVIDIA Isaac Lab도 data augmentation와 mirror loss를 별도 switch로 정의한다: [Isaac Lab symmetry configuration](https://isaac-sim.github.io/IsaacLab/main/_modules/isaaclab_rl/rsl_rl/symmetry_cfg.html).
@@ -226,10 +240,10 @@ symmetry/DR:
 1. committed H0–H3 config가 generator와 semantic하게 같은지 `--check`한다. **실행 중 tracked YAML을 다시 쓰지 않는다.** 과거 launcher가 YAML을 재생성해 서버 worktree를 dirty하게 만들고 다음 `git pull`을 막았던 문제를 제거했다.
 2. `[STATIC]`: task/interface/URDF와 새 path controller, full-grid restore, arrival/dwell, post-train reject gate를 exact 값으로 고정한다.
 3. `[PATH_MECHANICS]`: H event와 legacy push/kick를 모두 0으로 한 뒤 300-step rollout을 실행한다. per-env 초기 floor, deterministic radial floor/leash fixture, 모든 비-reroll step의 analytic rate budget, dwell world pose 정지·최소 지속시간·gait clock pause/resume, finite obs/reward, checkpoint-state round-trip을 hard gate로 검사한다.
-4. `[TRAIN_UPDATE]`: 64 env × horizon 24 × PPO 1 iteration의 disposable 학습을 실제로 수행한다. H 전용 entrypoint도 다른 v3/v7 trainer와 같이 `isaacgym`을 `torch`보다 먼저 import한다. H1/H2 mirror transition augmentation, mirrored critic, backward/autograd와 각 arm reward가 본 학습 전에 한 번은 실행된다. 고유 tag로 생긴 smoke log directory만 종료 후 삭제한다.
+4. `[TRAIN_UPDATE]`: production과 같은 4096 env × horizon 24 × 5 epoch × 4 minibatch로 PPO 2 iteration, 총 40 update를 disposable하게 수행한다. H 전용 entrypoint도 다른 v3/v7 trainer와 같이 `isaacgym`을 `torch`보다 먼저 import한다. H1/H2 mirror transition augmentation, mirrored critic, backward/autograd와 각 arm reward가 본 학습 전에 실행되며, 고유 token의 atomic health marker가 exact shape·40 update·fresh `5e-6` optimizer·parameter 변화·finite gradient/Adam state·마지막 post-update forward를 증명해야 한다. 고유 tag로 생긴 smoke log directory만 종료 후 삭제한다.
 5. `[DISTURBANCE]`: path/grid/goal noise와 joint encoder/target offset을 `[0,0]`으로 끈 별도 rollout에서 interval `3–4 s`, probability 1, ramp 1로 collision/support 두 class, 다섯 body, 크기 상한, force/torque 동일 body, env당 동시 active body≤1, 만료 clear를 검사한다. range가 `[0,0]`인 DR은 “nonzero sample”을 요구하지 않고 runtime buffer가 실제 0인지 검사하므로 외력 격리 자체를 실패로 오판하지 않는다. 추가로 force-active control step이 실제로 존재하고 wrench submit 호출 수가 정확히 `control steps × decimation`인지 검사해 1/10 impulse 회귀를 막는다. production hook에는 substep별 GPU→CPU 동기화가 없다.
 6. `[VIDEO]`: support-only 외란으로 10초 평가·앞 6초 녹화를 하고 실제 env0 force-active frame, renderer-confirmed 빨간 화살표, path carrot과 움직인 trace를 모두 요구한다. 부모가 매 실행 고유 completion token을 발급하며, eval의 마지막 filesystem 작업인 `eval-complete-codex.json` atomic marker에 그 token과 이번 실행에서 실제 생성한 report/mp4의 byte 수·SHA-256을 기록한다. 별도 verifier가 token·marker·JSON counter·hash와 MP4 전 frame decode 수를 함께 검사해 재사용 경로의 stale artifact도 배제한다. Isaac Gym camera native teardown이 그 뒤 nonzero status를 내더라도 이 증거가 전부 일치할 때만 경고로 허용하고, 하나라도 빠지면 실패한다.
-7. 다섯 stage를 가능한 끝까지 실행해 실패 원인을 한 로그에 모으고, 모두 통과한 arm만 GPU에 올린다. 성공 log는 삭제하고 실패 arm만 `logs/hbatch/smoke_failures/Hx-codex.log`에 남긴다.
+7. 다섯 stage를 가능한 끝까지 실행해 실패 원인을 한 로그에 모으고, 모두 통과한 arm만 GPU에 올린다. 성공 smoke log는 삭제하고 실패 arm만 `logs/hbatch/smoke_failures/Hx-codex.log`에 남긴다. launch 뒤에도 각 tmux arm을 즉시 성공으로 선언하지 않고 production runner가 고유 token으로 2회 finite iteration을 attestation한 뒤 10초 grace와 최종 status/`pane_dead` 재검사까지 통과할 때까지 최대 300초 poll한다. 모든 arm pane을 만들 때까지 별도 anchor가 session을 유지해 첫 arm의 즉시 사망이 뒤 arm launch를 연쇄 실패시키지 않게 한다. arm wrapper 자체를 tmux의 첫 프로세스로 두고 conda activation·`cd`·train/eval 전부를 알려진 pending log 안에서 실행하며 child와 `tee`의 exit status를 둘 다 판정한다. bootstrap/nonzero/signal/log-I/O/timeout/marker 직후 사망은 arm별 `logs/hbatch/training_failures/Hx-codex.log`로 승격하고, 정상 arm의 pending copy는 최종 성공 시 삭제한다. `exec bash`로 죽은 pane을 살아 있는 것처럼 보이게 하던 방식은 제거했다.
 
 정책 성능과 코드 불변식을 섞지 않는다. frozen G1의 running floor occupancy와 dwell 도착률은 숫자를 그대로 `NOTE`로 남기지만 pre-training launch gate가 아니다. 반대로 floor controller의 2-D projection/rate limit/dwell 정지는 policy·외란과 무관한 hard gate다. 학습 뒤에는 `gap/lookahead<0.75`가 dwell-resume recovery를 제외하고 10% 이하, per-env leash 이탈이 1% 이하인지 reject gate로 판정한다. 이는 30% 기준을 50%로 완화한 것이 아니라 잘못된 pre-training 질문을 deterministic mechanics 검사와 post-training 성능 검사로 분리한 것이다.
 

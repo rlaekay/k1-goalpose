@@ -43,6 +43,15 @@ def static_checks(path):
     require(cfg["basic"]["task"] == "K1/Goal_Pose_HBatch", "HBatch task class selected")
     require(cfg["env"]["num_observations"] == 54 and cfg["env"]["num_actions"] == 12,
             "warm-start interface stays 54 observations / 12 actions")
+    require(cfg["runner"].get("load_optimizer_state") is False and
+            cfg["algorithm"].get("finite_checks") is True and
+            float(cfg["algorithm"].get("min_learning_rate", 0.0)) == 1.0e-6 and
+            float(cfg["algorithm"].get("max_learning_rate", 0.0)) == 1.0e-5 and
+            float(cfg["algorithm"].get("max_abs_log_ratio", 0.0)) == 10.0,
+            "fresh H optimizer, bounded adaptive LR and finite PPO are mandatory")
+    require(cfg["randomization"].get("base_com", {}).get("distribution") == "uniform" and
+            cfg["randomization"].get("base_com", {}).get("range") == [-0.1, 0.1],
+            "COM latent mirror assumes the frozen symmetric uniform range")
     path_cfg = cfg["commands"]["path"]
     require(path_cfg["speed_grid"]["enabled"], "G1 speed-curvature grid retained")
     require(path_cfg["speed_grid"].get("initial_active") == "all",
@@ -68,7 +77,7 @@ def static_checks(path):
             "arrival rewards and gait pause are restricted to dwell")
     gates = cfg["evaluation"]["hbatch_gates"]
     require(cfg["evaluation"].get("hbatch_protocol_version") ==
-            "2026-07-30-codex-v2",
+            "2026-07-30-codex-v3",
             "frozen HBatch campaign protocol version is explicit")
     common_eval = cfg["evaluation"].get("hbatch_common_eval") or {}
     eval_disturbance = common_eval.get("disturbance") or {}
@@ -137,8 +146,12 @@ def static_checks(path):
             "persistent encoder and motor-target offsets are enabled")
     if version in ("H1", "H2"):
         require(cfg["algorithm"]["symmetry_coef"] > 0 and
-                cfg["algorithm"]["mirror_augmentation_coef"] > 0,
-                "H1/H2 mirror loss and transition augmentation both enabled")
+                cfg["algorithm"]["mirror_augmentation_coef"] > 0 and
+                float(cfg["algorithm"].get(
+                    "mirror_augmentation_max_std", 0.0)) == 5.0 and
+                float(cfg["algorithm"].get(
+                    "mirror_augmentation_min_valid_share", 0.0)) == 0.10,
+                "H1/H2 mirror loss and support-bounded transition augmentation enabled")
     else:
         require(cfg["algorithm"].get("symmetry_coef", 0.0) == 0.0 and
                 cfg["algorithm"].get("mirror_augmentation_coef", 0.0) == 0.0,
@@ -210,10 +223,10 @@ def dynamic_command(config, checkpoint, args):
     ]
 
 
-def call_stage(name, cmd):
+def call_stage(name, cmd, env=None):
     print("\n[{}]".format(name), flush=True)
     try:
-        rc = subprocess.call(cmd, cwd=ROOT)
+        rc = subprocess.call(cmd, cwd=ROOT, env=env)
     except Exception as exc:
         print("FAIL  {} could not run: {}".format(name, exc), flush=True)
         return 1
@@ -228,7 +241,8 @@ def main():
     ap.add_argument("--sim_device", default="cuda:0")
     ap.add_argument("--rl_device", default="cuda:0")
     ap.add_argument("--steps", type=int, default=300)
-    ap.add_argument("--train_smoke_envs", type=int, default=64)
+    ap.add_argument("--train_smoke_envs", type=int, default=4096)
+    ap.add_argument("--train_smoke_iterations", type=int, default=2)
     ap.add_argument("--static_only", action="store_true")
     args = ap.parse_args()
 
@@ -258,6 +272,7 @@ def main():
 
     temp_paths = []
     video_dir = None
+    train_health_dir = None
     disturbance_path = None
     video_path = None
     try:
@@ -283,9 +298,10 @@ def main():
             failures.append("PATH_MECHANICS")
 
         # TRAIN_UPDATE: inference smoke cannot exercise H1/H2's mirrored PPO
-        # transition augmentation, critic reflection or backward pass.  Run one
-        # disposable short PPO iteration for every arm and delete only the
-        # uniquely tagged smoke log directory afterwards.
+        # transition augmentation, critic reflection or backward pass.  Match
+        # the production 4096-env PPO shape for two complete iterations: a
+        # one-iteration smoke never forwards the policy after its final update
+        # and therefore missed the H1/H2 NaN seen on the first server launch.
         train_tag = "smoke_train_{}_{}".format(
             os.path.basename(args.config).split("-")[0], os.getpid())
         train_root = os.path.join(
@@ -295,7 +311,7 @@ def main():
         try:
             train_cfg = copy.deepcopy(cfg)
             train_cfg["basic"]["description"] = train_tag
-            train_cfg["basic"]["max_iterations"] = 1
+            train_cfg["basic"]["max_iterations"] = args.train_smoke_iterations
             train_cfg["runner"]["use_wandb"] = False
             train_cfg["runner"]["save_interval"] = 1000000
             train_path = write_temp_config(train_cfg, "train-update")
@@ -305,10 +321,32 @@ def main():
                 "--task", "K1/Goal_Pose_HBatch", "--config", train_path,
                 "--headless", "True", "--checkpoint", args.checkpoint,
                 "--num_envs", str(args.train_smoke_envs),
-                "--max_iterations", "1", "--sim_device", args.sim_device,
+                "--max_iterations", str(args.train_smoke_iterations),
+                "--sim_device", args.sim_device,
                 "--rl_device", args.rl_device,
             ]
-            train_rc = call_stage("TRAIN_UPDATE", train_cmd)
+            train_health_dir = tempfile.mkdtemp(
+                prefix="hbatch-train-health-", suffix="-codex")
+            train_health_path = os.path.join(
+                train_health_dir, "health-codex.json")
+            train_health_token = secrets.token_hex(16)
+            train_env = os.environ.copy()
+            train_env.update({
+                "HBATCH_HEALTH_MARKER": train_health_path,
+                "HBATCH_HEALTH_TOKEN": train_health_token,
+                "HBATCH_HEALTH_ITERATIONS": str(args.train_smoke_iterations),
+            })
+            train_rc = call_stage("TRAIN_UPDATE", train_cmd, env=train_env)
+            if train_rc == 0:
+                verify_health_cmd = [
+                    sys.executable,
+                    os.path.join(ROOT, "tools", "verify_hbatch_health.py"),
+                    "--marker", train_health_path,
+                    "--health_token", train_health_token,
+                    "--num_envs", str(args.train_smoke_envs),
+                    "--min_iterations", str(args.train_smoke_iterations),
+                ]
+                train_rc = subprocess.call(verify_health_cmd, cwd=ROOT)
         except Exception as exc:
             print("\n[TRAIN_UPDATE]", flush=True)
             print("FAIL  TRAIN_UPDATE setup: {}".format(exc), flush=True)
@@ -318,6 +356,8 @@ def main():
                 os.path.join(train_root, "*_{}".format(train_tag))))
             for directory in sorted(after_train_dirs - before_train_dirs):
                 shutil.rmtree(directory, ignore_errors=True)
+            if train_health_dir is not None:
+                shutil.rmtree(train_health_dir, ignore_errors=True)
         if train_rc:
             failures.append("TRAIN_UPDATE")
 

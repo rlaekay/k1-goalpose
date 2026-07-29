@@ -19,17 +19,70 @@ Same STOP-file graceful early stop and checkpoint format as the parent, so
 tools/auto_stop.py and eval_goal_pose.py work unchanged.
 """
 
+import json
 import os
 
 import torch
 import torch.nn.functional as F
 
 from utils.runner import Runner
-from utils.utils import discount_values, surrogate_loss
+from utils.utils import discount_values
 from utils.recorder import Recorder
 
 
+def _bounded_surrogate_loss(old_logprob, new_logprob, advantages,
+                            max_abs_log_ratio):
+    """PPO surrogate whose exponent cannot overflow in float32.
+
+    The ordinary PPO clip happens after exp(log-ratio), which is too late for
+    mirrored synthetic actions in the tail of a narrow Gaussian.  Saturating
+    the log-ratio is a numerical guard; the usual epsilon clip still defines
+    the PPO objective inside that finite envelope.
+    """
+    log_ratio = torch.clamp(
+        new_logprob - old_logprob,
+        min=-float(max_abs_log_ratio), max=float(max_abs_log_ratio))
+    ratio = torch.exp(log_ratio)
+    surrogate = -advantages * ratio
+    surrogate_clipped = -advantages * torch.clamp(ratio, 0.8, 1.2)
+    return torch.max(surrogate, surrogate_clipped).mean()
+
+
+def _normal_kl(old_mu, old_sigma, new_mu, new_sigma):
+    return torch.sum(
+        torch.log(new_sigma / old_sigma)
+        + 0.5 * (torch.square(old_sigma) + torch.square(new_mu - old_mu))
+        / torch.square(new_sigma)
+        - 0.5,
+        dim=-1,
+    )
+
+
 class RunnerV3(Runner):
+
+    @staticmethod
+    def _require_finite(name, *tensors):
+        for tensor in tensors:
+            if tensor is None:
+                continue
+            if not bool(torch.isfinite(tensor).all().item()):
+                bad = int((~torch.isfinite(tensor)).sum().item())
+                raise FloatingPointError(
+                    "nonfinite {}: {} / {} values".format(
+                        name, bad, tensor.numel()))
+
+    @staticmethod
+    def _write_health_marker(path, payload):
+        if not path:
+            return
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        temporary = path + ".tmp-{}".format(os.getpid())
+        with open(temporary, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, path)
 
     def train(self):
         self.recorder = Recorder(self.cfg)
@@ -59,6 +112,42 @@ class RunnerV3(Runner):
         use_mirror_aug = mirror_aug_coef > 0.0 and hasattr(self.env, "mirror_obs")
         batch_size = horizon * self.env.num_envs
         mb_size = batch_size // num_minibatches
+        finite_checks = bool(self.cfg["algorithm"].get("finite_checks", False))
+        min_learning_rate = float(self.cfg["algorithm"].get(
+            "min_learning_rate",
+            min(float(self.cfg["algorithm"]["learning_rate"]), 1.0e-5)))
+        max_learning_rate = float(self.cfg["algorithm"].get(
+            "max_learning_rate", 1.0e-2))
+        if not (0.0 < min_learning_rate <= max_learning_rate):
+            raise ValueError("invalid adaptive learning-rate bounds: [{}, {}]".format(
+                min_learning_rate, max_learning_rate))
+        self.learning_rate = min(max_learning_rate,
+                                 max(min_learning_rate, self.learning_rate))
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = self.learning_rate
+        initial_optimizer_lr = self.learning_rate
+        max_abs_log_ratio = float(self.cfg["algorithm"].get(
+            "max_abs_log_ratio", 20.0))
+        mirror_max_std = float(self.cfg["algorithm"].get(
+            "mirror_augmentation_max_std", 5.0))
+        mirror_min_valid_share = float(self.cfg["algorithm"].get(
+            "mirror_augmentation_min_valid_share", 0.0))
+        if max_abs_log_ratio <= 0.0 or mirror_max_std <= 0.0:
+            raise ValueError("log-ratio and mirror-support bounds must be positive")
+
+        health_path = os.environ.get("HBATCH_HEALTH_MARKER", "")
+        health_token = os.environ.get("HBATCH_HEALTH_TOKEN", "")
+        health_iterations = max(
+            1, int(os.environ.get("HBATCH_HEALTH_ITERATIONS", "2")))
+        optimizer_steps = 0
+        max_grad_norm_seen = 0.0
+        initial_actor_parameters = [
+            parameter.detach().clone() for parameter in self.model.actor.parameters()]
+        last_mirror_valid_share = 1.0
+        if finite_checks:
+            self._require_finite("initial observations", obs, privileged_obs)
+            self._require_finite(
+                "initial model parameters", *list(self.model.parameters()))
 
         for it in range(self.cfg["basic"]["max_iterations"]):
             # ---- rollout (identical to parent) ------------------------------
@@ -68,6 +157,11 @@ class RunnerV3(Runner):
                 with torch.no_grad():
                     dist = self.model.act(obs)
                     act = dist.sample()
+                if finite_checks:
+                    self._require_finite(
+                        "rollout policy/action at iteration {} step {}".format(
+                            it + 1, n + 1),
+                        dist.loc, dist.scale, act)
                 obs, rew, done, infos = self.env.step(act)
                 obs, rew, done = obs.to(self.device), rew.to(self.device), done.to(self.device)
                 privileged_obs = infos["privileged_obs"].to(self.device)
@@ -79,6 +173,13 @@ class RunnerV3(Runner):
                 ep_info.update(infos["rew_terms"])
                 self.recorder.record_episode_statistics(done, ep_info, it, n == (horizon - 1))
 
+            if finite_checks:
+                self._require_finite(
+                    "rollout tensors at iteration {}".format(it + 1),
+                    self.buffer["obses"], self.buffer["privileged_obses"],
+                    self.buffer["actions"], self.buffer["rewards"], obs,
+                    privileged_obs)
+
             # ---- fixed reference policy for the whole update phase ----------
             with torch.no_grad():
                 old_dist = self.model.act(self.buffer["obses"])
@@ -87,6 +188,8 @@ class RunnerV3(Runner):
                 old_logprob = old_dist.log_prob(self.buffer["actions"]).sum(dim=-1).reshape(batch_size)
                 if use_mirror_aug:
                     old_mirror_dist = self.model.act(self.env.mirror_obs(self.buffer["obses"]))
+                    old_mirror_mu = old_mirror_dist.loc.reshape(batch_size, -1)
+                    old_mirror_sigma = old_mirror_dist.scale.reshape(batch_size, -1)
                     old_mirror_logprob = old_mirror_dist.log_prob(
                         self.env.mirror_actions(self.buffer["actions"])
                     ).sum(dim=-1).reshape(batch_size)
@@ -94,10 +197,32 @@ class RunnerV3(Runner):
             obs_b = self.buffer["obses"].reshape(batch_size, -1)
             priv_b = self.buffer["privileged_obses"].reshape(batch_size, -1)
             act_b = self.buffer["actions"].reshape(batch_size, -1)
+            mirrored_act_b = self.env.mirror_actions(act_b) if use_mirror_aug else None
+            if use_mirror_aug:
+                mirror_z = torch.abs(
+                    (mirrored_act_b - old_mirror_mu) / old_mirror_sigma)
+                mirror_valid = mirror_z.amax(dim=-1) <= mirror_max_std
+                last_mirror_valid_share = float(mirror_valid.float().mean().item())
+                if last_mirror_valid_share < mirror_min_valid_share:
+                    raise RuntimeError(
+                        "mirror augmentation support {:.3f} is below configured minimum "
+                        "{:.3f} at iteration {}".format(
+                            last_mirror_valid_share, mirror_min_valid_share, it + 1))
+            if finite_checks:
+                finite_refs = [old_mu, old_sigma, old_logprob]
+                if use_mirror_aug:
+                    finite_refs.extend([
+                        old_mirror_mu, old_mirror_sigma,
+                        old_mirror_logprob, mirror_z])
+                self._require_finite(
+                    "frozen PPO reference at iteration {}".format(it + 1),
+                    *finite_refs)
 
             stats = {"value_loss": 0.0, "actor_loss": 0.0,
                      "mirror_actor_loss": 0.0, "bound_loss": 0.0,
-                     "entropy": 0.0, "symmetry_loss": 0.0}
+                     "entropy": 0.0, "symmetry_loss": 0.0,
+                     "mirror_valid_share": 0.0, "grad_norm": 0.0,
+                     "mirror_kl_mean": 0.0}
             num_updates = 0
             kl_mean = torch.tensor(0.0, device=self.device)
 
@@ -119,6 +244,10 @@ class RunnerV3(Runner):
                     returns_b = (values_seq + advantages).reshape(batch_size)
                     adv_b = advantages.reshape(batch_size)
                     adv_b = (adv_b - adv_b.mean()) / (adv_b.std() + 1e-8)
+                    if finite_checks:
+                        self._require_finite(
+                            "returns/advantages at iteration {}".format(it + 1),
+                            values_seq, last_values, returns_b, adv_b)
 
                 perm = torch.randperm(batch_size, device=self.device)
                 for k in range(num_minibatches):
@@ -137,21 +266,36 @@ class RunnerV3(Runner):
 
                     dist = self.model.act(mb_obs)
                     logprob = dist.log_prob(act_b[idx]).sum(dim=-1)
-                    actor_loss = surrogate_loss(old_logprob[idx], logprob, adv_b[idx])
+                    actor_loss = _bounded_surrogate_loss(
+                        old_logprob[idx], logprob, adv_b[idx],
+                        max_abs_log_ratio)
 
                     mirror_actor_loss = torch.tensor(0.0, device=self.device)
                     mirrored_dist = None
+                    mirror_logprob = None
                     if use_mirror_aug:
                         mirrored_dist = self.model.act(self.env.mirror_obs(mb_obs))
-                        mirror_logprob = mirrored_dist.log_prob(
-                            self.env.mirror_actions(act_b[idx])
-                        ).sum(dim=-1)
-                        # A reflected transition has the same reward, done,
-                        # return and advantage.  Its PPO reference probability
-                        # must, however, come from pi_old(Ms) evaluated at Ma;
-                        # reusing the original logprob is mathematically wrong.
-                        mirror_actor_loss = surrogate_loss(
-                            old_mirror_logprob[idx], mirror_logprob, adv_b[idx])
+                        valid_local = mirror_valid[idx]
+                        valid_pos = torch.nonzero(
+                            valid_local, as_tuple=False).squeeze(-1)
+                        if valid_pos.numel() > 0:
+                            valid_actions = mirrored_act_b[idx][valid_pos]
+                            valid_mirror_dist = torch.distributions.Normal(
+                                mirrored_dist.loc[valid_pos],
+                                mirrored_dist.scale[valid_pos])
+                            mirror_logprob = valid_mirror_dist.log_prob(
+                                valid_actions).sum(dim=-1)
+                            # The reflected transition is a pseudo-on-policy
+                            # augmentation referenced to frozen pi_old(Ms).
+                            # Restrict it to transformed actions within the old
+                            # mirrored policy's configured Gaussian support;
+                            # the explicit mean-equivariance loss below covers
+                            # the remaining asymmetric samples without a tail
+                            # likelihood-ratio explosion.
+                            mirror_actor_loss = _bounded_surrogate_loss(
+                                old_mirror_logprob[idx][valid_pos],
+                                mirror_logprob, adv_b[idx][valid_pos],
+                                max_abs_log_ratio)
 
                     bound_loss = (
                         torch.clip(dist.loc - 1.0, min=0.0).square().mean()
@@ -174,25 +318,64 @@ class RunnerV3(Runner):
                         sym_loss = F.mse_loss(mirrored_dist.loc, self.env.mirror_actions(dist.loc))
                         loss = loss + sym_coef * sym_loss
 
+                    if finite_checks:
+                        self._require_finite(
+                            "PPO losses at iteration {} minibatch {}".format(
+                                it + 1, num_updates + 1),
+                            values, value_loss, dist.loc, dist.scale, logprob,
+                            actor_loss, mirror_actor_loss, mirror_logprob,
+                            bound_loss, entropy, sym_loss, loss)
                     self.optimizer.zero_grad()
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), 1.0,
+                        error_if_nonfinite=finite_checks)
                     self.optimizer.step()
+                    optimizer_steps += 1
+                    grad_norm_value = float(grad_norm.item())
+                    max_grad_norm_seen = max(max_grad_norm_seen, grad_norm_value)
+                    if finite_checks:
+                        self._require_finite(
+                            "model parameters after optimizer step {}".format(
+                                optimizer_steps),
+                            *list(self.model.parameters()))
 
-                    # adaptive-KL learning rate, same rule as the parent but on
-                    # the minibatch against the fixed pre-update reference
+                    # Re-forward AFTER optimizer.step.  The old implementation
+                    # measured the stale pre-step distribution, so its first KL
+                    # was exactly zero and increased LR without evidence.  For
+                    # mirrored arms, control against the worse of original and
+                    # mirrored KL.
                     with torch.no_grad():
-                        kl = torch.sum(
-                            torch.log(dist.scale / old_sigma[idx])
-                            + 0.5 * (torch.square(old_sigma[idx]) + torch.square(dist.loc - old_mu[idx])) / torch.square(dist.scale)
-                            - 0.5,
-                            axis=-1,
-                        )
-                        kl_mean = torch.mean(kl)
+                        post_dist = self.model.act(mb_obs)
+                        original_kl_mean = _normal_kl(
+                            old_mu[idx], old_sigma[idx],
+                            post_dist.loc, post_dist.scale).mean()
+                        mirror_kl_mean = torch.tensor(0.0, device=self.device)
+                        post_mirror_dist = None
+                        if use_mirror_aug:
+                            post_mirror_dist = self.model.act(
+                                self.env.mirror_obs(mb_obs))
+                            mirror_kl_mean = _normal_kl(
+                                old_mirror_mu[idx], old_mirror_sigma[idx],
+                                post_mirror_dist.loc,
+                                post_mirror_dist.scale).mean()
+                        kl_mean = torch.maximum(
+                            original_kl_mean, mirror_kl_mean)
+                        if finite_checks:
+                            self._require_finite(
+                                "post-update policy/KL at optimizer step {}".format(
+                                    optimizer_steps),
+                                post_dist.loc, post_dist.scale,
+                                post_mirror_dist.loc if post_mirror_dist is not None else None,
+                                post_mirror_dist.scale if post_mirror_dist is not None else None,
+                                original_kl_mean, mirror_kl_mean, kl_mean)
                         if kl_mean > self.cfg["algorithm"]["desired_kl"] * 2:
-                            self.learning_rate = max(1e-5, self.learning_rate / 1.5)
-                        elif kl_mean < self.cfg["algorithm"]["desired_kl"] / 2:
-                            self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                            self.learning_rate = max(
+                                min_learning_rate, self.learning_rate / 1.5)
+                        elif (kl_mean > 0 and
+                              kl_mean < self.cfg["algorithm"]["desired_kl"] / 2):
+                            self.learning_rate = min(
+                                max_learning_rate, self.learning_rate * 1.5)
                         for param_group in self.optimizer.param_groups:
                             param_group["lr"] = self.learning_rate
 
@@ -202,7 +385,51 @@ class RunnerV3(Runner):
                     stats["bound_loss"] += bound_loss.item()
                     stats["entropy"] += entropy.mean().item()
                     stats["symmetry_loss"] += sym_loss.item()
+                    stats["mirror_valid_share"] += last_mirror_valid_share
+                    stats["grad_norm"] += grad_norm_value
+                    stats["mirror_kl_mean"] += mirror_kl_mean.item()
                     num_updates += 1
+
+            with torch.no_grad():
+                post_update_probe = self.model.act(obs[:min(64, obs.shape[0])])
+            optimizer_state_tensors = []
+            for state in self.optimizer.state.values():
+                optimizer_state_tensors.extend(
+                    value for value in state.values()
+                    if isinstance(value, torch.Tensor))
+            if finite_checks:
+                self._require_finite(
+                    "post-iteration policy at iteration {}".format(it + 1),
+                    post_update_probe.loc, post_update_probe.scale)
+                self._require_finite(
+                    "optimizer state at iteration {}".format(it + 1),
+                    *optimizer_state_tensors)
+
+            parameter_delta = max(
+                float((parameter.detach() - initial).abs().max().item())
+                for parameter, initial in zip(
+                    self.model.actor.parameters(), initial_actor_parameters))
+            health_payload = {
+                "version": 1,
+                "status": "healthy",
+                "health_token": health_token,
+                "completed_iterations": it + 1,
+                "optimizer_steps": optimizer_steps,
+                "num_envs": self.env.num_envs,
+                "horizon_length": horizon,
+                "mini_epochs": mini_epochs,
+                "num_minibatches": num_minibatches,
+                "finite_checks": finite_checks,
+                "post_update_forward_finite": True,
+                "parameter_delta_max": parameter_delta,
+                "max_grad_norm_seen": max_grad_norm_seen,
+                "mirror_valid_share": last_mirror_valid_share,
+                "configured_learning_rate": float(
+                    self.cfg["algorithm"]["learning_rate"]),
+                "initial_optimizer_learning_rate": initial_optimizer_lr,
+                "current_learning_rate": self.learning_rate,
+                "checkpoint": self.cfg["basic"].get("checkpoint"),
+            }
 
             record = {name: value / num_updates for name, value in stats.items()}
             record.update(
@@ -222,6 +449,10 @@ class RunnerV3(Runner):
             if (it + 1) % self.cfg["runner"]["save_interval"] == 0:
                 self.recorder.save(self._checkpoint_payload(), it + 1)
             print("epoch: {}/{}".format(it + 1, self.cfg["basic"]["max_iterations"]))
+            if (it + 1 <= health_iterations or
+                    (it + 1) % self.cfg["runner"]["save_interval"] == 0 or
+                    it + 1 == self.cfg["basic"]["max_iterations"]):
+                self._write_health_marker(health_path, health_payload)
 
             # graceful early stop: tools/auto_stop.py (or a human) drops a STOP
             # file into the run dir when the reward curve plateaus

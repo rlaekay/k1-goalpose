@@ -199,10 +199,21 @@ class Runner:
                 self.env.load_checkpoint_state(model_dict["env_state"])
         except Exception as e:
             raise RuntimeError("Failed to load task checkpoint state: {}".format(e))
-        try:
-            self.optimizer.load_state_dict(model_dict["optimizer"])
-        except Exception as e:
-            print(f"Failed to load optimizer: {e}")
+        if self.cfg.get("runner", {}).get("load_optimizer_state", True):
+            try:
+                self.optimizer.load_state_dict(model_dict["optimizer"])
+                # load_state_dict restores the checkpoint param-group LR as
+                # well as Adam moments.  Keep the controller's scalar in sync
+                # so the first update and the subsequent adaptive-KL update do
+                # not silently use two different learning rates.
+                self.learning_rate = float(self.optimizer.param_groups[0]["lr"])
+                print("Restored optimizer state at lr={:.8g}".format(
+                    self.learning_rate))
+            except Exception as e:
+                print(f"Failed to load optimizer: {e}")
+        else:
+            print("Starting with a fresh optimizer at configured lr={:.8g}".format(
+                self.learning_rate))
 
     def _checkpoint_payload(self):
         payload = {

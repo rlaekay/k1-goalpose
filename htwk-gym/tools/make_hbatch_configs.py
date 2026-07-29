@@ -39,6 +39,10 @@ def common(base, name):
     })
     c["asset"]["file"] = ASSET
     c["arm_script"]["enabled"] = False
+    # G1 -> H changes the objective/distribution.  Reusing G1's Adam moments
+    # and checkpoint LR (observed 1.7086e-4) would make the first H update 34x
+    # larger than the declared 5e-6 and confound all four arm comparisons.
+    c["runner"]["load_optimizer_state"] = False
     c["commands"]["goal_mode_mixture"] = {"waypoint": 0.65, "path": 0.35}
     path = c["commands"]["path"]
     path["speed_grid"]["enabled"] = True
@@ -81,6 +85,14 @@ def common(base, name):
     # with half of H1's intervention and H3 is no longer gait-only.
     c["algorithm"]["symmetry_coef"] = 0.0
     c["algorithm"]["mirror_augmentation_coef"] = 0.0
+    c["algorithm"].update({
+        "finite_checks": True,
+        "min_learning_rate": 1.0e-6,
+        "max_learning_rate": 1.0e-5,
+        "max_abs_log_ratio": 10.0,
+        "mirror_augmentation_max_std": 5.0,
+        "mirror_augmentation_min_valid_share": 0.10,
+    })
     # Mandatory low-dose observation jitter in every H arm.
     c["noise"]["goal_pos"] = gaussian(0.015)
     c["noise"]["goal_heading"] = gaussian(0.020)
@@ -129,7 +141,7 @@ def common(base, name):
         "high_speed_threshold_mps": 0.8,
     })
     c["evaluation"].update({
-        "hbatch_protocol_version": "2026-07-30-codex-v2",
+        "hbatch_protocol_version": "2026-07-30-codex-v3",
         "hbatch_common_eval": {
             "noise_overrides": {
                 "goal_bt_flicker": {

@@ -152,6 +152,13 @@ def main():
         check("privileged mirror is an involution",
               bool(torch.allclose(env.mirror_privileged_obs(
                   env.mirror_privileged_obs(probe_p)), probe_p, atol=1e-6)))
+        privileged = env.privileged_obs_buf
+        mirrored_privileged = env.mirror_privileged_obs(privileged)
+        latent = torch.cat((privileged[:, :4], mirrored_privileged[:, :4]), dim=0)
+        check("privileged mirror preserves U[0,1] DR latent support",
+              bool(((latent >= 0.0) & (latent <= 1.0)).all()),
+              "original/mirrored latent [{:.4f}, {:.4f}]".format(
+                  float(latent.min().item()), float(latent.max().item())))
 
     encoder_cfg = cfg["randomization"].get("joint_encoder_bias")
     if encoder_cfg:

@@ -21,6 +21,7 @@ runner:
   save_interval: 100
   num_minibatches: 4
   use_wandb: false
+  load_optimizer_state: false
 viewer:
   pos:
   - 3.0
@@ -43,6 +44,12 @@ algorithm:
   desired_kl: 0.01
   symmetry_coef: 0.5
   mirror_augmentation_coef: 0.5
+  finite_checks: true
+  min_learning_rate: 1.0e-06
+  max_learning_rate: 1.0e-05
+  max_abs_log_ratio: 10.0
+  mirror_augmentation_max_std: 5.0
+  mirror_augmentation_min_valid_share: 0.1
 sim:
   dt: 0.002
   substeps: 1
@@ -651,7 +658,7 @@ evaluation:
     pos_p90_m: 0.1
     heading_median_deg: 10.0
     max_falls: 0
-  hbatch_protocol_version: 2026-07-30-codex-v2
+  hbatch_protocol_version: 2026-07-30-codex-v3
   hbatch_common_eval:
     noise_overrides:
       goal_bt_flicker:

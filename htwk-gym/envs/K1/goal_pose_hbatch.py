@@ -64,9 +64,15 @@ class GoalPoseHBatch(GoalPoseV7):
     # also have to be reflected for transition-level PPO augmentation.
     def mirror_privileged_obs(self, obs):
         out = obs.clone()
-        # base COM y; base linear vy; applied force y.  Torque is an axial
-        # vector, hence Tx and Tz change sign under a y reflection while Ty does not.
-        out[..., [1, 5, 9, 11, 13]] *= -1.0
+        # base_mass_scaled[0:4] stores the raw U[0,1] latent returned by
+        # apply_randomization(..., return_noise=True), not the physical offset.
+        # For symmetric uniform COM-y bounds, physical y -> -y is therefore
+        # latent u -> 1-u.  The old u -> -u sent the mirrored critic OOD values
+        # in [-1,0].
+        out[..., 1] = 1.0 - out[..., 1]
+        # base linear vy; applied force y. Torque is an axial vector, hence Tx
+        # and Tz change sign under a y reflection while Ty does not.
+        out[..., [5, 9, 11, 13]] *= -1.0
         return out
 
     def _reset_idx(self, env_ids):
