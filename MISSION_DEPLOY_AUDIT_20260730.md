@@ -14,11 +14,10 @@ Mac mission number
 ```
 
 그러나 2026-07-30 확인 시점의 상태를 **실기 mission-ready**라고 부를 수는 없다.
-E0 checkpoint `model_6200.pth`의 기대 서버 경로만 알고 있을 뿐 실제 존재/hash와
-TorchScript export 결과를 재확인하지 못했고, 로봇에는 `goal_pose_e0.pt`가 없다. 서버
-SSH가 Mac에서는 timeout, 로봇에서는 port 22 connection refused였기 때문이다. 따라서
-이번 세션에는 checkpoint export와 서버→로봇 policy 복사를 완료하지 못했다. 정책 파일
-없이 로봇을 CUSTOM/LowCmd로 진입시키면 안 된다.
+E0 checkpoint `model_6200.pth`와 frozen `config.yaml`은 서버에서 존재/hash를 확인했지만,
+TorchScript `model_6200.pt`는 아직 없고 로봇에도 `goal_pose_e0.pt`가 없다. 따라서
+checkpoint export와 서버→로봇 policy 복사는 아직 미완료다. 정책 파일 없이 로봇을
+CUSTOM/LowCmd로 진입시키면 안 된다.
 
 코드 측면에서는 Claude 반영분에 있던 Ctrl-C 종료 안전성, LowState freshness,
 policy bridge 가시성을 보강했다. `deploy_goal_pose.py`는 이제 CUSTOM 진입 후 어떤 종료
@@ -37,6 +36,7 @@ policy bridge 가시성을 보강했다. `deploy_goal_pose.py`는 이제 CUSTOM 
 | NaN/rpy watchdog이면 충분 | LowState가 끊겨도 마지막 sensor 값으로 추론·publish를 계속할 수 있었음 | 수정: `low_state_timeout_s: 0.20` watchdog 추가 |
 | telemetry로 end-to-end 확인 가능 | Brain telemetry만으로는 deploy가 topic을 실제 수신했는지, goal stale인지, actor action 범위가 어떤지 알 수 없음 | 수정: `/locomotion_test/policy_debug` 추가 |
 | 문서가 현재 구현을 설명 | `missions.md`는 여전히 LocalPlanner/velocity와 “adapter 미구현”을 설명하고, 새 Brain 코드는 polyline projection이 아니라 현재 waypoint 방향의 radial carrot을 사용 | 이 보고서와 `missions.md`를 현재 코드 기준으로 정정 |
+| 기존 deploy PD gain을 E0에도 재사용 | frozen E0@6200은 Hip/Knee `Kp=100,Kd=2`, Ankle `Kp=50,Kd=1`; 초안 deploy는 `200/5`, `50/3` | 수정: `Goal_Pose_E0.yaml`을 frozen gain에 일치시킴. 학습 이력에서도 PD gain 두 배 변경은 폐기됨 |
 
 ## 실제로 확인한 환경
 
@@ -74,11 +74,50 @@ policy bridge 가시성을 보강했다. `deploy_goal_pose.py`는 이제 CUSTOM 
 
 ### Training server
 
-- 기대 경로:
+- 실제 SSH endpoint는 `165.246.193.194:6666`이다. sshd가 IPv4/IPv6 all-address에서
+  6666 LISTEN 중이고 `user` 인증도 성공했다. 앞선 22번 포트 검사는 endpoint 자체가
+  잘못됐다.
+- Mac에는 default route가 두 개다. 우선 route가 robot 전용 Ethernet
+  `192.168.10.10(en13) -> 192.168.10.1`이라 평범한 `ssh -p 6666`도 TCP timeout이 났다.
+  Wi-Fi는 `10.10.124.17(en0) -> 10.10.120.1`이며 이 주소를 bind하면 6666 연결이 성공한다.
+- Robot은 서버 트래픽을 별도 Wi-Fi `192.168.0.35 -> 192.168.0.1`로 보내므로
+  `nc 165.246.193.194 6666`이 성공했다. Robot을 ProxyJump로 쓴 SSH 인증도 성공했다.
+- 현재 Mac에서 직접 접속하는 명령:
+
+  ```bash
+  MAC_WIFI_IP=$(ipconfig getifaddr en0)
+  ssh -b "$MAC_WIFI_IP" -p 6666 user@165.246.193.194
+  ```
+
+- fallback jump 경로:
+
+  ```bash
+  ssh -J booster@192.168.10.102 -p 6666 user@165.246.193.194
+  ```
+
+- 서버 repo는 `main` commit `3d34d27`이고 기존 untracked sweep/video 항목이 있다. pull,
+  checkout, edit를 하지 않았다.
+- checkpoint:
   `/mnt/DATA/workspace/ws_eungkyu/k1-goalpose/htwk-gym/logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_E0_armB_armsdown/nn/model_6200.pth`
-- `165.246.193.194:22`: Mac SSH timeout.
-- 같은 주소: 로봇에서 connection refused.
-- 따라서 서버 파일 존재/hash/export 결과를 이번 세션에는 재확인하지 못했다.
+  - size: `2,200,235 bytes`
+  - SHA-256: `d646da18c7209b9477cd24e8fb9224d2fe9e1137fe2bec2ddb4ab75e0a86eb8c`
+- frozen `config.yaml` SHA-256:
+  `1923a0fdf9fbe7b43cf72200d944759a077801372f67597bd8ec492d8f739f68`
+- 같은 `nn/`의 `model_6200.pt`는 존재하지 않는다. export는 실행하지 않았다.
+
+frozen config와 deploy contract 비교:
+
+| 항목 | frozen E0@6200 | local deploy | 판정 |
+|---|---:|---:|---|
+| observations/actions | 54 / 12 | 54 / 12 | 일치 |
+| goal dx/dy/dtheta | ±2.0 m / ±1.5 m / ±π | 동일 clamp/wrap | 일치 |
+| normalization | goal pos 0.5, heading 0.31831, dof pos 1.0, vel 0.1 | 동일 | 일치 |
+| default leg pose | HipPitch -0.2, Knee 0.4, AnklePitch -0.25, 나머지 0 | 동일 | 일치 |
+| action scale / decimation | 1.0 / 10 | 1.0 / 10 | 일치 |
+| neutral style slots | 모두 0 | 모두 0 | 일치 |
+| gait frequency | 학습 1.8–2.4 Hz | 2.0 Hz | 범위 내 |
+| Hip/Knee PD | 100 / 2 | 초안 200 / 5 → **100 / 2로 수정** | 수정 후 일치 |
+| Ankle PD | 50 / 1 | 초안 50 / 3 → **50 / 1로 수정** | 수정 후 일치 |
 
 ### 이번 세션에서 실제로 만든 robot staging과 검증 결과
 
@@ -89,6 +128,9 @@ policy bridge 가시성을 보강했다. `deploy_goal_pose.py`는 이제 CUSTOM 
   `deploy_goal_pose.py`/`policy_goal_pose.py`의 robot-side `py_compile`을 통과했다. 최신
   `deploy_goal_pose.py`의 Mac/robot SHA-256은 모두
   `83f292fa5f6aa11dde0ef9591d37d9e016165d136e984c07da2fc07904afa7b2`다.
+- frozen PD 수정 후 `Goal_Pose_E0.yaml`을 staging에 다시 복사했다. robot PyYAML parse와
+  23-entry/leg-slice assertion을 통과했고 Mac/robot SHA-256은 모두
+  `d12fc17dfce9d1392ff0ccdc0da3c5ecea1097cda2ac6e0e213756f4f149bc22`다.
 - `brain_ws/src/brain`: Mac sibling `INHA-Player`의 `afb731d2` Brain source를 복사했다.
 - 기존 경기 install을 dependency underlay로 source한 뒤 새 workspace에서
   `colcon build --packages-select brain --executor sequential --parallel-workers 1` 실행:
@@ -165,7 +207,7 @@ E0 observation:
 BT가 제공하는 값은 앞의 3개뿐이다. 나머지는 onboard sensor, internal state, config
 constant다.
 
-## 서버가 다시 열렸을 때: export와 복사
+## 서버에서 export와 복사
 
 서버에서 checkpoint를 TorchScript actor로 export한다. **현재 base YAML이 아니라 checkpoint의
 frozen run config가 최종 기준**이어야 한다. architecture는 54→12로 같아도 normalization,
@@ -202,7 +244,9 @@ scp logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_E0_armB_armsdown/nn/model_6200.p
 직접 route가 없으면 Mac relay를 쓴다:
 
 ```bash
-scp user@165.246.193.194:/mnt/DATA/workspace/ws_eungkyu/k1-goalpose/htwk-gym/logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_E0_armB_armsdown/nn/model_6200.pt \
+MAC_WIFI_IP=$(ipconfig getifaddr en0)
+scp -o BindAddress="$MAC_WIFI_IP" -P 6666 \
+  user@165.246.193.194:/mnt/DATA/workspace/ws_eungkyu/k1-goalpose/htwk-gym/logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_E0_armB_armsdown/nn/model_6200.pt \
   /tmp/goal_pose_e0.pt
 
 scp /tmp/goal_pose_e0.pt \
@@ -349,10 +393,9 @@ mission 실행 중 acceptance:
 
 ## 아직 남은 blocker
 
-1. 서버 접속 복구.
-2. Mac의 GitHub DNS/network 복구 후 두 repo `ekay-fix` push; 그 다음 server clean pull.
-3. frozen run config와 deploy config의 normalization/default pose/action scale 최종 diff.
-4. E0@6200 export, hash 기록, robot staging copy와 **정확한 E0 actor** smoke.
-5. 사람이 로봇 옆에서 hoist 승격 gate 수행.
+1. Mac의 GitHub DNS/network 복구 후 두 repo `ekay-fix` push; 그 다음 server clean pull.
+2. E0@6200 TorchScript export, `.pt` hash 기록, robot staging copy와 **정확한 E0 actor** smoke.
+3. frozen PD gain이 real LowCmd에 그대로 대응하는지 hoist에서 action/torque와 함께 확인.
+4. 사람이 로봇 옆에서 나머지 hoist 승격 gate 수행.
 
-이 다섯 항목 전에는 “mission 수행용으로 준비 완료”가 아니라 **코드/Brain staging 완료**다.
+이 네 항목 전에는 “mission 수행용으로 준비 완료”가 아니라 **코드/Brain staging 완료**다.

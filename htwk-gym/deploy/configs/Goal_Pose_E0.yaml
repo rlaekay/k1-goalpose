@@ -14,16 +14,18 @@ common:
     20, 20, 20, 20,
     20, 20, 20, 20,
     200,
-    200, 200, 200, 200, 50, 50,
-    200, 200, 200, 200, 50, 50
+    # Frozen E0@6200 config: Hip/Knee 100, Ankle 50 N*m/rad.
+    100, 100, 100, 100, 50, 50,
+    100, 100, 100, 100, 50, 50
   ]
   damping: [
     0.2, 0.2,
     0.5, 0.5, 0.5, 0.5,
     0.5, 0.5, 0.5, 0.5,
     5,
-    5, 5, 5, 5, 3, 3,
-    5, 5, 5, 5, 3, 3
+    # Frozen E0@6200 config: Hip/Knee 2, Ankle 1 N*m*s/rad.
+    2, 2, 2, 2, 1, 1,
+    2, 2, 2, 2, 1, 1
   ]
   # legs [11:23] MUST match E0 training default_joint_angles
   # (Hip_Pitch -0.2, Knee_Pitch 0.4, Ankle_Pitch -0.25, rest 0).

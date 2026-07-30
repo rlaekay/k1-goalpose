@@ -43,7 +43,7 @@ Laptop terminal
 | 3 | mission FSM + command/status topic 추가 | 완료 | Mac의 `missionctl.sh`가 robot-side ROS CLI를 통해 숫자 mission topic을 보낸다. |
 | 4 | mission/repeat/threshold/lookahead config화 | 완료 | `src/brain/config/config.yaml`의 `locomotion_test.*`에 모았다. 초기 도달 threshold는 10 cm, 6°다. |
 | 5 | E0 real LowCmd adapter | 코드 구현 | `policy_goal_pose.py`와 `deploy_goal_pose.py`가 ROS `goal_rel`→54 obs→12 action→23-joint LowCmd를 연결한다. 실기 policy 검증은 미완료. |
-| 6 | 로봇/server 준비 | 일부 완료/차단 | 별도 robot staging의 clean Brain build와 ROS bridge smoke는 통과. server SSH 불가, `goal_pose_e0.pt`가 robot에 없어 export/copy/hash/E0 smoke 전에는 실행 금지. |
+| 6 | 로봇/server 준비 | 일부 완료/차단 | clean Brain build와 ROS bridge smoke 통과. server `:6666` 접속 및 E0@6200 `.pth`/frozen config hash 확인. `.pt` 미export·robot 미복사이므로 export/copy/hash/E0 smoke 전에는 실행 금지. |
 
 ## 실행법
 

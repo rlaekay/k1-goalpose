@@ -438,9 +438,10 @@ heading_error = wrap_pi(goal_yaw_field - robot_yaw_field)
 goal_rel_y_m,heading_error_deg}`와 `/locomotion_test/goal_rel`에 동시에 나온다. telemetry의
 heading은 degree, 실제 policy topic의 `vector.z`는 radian이다.
 
-주의: robot-side syntax/ROS bridge/LowState gate와 clean Brain build는 비구동으로 통과했지만,
-E0@6200 파일과 CUSTOM 실기 구동은 검증하지 못했다. §4 TorchScript smoke → §8-6 LowState
-replay → §10 hoist stage 순서로 반드시 검증 후 지면 접촉한다.
+주의: robot-side syntax/ROS bridge/LowState gate와 clean Brain build는 비구동으로 통과했고,
+서버의 E0@6200 `.pth`와 frozen config hash도 확인했다. 그러나 `.pt` export와 CUSTOM 실기
+구동은 검증하지 못했다. §4 TorchScript smoke → §8-6 LowState replay → §10 hoist stage
+순서로 반드시 검증 후 지면 접촉한다.
 
 ### Deploy pipeline — 코드/정책이 로봇에 실리는 경로
 
