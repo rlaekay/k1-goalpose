@@ -1,8 +1,12 @@
 # E0 GoalPose Policy Real-Robot Deployment Guide
 
+> 2026-07-30 현장 감사 이후 mission-only 최종 실행 순서, Claude critic, 실제 robot/server
+> 상태와 최신 topic은 `MISSION_DEPLOY_AUDIT_20260730.md`가 우선한다. 이 문서의 §1–§7은
+> policy contract 설명, §8 이후는 구현 배경으로 읽는다.
+
 이 문서는 현재 repo 상태에서 `E0_armB_armsdown` policy를 Booster K1 실기 로봇에 올리기 위한 연결 가이드다.
 
-결론부터 말하면, E0는 "속도 명령 walk"가 아니라 "목표 pose error를 먹는 12-DOF leg policy"다. 따라서 기존 `deploy_parameter_walk.py`에 `.pt`만 갈아끼우면 안 된다. 기존 deploy wrapper는 `vx, vy, vyaw`를 obs[6:8]에 넣지만, E0는 `goal_rel_x, goal_rel_y, heading_error`를 obs[6:8]에 넣어야 한다. BT/local planner는 최종 속도를 만들지 말고, 로봇 로컬 프레임의 `(dx, dy, dtheta)`만 policy wrapper에 넘겨야 한다.
+결론부터 말하면, E0는 "속도 명령 walk"가 아니라 "목표 pose error를 먹는 12-DOF leg policy"다. 따라서 기존 `deploy_parameter_walk.py`에 `.pt`만 갈아끼우면 안 된다. 기존 deploy wrapper는 velocity 3값을 command block에 넣지만, E0는 observation index 6,7,8에 `goal_rel_x, goal_rel_y, heading_error`를 넣어야 한다. BT는 최종 속도를 만들지 말고, 로봇 로컬 프레임의 `(dx, dy, dtheta)`만 policy wrapper에 넘겨야 한다.
 
 ## 1. Source Base
 
@@ -252,7 +256,8 @@ heading_error clamp/wrap: [-pi, pi]
 
 - `LowState`가 끊기면 DAMP 또는 PREP 복귀
 - roll/pitch 절댓값이 1 rad 근처로 가면 중단
-- command stamp가 stale이면 `goal_rel_x/y/theta = 0`으로 두고 gait clock을 끄거나 매우 낮춘다
+- command stamp가 stale이면 applied `goal_rel_x/y/theta = 0`으로 둔다. 현재 E0 wrapper의
+  gait clock은 2 Hz로 계속 돈다. 따라서 이것은 learned zero-goal 요청이지 DAMPING/E-stop이 아니다.
 - action NaN/Inf면 즉시 중단
 - target jump limit을 둔다
 - torque limit은 config 값으로 clamp한다
@@ -390,7 +395,7 @@ common.dt: 0.002
   - `/locomotion_test/goal_pose` publish
   - `prep / ready / playing / finished` FSM
   - mission별 map-frame path 생성
-  - pure-pursuit style lookahead target 생성
+  - 현재 waypoint 방향의 radial carrot 생성(2 m cap)
 - `src/brain/config/config.yaml`
   - `locomotion_test.goal_reached_xy_m: 0.10`
   - `locomotion_test.goal_reached_theta_deg: 6.0`
@@ -400,8 +405,8 @@ common.dt: 0.002
 
 ```text
 이전 경로: LocomotionTest -> LocalPlanner -> RobotClient::setVelocity() -> SDK walk
-현재 경로: LocomotionTest -> /locomotion_test/goal_pose (map-frame carrot, PoseStamped)
-목표 경로: goal_pose -> GoalPoseAdapter(goal_rel) -> E0 actor -> LowCmd
+현재 경로: LocomotionTest -> /locomotion_test/goal_rel (robot-frame Vector3Stamped)
+          -> GoalPosePolicy -> E0 actor -> LowCmd
 ```
 
 INHA-Player `LocomotionTest`에서 velocity 제어기(LocalPlanner/setVelocity)를 **완전히 제거**했다. 이제 이 노드는 map-frame carrot goal만 publish한다. carrot은 현재 목표 waypoint 방향으로 `lookahead_max_m`(=2.0 m, E0 goal_rel_x 범위)까지 뻗는 점이고, spin mission은 heading을 60° 앞세운다. mission2/3는 heading 고정(후진/측면 gait). `locomotion_test.xml`에서 `RobocupWalk`(SDK gait 진입)도 제거했다 — E0 deploy가 CUSTOM 모드에서 low-level을 소유하므로 동시 구동 금지.
@@ -411,9 +416,13 @@ refactor 단위 상태:
 1. [done] `export_model.py` import 수정 (`utils.model`).
 2. [사용자] E0 actor-only TorchScript `.pt` export (§4 명령). smoke `[1,54]->[1,12]` 확인.
 3. [done] `htwk-gym/deploy/utils/policy_goal_pose.py` — E0 obs layout, goal_rel 입력.
-4. [done] `htwk-gym/deploy/configs/Goal_Pose_E0.yaml` — arms `default_qpos[0:11]`만 TODO(ekay).
-5. [done] `htwk-gym/deploy/deploy_goal_pose.py` — fixed/stdin goal source + NaN·rpy safety.
-6. [pending] 실기 live 연동: INHA-Player가 goal_rel(robot-frame dx,dy,dθ)을 topic으로 내보내고 deploy가 subscribe. bring-up(§10)은 fixed goal이라 6번 없이 진행 가능.
+4. [done/code] `htwk-gym/deploy/configs/Goal_Pose_E0.yaml` — K1 arms-down hold pose,
+   goal/debug topic, LowState/rpy safety 설정.
+5. [done/code] `htwk-gym/deploy/deploy_goal_pose.py` — ros/fixed/stdin source,
+   NaN·rpy·LowState watchdog, DAMPING cleanup, policy debug topic.
+6. [done/code] 실기 live 연동: INHA-Player가 `/locomotion_test/goal_rel`
+   (`Vector3Stamped`, m/m/rad)을 내고 deploy의 `--goal-source ros`가 subscribe한다.
+   policy 파일 복사와 실기 승격 검증은 별도 미완료다.
 
 live bridge용 goal_rel 계약(§5 식과 동일):
 
@@ -425,9 +434,13 @@ goal_rel_y = -sin(yaw)*dx_world + cos(yaw)*dy_world   # clamp [-1.5, 1.5]
 heading_error = wrap_pi(goal_yaw_field - robot_yaw_field)
 ```
 
-이 세 값은 이미 INHA-Player telemetry `pose_error_to_goal.{goal_rel_x_m, goal_rel_y_m, heading_error_deg}`로 나오고 있다. live bridge는 그 값을 그대로 topic으로 옮겨 `deploy_goal_pose.py`(stdin 자리 대체)에 넣으면 된다.
+이 세 값은 INHA-Player telemetry `pose_error_to_goal.{goal_rel_x_m,
+goal_rel_y_m,heading_error_deg}`와 `/locomotion_test/goal_rel`에 동시에 나온다. telemetry의
+heading은 degree, 실제 policy topic의 `vector.z`는 radian이다.
 
-주의: 아래 deploy 코드는 실기에서 여기 환경으로는 실행/검증하지 못했다. §4 TorchScript smoke → §8-6 LowState replay → §10 hoist stage 순서로 반드시 검증 후 지면 접촉.
+주의: robot-side syntax/ROS bridge/LowState gate와 clean Brain build는 비구동으로 통과했지만,
+E0@6200 파일과 CUSTOM 실기 구동은 검증하지 못했다. §4 TorchScript smoke → §8-6 LowState
+replay → §10 hoist stage 순서로 반드시 검증 후 지면 접촉한다.
 
 ### Deploy pipeline — 코드/정책이 로봇에 실리는 경로
 
@@ -438,43 +451,61 @@ heading_error = wrap_pi(goal_yaw_field - robot_yaw_field)
 3. **`.pt` → 로봇**: `.pt`는 대용량 바이너리라 git에 안 들어간다(`.gitignore`). rsync/scp로 옮긴다:
    ```bash
    # 서버 -> 보드로 직접, 또는 로컬 경유
-   scp <server>:.../nn/model_6200.pt  htwk-gym/deploy/models/goal_pose_e0.pt
+   # server -> robot direct route가 없으면 MISSION_DEPLOY_AUDIT_20260730.md의 Mac relay 사용
+   scp .../nn/model_6200.pt \
+     booster@192.168.10.102:/home/booster/Workspace/k1-goalpose-mission/deploy/models/goal_pose_e0.pt
    ```
 4. **Deploy 실행 = 로봇 보드에서**(`deploy/README.md`):
    ```bash
-   scp -r deploy/ <user>@<robot_ip>:/<dest>/      # models/goal_pose_e0.pt 포함
-   ssh <user>@<robot_ip> ; cd /<dest>/deploy
-   python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
-   # Booster SDK 설치, 로봇 PREP 모드
-   python deploy_goal_pose.py --config Goal_Pose_E0.yaml --net 127.0.0.1 --goal "0,0,0"
+   scp -r deploy/ booster@192.168.10.102:/home/booster/Workspace/k1-goalpose-mission/
+   ssh booster@192.168.10.102
+   cd /home/booster/Workspace/k1-goalpose-mission/deploy
+   source /opt/ros/humble/setup.bash
+   # system Python에서 rclpy/PyTorch/Booster SDK import가 확인된 로봇 환경을 사용
+   python deploy_goal_pose.py --config Goal_Pose_E0.yaml --net 127.0.0.1 \
+     --goal-source fixed --goal "0,0,0"
    ```
    `--net 127.0.0.1` = 보드 로컬 SDK. 서버에서 이 스크립트를 돌리는 게 아니다.
 
-### Mission 실행 런북 (E0 live, hoist 생략)
+### Mission 실행 런북 (E0 live)
 
-**세 프로세스**가 같은 `ROS_DOMAIN_ID`(예: 로봇 보드)에서 동시에 돈다. hoist/fixed goal 없이 바로 mission만 돌리는 경로다.
+**세 프로세스**가 같은 `ROS_DOMAIN_ID`(현재 robot은 0)에서 동시에 돈다. 단, 최초 한 번은
+E0@6200 hash/shape smoke와 fixed-goal hoist gate를 통과해야 한다. 이는 별도 기능 테스트가
+아니라 mission 지면 실행의 안전 전제다.
 
-**① Brain** — localization(ekay 카메라 PF) + mission BT + goal_rel publish (C++, colcon 빌드 필요):
+**① camera-PF vision** — 기존 경기 install은 dependency underlay로 읽기만 한다:
 ```bash
-cd <INHA-Player ws>
-colcon build --packages-select brain && source install/setup.bash
-# vision/카메라 노드도 같이 떠 있어야 marker로 PF가 수렴한다
-ros2 launch brain launch.py tree:=locomotion_test
+source /opt/ros/humble/setup.bash
+source /home/booster/Workspace/INHA-Soccer/INHA-Player/install/setup.bash
+source /home/booster/Workspace/k1-goalpose-mission/brain_ws/install/setup.bash
+ros2 launch vision launch.py vision_config_path:=/opt/booster \
+  ekay_odom:=true save_data:=false show_det:=false
 ```
 
-**② E0 deploy** — 정책 실행, goal_rel 구독 → LowCmd (파이썬, 빌드 없음, rclpy 필요):
+**② mission-only Brain** — 새 staging build의 BT/FSM과 goal_rel publisher:
 ```bash
-# ROS2 sourced + booster SDK가 import되는 파이썬에서 실행
-cd deploy
-python deploy_goal_pose.py --config Goal_Pose_E0.yaml --goal-source ros --net 127.0.0.1
+source /opt/ros/humble/setup.bash
+source /home/booster/Workspace/INHA-Soccer/INHA-Player/install/setup.bash
+source /home/booster/Workspace/k1-goalpose-mission/brain_ws/install/setup.bash
+ros2 launch brain launch.py tree:=locomotion_test \
+  vision_config_path:=/opt/booster disable_com:=true
+```
+
+**③ E0 deploy** — 정책 실행, goal_rel 구독 → LowCmd (파이썬, 빌드 없음, rclpy 필요):
+```bash
+source /opt/ros/humble/setup.bash
+cd /home/booster/Workspace/k1-goalpose-mission/deploy
+python3 deploy_goal_pose.py --config Goal_Pose_E0.yaml \
+  --goal-source ros --net 127.0.0.1
 # 로봇 PREP 상태에서 시작 → custom mode 진입 프롬프트를 따라 진행
 ```
 
-**③ mission 발사** (다른 터미널):
+**Mac에서 mission 발사/관찰** — Mac에는 ROS 2가 없어도 된다:
 ```bash
-ros2 topic echo /locomotion_test/telemetry     # odom_calibrated:true 될 때까지 대기
-ros2 topic pub --once /locomotion_test/mission_id std_msgs/msg/Int32 "{data: 1}"   # mission1
-# mission_id는 auto-start: start pose 도달 → 자동 PLAYING. 정지 = {data: 0}
+cd /Users/dmdrb/RoboCup/k1-goalpose
+./missionctl.sh watch telemetry                 # odom_calibrated:true까지 대기
+./missionctl.sh 1                               # mission1 autoplay
+./missionctl.sh 0                               # BT goal stop; emergency stop 아님
 ```
 
 **데이터 흐름:**
@@ -482,12 +513,14 @@ ros2 topic pub --once /locomotion_test/mission_id std_msgs/msg/Int32 "{data: 1}"
 camera ─► Brain(ekay PF) ─► robotPoseToField
                           ─► LocomotionTest: carrot(2m cap) ─► goal_rel(robot frame)
                           ─► /locomotion_test/goal_rel  (Vector3Stamped: x=fwd, y=left, z=heading_err[rad])
-        ─► deploy(--goal-source ros) ─► E0 actor obs[6:8] ─► LowCmd ─► 로봇 다리
-Brain이 goal_rel pub을 멈추면(READY/finished/idle) deploy가 stale ─► goal 0 ─► E0 정지.
+        ─► deploy(--goal-source ros) ─► E0 actor obs[6:9] ─► LowCmd ─► 로봇 다리
+Brain이 goal_rel pub을 멈추면(READY/finished/idle) deploy가 stale ─► goal 0.
+이는 E0의 learned zero-goal behavior 요청이지 hardware stop이 아니다. Ctrl-C/fault는 DAMPING,
+비상 상황은 물리 remote/E-stop으로 처리한다.
 ```
 
 **전제 3가지:**
-- ①②③가 같은 ROS 도메인(권장: 전부 로봇 보드). deploy 파이썬에 **rclpy가 import**돼야 함(ROS2 sourced 환경에서 실행).
+- ①②③가 같은 ROS 도메인(전부 로봇 보드). deploy 파이썬에 **rclpy가 import**돼야 함(ROS2 sourced 환경에서 실행).
 - 시작 위치에서 카메라가 **field marker를 봐야** PF가 수렴(`odom_calibrated=true`). 안 보이면 mission이 시작 안 된다(안전 게이트).
 - `config.yaml`에 `ekay_odom: true` (CUSTOM 모드에선 SDK odom이 없으므로 카메라 PF가 유일한 localization).
 
@@ -498,16 +531,21 @@ Brain이 goal_rel pub을 멈추면(READY/finished/idle) deploy가 stale ─► g
 ```text
 /locomotion_test/status        # 사람 확인용
 /locomotion_test/telemetry     # walk 비교/debug용 JSON stream
-/locomotion_test/goal_pose     # adapter 입력용, geometry/msg 또는 custom msg
+/locomotion_test/goal_pose     # map-frame carrot 시각화
+/locomotion_test/goal_rel      # E0 입력, Vector3Stamped(m,m,rad)
+/locomotion_test/policy_debug  # deploy 수신/freshness/action JSON
 ```
 
-현재는 `geometry_msgs/msg/PoseStamped`로 map-frame carrot을 낸다. 처음에는 topic이 가장 안전하다. 이유는 BT와 policy process를 분리해 한쪽 crash가 다른 쪽을 바로 죽이지 않고, `ros2 topic echo/bag`로 goal stream을 검증할 수 있기 때문이다. latency가 문제가 되면 같은 message contract를 유지한 채 shared memory 또는 in-process adapter로 옮긴다.
+`PoseStamped`는 visualization, 실제 adapter 입력은 robot-frame `Vector3Stamped`다. topic 분리는
+`ros2 topic echo/bag`으로 goal stream을 검증할 수 있다는 장점이 있다. latency가 문제가 되면
+같은 message contract를 유지한 채 shared memory 또는 in-process adapter로 옮긴다.
 
 policy 교체 방법:
 
 1. `locomotion_test.active_policy` 값을 `e0`, `e1_path`, `g1_speed` 등으로 바꾼다.
 2. adapter가 policy별 checkpoint/config/profile을 선택한다.
-3. `lookahead_default_m`, `lookahead_max_m`, `heading_blend_distance_m`만 policy profile에 맞춰 바꾼다.
+3. 현재 radial-carrot 구현에서는 `lookahead_max_m` cap과 deploy per-axis clamp를 policy
+   envelope에 맞춰 바꾼다. `lookahead_min/default`와 heading blend는 현재 계산에서 미사용이다.
 4. `locomotion_test.xml`과 mission sequence는 바꾸지 않는다.
 
 E0 기준 첫 값:
@@ -517,20 +555,21 @@ locomotion_test:
   active_policy: "e0"
   lookahead_min_m: 0.25
   lookahead_default_m: 0.55
-  lookahead_max_m: 0.90
+  lookahead_max_m: 2.0
   heading_blend_distance_m: 0.60
 ```
 
 판단 근거:
 
 - E0는 waypoint precision baseline이다. 현재 유효 결과는 위치 2.7 cm / p90 5.0 cm, heading 2.5°, strict 89.3%지만 path 학습은 없다.
-- `STATE_ESTIMATION.md` 기준 production GoalPose 입력 범위는 `dx∈[-2,2]`, `dy∈[-1.5,1.5]`다. 첫 실기는 이 범위를 벗기지 않는 짧은 lookahead가 맞다.
-- pure-pursuit 계열 문헌도 lookahead가 크면 smooth하지만 corner cutting과 tracking error가 커지고, 작으면 oscillation이 커지는 tradeoff를 말한다. 그래서 E0는 짧고 보수적인 값에서 시작한다.
+- `STATE_ESTIMATION.md` 기준 production GoalPose 입력 범위는 `dx∈[-2,2]`, `dy∈[-1.5,1.5]`다.
+- Brain의 radial cap은 2 m여서 lateral에서는 y가 1.5 m를 넘을 수 있다. deploy의 per-axis
+  clamp가 이를 제한하므로 path 방향 변형 여부를 telemetry로 확인한다.
 
 ## 9. What Not To Do
 
 - Do not replace `parameter_walk.pt` with E0 `.pt` while keeping `policy.py`.
-- Do not feed velocity command into E0 obs[6:8].
+- Do not feed velocity command into E0 observation index 6,7,8.
 - Do not let `setVel()` clamp E0 commands. E0 command clamp is pose-error range, not velocity range.
 - Do not move arms dynamically in the first real test.
 - Do not call SDK WALK/native locomotion and CUSTOM low-level policy at the same time.

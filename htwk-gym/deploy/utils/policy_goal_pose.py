@@ -37,6 +37,7 @@ class GoalPosePolicy:
         self.policy = torch.jit.load(cfg["policy"]["policy_path"])
         self.policy.eval()
         self._init_inference_variables()
+        self._validate_policy_contract()
 
     def get_policy_interval(self):
         return self.policy_interval
@@ -81,6 +82,30 @@ class GoalPosePolicy:
         self.actions = np.zeros(self.num_act, dtype=np.float32)
         self.dof_targets = np.copy(self.default_dof_pos)
 
+        if self.default_dof_pos.shape != (23,):
+            raise ValueError(
+                f"common.default_qpos must contain 23 K1 joints, got {self.default_dof_pos.shape}"
+            )
+        if self.leg_start + self.num_act != self.default_dof_pos.size:
+            raise ValueError(
+                "policy leg slice does not cover exactly the final 12 K1 joints: "
+                f"leg_start={self.leg_start}, num_actions={self.num_act}, "
+                f"joints={self.default_dof_pos.size}"
+            )
+
+    def _validate_policy_contract(self):
+        """Fail before CUSTOM mode if the copied TorchScript is the wrong actor."""
+        with torch.inference_mode():
+            output = self.policy(torch.zeros((1, self.num_obs), dtype=torch.float32))
+        if not isinstance(output, torch.Tensor):
+            raise TypeError(f"policy must return a Tensor, got {type(output)!r}")
+        if tuple(output.shape) != (1, self.num_act):
+            raise ValueError(
+                f"policy contract mismatch: expected (1,{self.num_act}), got {tuple(output.shape)}"
+            )
+        if not torch.isfinite(output).all():
+            raise ValueError("policy produced non-finite output for a zero-observation smoke test")
+
     @staticmethod
     def _wrap_pi(a):
         return (a + np.pi) % (2.0 * np.pi) - np.pi
@@ -107,7 +132,9 @@ class GoalPosePolicy:
         self.obs[30:42] = dof_vel[ls:] * n["dof_vel"]
         self.obs[42:54] = self.actions
 
-        self.actions[:] = self.policy(torch.from_numpy(self.obs).unsqueeze(0)).detach().numpy()
+        with torch.inference_mode():
+            output = self.policy(torch.from_numpy(self.obs).unsqueeze(0))
+        self.actions[:] = output.squeeze(0).cpu().numpy()
         self.actions[:] = np.clip(self.actions, -self.clip_actions, self.clip_actions)
 
         self.dof_targets[:] = self.default_dof_pos

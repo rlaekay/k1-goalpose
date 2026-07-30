@@ -117,4 +117,12 @@ deploy_goal:
   goal_rel_x: 0.0
   goal_rel_y: 0.0
   heading_error: 0.0
-  stale_timeout_s: 0.5        # live source only: zero the goal if no update within this
+  topic: "/locomotion_test/goal_rel"
+  debug_topic: "/locomotion_test/policy_debug"
+  stale_timeout_s: 0.5        # live source only: replace a stale goal with (0,0,0)
+  debug_period_s: 0.10        # 10 Hz end-to-end policy bridge diagnostics
+
+safety:
+  # Stop LowCmd publication and request DAMPING if robot state stops arriving.
+  low_state_timeout_s: 0.20
+  roll_pitch_limit_rad: 1.0

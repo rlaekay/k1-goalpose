@@ -18,6 +18,7 @@ guide's TorchScript smoke + a LowState replay before ground contact.
 """
 
 import argparse
+import json
 import logging
 import os
 import signal
@@ -108,67 +109,120 @@ class RosGoalSource:
         vector.x = goal_rel_x [m] (forward), vector.y = goal_rel_y [m] (left),
         vector.z = heading_error [rad], already in the robot-local frame and
     recomputed every BT tick from camera-PF localization. We just hold the
-    latest; a stale message (no update within stale_timeout_s) zeros the goal so
-    E0 stands (guide section 6 watchdog).
+    latest; a stale message (no update within stale_timeout_s) replaces the
+    command with (0,0,0). That requests E0's learned zero-goal behavior; it is
+    not a hardware stop. Ctrl-C/fault cleanup separately requests DAMPING.
 
     Requires rclpy importable in this process: run with ROS2 sourced and on the
     same ROS_DOMAIN_ID as the Brain (e.g. both on the robot board).
     """
 
-    def __init__(self, cfg, topic="/locomotion_test/goal_rel"):
+    def __init__(self, cfg, topic=None, debug_topic=None):
         import rclpy
         from rclpy.node import Node
         from geometry_msgs.msg import Vector3Stamped
+        from std_msgs.msg import String
 
         self._rclpy = rclpy
         dg = cfg.get("deploy_goal", {})
+        topic = topic or str(dg.get("topic", "/locomotion_test/goal_rel"))
+        debug_topic = debug_topic or str(
+            dg.get("debug_topic", "/locomotion_test/policy_debug")
+        )
         self._stale_timeout = float(dg.get("stale_timeout_s", 0.5))
         self._goal = np.zeros(3, dtype=np.float32)
         self._last = 0.0
         self._lock = threading.Lock()
+        self._received = 0
+        self._rejected = 0
 
         if not rclpy.ok():
             rclpy.init(args=None)
         self._node = Node("e0_goal_rel_sub")
         self._node.create_subscription(Vector3Stamped, topic, self._cb, 10)
+        self._debug_pub = self._node.create_publisher(String, debug_topic, 10)
+        self.topic = topic
+        self.debug_topic = debug_topic
         self._spin = threading.Thread(target=lambda: rclpy.spin(self._node), daemon=True)
         self._spin.start()
 
     def _cb(self, msg):
+        goal = np.array((msg.vector.x, msg.vector.y, msg.vector.z), dtype=np.float32)
         with self._lock:
-            self._goal[:] = (msg.vector.x, msg.vector.y, msg.vector.z)
+            if not np.all(np.isfinite(goal)):
+                self._rejected += 1
+                return
+            self._goal[:] = goal
             self._last = time.monotonic()
+            self._received += 1
 
-    def get(self):
+    def get_with_status(self):
         with self._lock:
-            if (time.monotonic() - self._last) > self._stale_timeout:
-                return 0.0, 0.0, 0.0  # no fresh goal -> stand
-            return float(self._goal[0]), float(self._goal[1]), float(self._goal[2])
+            age = float("inf") if self._last <= 0.0 else time.monotonic() - self._last
+            stale = age > self._stale_timeout
+            goal = (0.0, 0.0, 0.0) if stale else tuple(float(v) for v in self._goal)
+            status = {
+                "goal_age_sec": None if not np.isfinite(age) else age,
+                "goal_stale": stale,
+                "goal_messages_received": self._received,
+                "goal_messages_rejected": self._rejected,
+            }
+            return goal, status
+
+    def publish_debug(self, payload):
+        from std_msgs.msg import String
+
+        msg = String()
+        msg.data = json.dumps(payload, allow_nan=False, separators=(",", ":"))
+        self._debug_pub.publish(msg)
+
+    def close(self):
+        if self._rclpy.ok():
+            self._node.destroy_node()
+            self._rclpy.shutdown()
+        if self._spin.is_alive():
+            self._spin.join(timeout=1.0)
 
 
 class Controller:
-    def __init__(self, cfg_file, goal_source_mode="ros", initial_goal=None) -> None:
+    def __init__(self, cfg_file, goal_source_mode="ros", initial_goal=None,
+                 goal_topic=None, debug_topic=None) -> None:
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
 
         with open(cfg_file, "r", encoding="utf-8") as f:
             self.cfg = yaml.load(f.read(), Loader=yaml.FullLoader)
 
-        self.remoteControlService = RemoteControlService()
+        # Load and contract-check the actor before creating SDK/remote-control
+        # services. A missing or wrong model must fail without touching robot I/O.
         self.policy = GoalPosePolicy(cfg=self.cfg)
 
         self.goal_source_mode = goal_source_mode
         if goal_source_mode == "ros":
-            self.goal_source = RosGoalSource(self.cfg)  # mission mode: live BT bridge
+            self.goal_source = RosGoalSource(
+                self.cfg, topic=goal_topic, debug_topic=debug_topic
+            )  # mission mode: live BT bridge
         else:
             self.goal_source = GoalSource(self.cfg, initial=initial_goal)  # fixed/stdin
+
+        self.remoteControlService = RemoteControlService()
+
+        # Initialize every field touched by an SDK callback before opening the
+        # channels: InitChannel may deliver LowState immediately.
+        self.publish_runner = None
+        self.running = True
+        self.publish_lock = threading.Lock()
+        self._cleanup_lock = threading.Lock()
+        self._cleaned_up = False
+        self._custom_mode_started = False
+        self._last_low_state_monotonic = 0.0
+        self._last_debug_monotonic = 0.0
+        self._last_goal = (0.0, 0.0, 0.0)
+        self._latest_rpy = np.zeros(3, dtype=np.float32)
 
         self._init_timer()
         self._init_low_state_values()
         self._init_communication()
-        self.publish_runner = None
-        self.running = True
-        self.publish_lock = threading.Lock()
 
     def _init_timer(self):
         self.timer = Timer(TimerConfig(time_step=self.cfg["common"]["dt"]))
@@ -201,7 +255,11 @@ class Controller:
 
     def _low_state_handler(self, low_state_msg: LowState):
         # Safety watchdog: a large base roll/pitch means the robot is going over.
-        if abs(low_state_msg.imu_state.rpy[0]) > 1.0 or abs(low_state_msg.imu_state.rpy[1]) > 1.0:
+        self._last_low_state_monotonic = time.monotonic()
+        self._latest_rpy[:] = low_state_msg.imu_state.rpy
+        rpy_limit = float(self.cfg.get("safety", {}).get("roll_pitch_limit_rad", 1.0))
+        if (abs(low_state_msg.imu_state.rpy[0]) > rpy_limit or
+                abs(low_state_msg.imu_state.rpy[1]) > rpy_limit):
             self.logger.warning("IMU base rpy too large: {}".format(low_state_msg.imu_state.rpy))
             self.running = False
         self.timer.tick_timer_if_sim()
@@ -224,26 +282,62 @@ class Controller:
         self.low_cmd_publisher.Write(cmd)
 
     def cleanup(self) -> None:
-        self.remoteControlService.close()
-        if hasattr(self, "low_cmd_publisher"):
-            self.low_cmd_publisher.CloseChannel()
-        if hasattr(self, "low_state_subscriber"):
-            self.low_state_subscriber.CloseChannel()
-        if hasattr(self, "publish_runner") and getattr(self, "publish_runner") is not None:
-            self.publish_runner.join(timeout=1.0)
+        with self._cleanup_lock:
+            if self._cleaned_up:
+                return
+            self._cleaned_up = True
+            self.running = False
+
+            if self.publish_runner is not None and self.publish_runner.is_alive():
+                self.publish_runner.join(timeout=1.0)
+
+            # Ctrl-C/SystemExit also comes through __exit__. Always leave CUSTOM
+            # mode before closing the command channel once we entered it.
+            if self._custom_mode_started and hasattr(self, "client"):
+                try:
+                    self.client.ChangeMode(RobotMode.kDamping)
+                except Exception as exc:
+                    self.logger.error("Failed to request DAMPING during cleanup: %s", exc)
+
+            if hasattr(self.goal_source, "close"):
+                self.goal_source.close()
+            self.remoteControlService.close()
+            if hasattr(self, "low_cmd_publisher"):
+                self.low_cmd_publisher.CloseChannel()
+            if hasattr(self, "low_state_subscriber"):
+                self.low_state_subscriber.CloseChannel()
 
     def start_custom_mode_conditionally(self):
+        self._require_fresh_low_state("before waiting for CUSTOM mode")
         print(f"{self.remoteControlService.get_custom_mode_operation_hint()}")
         while True:
             if self.remoteControlService.start_custom_mode():
                 break
             time.sleep(0.1)
+
+        # The operator may spend an arbitrary amount of time at the remote-control
+        # prompt.  Re-check immediately before the first LowCmd and mode change;
+        # the earlier check alone cannot make that transition safe.
+        self._require_fresh_low_state("immediately before CUSTOM mode")
         create_prepare_cmd(self.low_cmd, self.cfg)
         for i in range(B1JointCnt):
             self.dof_target[i] = self.low_cmd.motor_cmd[i].q
             self.filtered_dof_target[i] = self.low_cmd.motor_cmd[i].q
         self._send_cmd(self.low_cmd)
+        # Mark the transition as attempted before the SDK call: if ChangeMode
+        # raises after the robot accepted it, cleanup must still request DAMPING.
+        self._custom_mode_started = True
         self.client.ChangeMode(RobotMode.kCustom)
+
+    def _require_fresh_low_state(self, context):
+        low_state_timeout = float(self.cfg.get("safety", {}).get("low_state_timeout_s", 0.2))
+        low_state_age = time.monotonic() - self._last_low_state_monotonic
+        if self._last_low_state_monotonic <= 0.0 or low_state_age > low_state_timeout:
+            raise RuntimeError(
+                f"No fresh LowState {context} (age={low_state_age:.3f}s, "
+                f"limit={low_state_timeout:.3f}s)"
+            )
+        return low_state_age
 
     def start_rl_gait_conditionally(self):
         print(f"{self.remoteControlService.get_rl_gait_operation_hint()}")
@@ -269,7 +363,28 @@ class Controller:
             return
         self.next_inference_time += self.policy.get_policy_interval()
 
-        goal_rel_x, goal_rel_y, heading_error = self.goal_source.get()
+        low_state_timeout = float(self.cfg.get("safety", {}).get("low_state_timeout_s", 0.2))
+        low_state_age = time.monotonic() - self._last_low_state_monotonic
+        if self._last_low_state_monotonic <= 0.0 or low_state_age > low_state_timeout:
+            self.logger.error(
+                "LowState stale (age=%.3fs, limit=%.3fs); stopping LowCmd.",
+                low_state_age, low_state_timeout,
+            )
+            self.running = False
+            return
+
+        if self.goal_source_mode == "ros":
+            goal, goal_status = self.goal_source.get_with_status()
+        else:
+            goal = self.goal_source.get()
+            goal_status = {
+                "goal_age_sec": 0.0,
+                "goal_stale": False,
+                "goal_messages_received": None,
+                "goal_messages_rejected": None,
+            }
+        goal_rel_x, goal_rel_y, heading_error = goal
+        self._last_goal = goal
         dof_target = self.policy.inference(
             time_now=time_now,
             dof_pos=self.dof_pos,
@@ -287,7 +402,37 @@ class Controller:
             self.running = False
             return
         self.dof_target[:] = dof_target
+        self._publish_policy_debug(low_state_age, goal_status)
         time.sleep(0.001)
+
+    def _publish_policy_debug(self, low_state_age, goal_status):
+        if self.goal_source_mode != "ros":
+            return
+        now = time.monotonic()
+        period = float(self.cfg.get("deploy_goal", {}).get("debug_period_s", 0.10))
+        if now - self._last_debug_monotonic < max(0.02, period):
+            return
+        self._last_debug_monotonic = now
+        payload = {
+            "schema": "locomotion_test.policy_debug.v1",
+            "goal_source": "ros",
+            "goal_topic": self.goal_source.topic,
+            "goal_rel": {
+                "x_m": self._last_goal[0],
+                "y_m": self._last_goal[1],
+                "heading_error_rad": self._last_goal[2],
+            },
+            **goal_status,
+            "low_state_age_sec": low_state_age,
+            "rpy_rad": [float(v) for v in self._latest_rpy],
+            "action_min": float(np.min(self.policy.actions)),
+            "action_max": float(np.max(self.policy.actions)),
+            "running": self.running,
+        }
+        try:
+            self.goal_source.publish_debug(payload)
+        except Exception as exc:
+            self.logger.warning("Failed to publish policy debug: %s", exc)
 
     def _publish_cmd(self):
         while self.running:
@@ -339,6 +484,10 @@ if __name__ == "__main__":
                              "fixed/stdin = manual constant goal.")
     parser.add_argument("--goal", type=str, default=None,
                         help='Initial robot-local goal "x,y,theta" (m,m,rad). Overrides config.')
+    parser.add_argument("--goal-topic", type=str, default=None,
+                        help="Override deploy_goal.topic for ROS mission mode.")
+    parser.add_argument("--debug-topic", type=str, default=None,
+                        help="Override deploy_goal.debug_topic for ROS mission mode.")
     args = parser.parse_args()
     cfg_file = os.path.join("configs", args.config)
 
@@ -350,7 +499,13 @@ if __name__ == "__main__":
     print(f"Starting E0 GoalPose controller, connecting to {args.net} ...")
     ChannelFactory.Instance().Init(0, args.net)
 
-    with Controller(cfg_file, goal_source_mode=args.goal_source, initial_goal=initial_goal) as controller:
+    with Controller(
+        cfg_file,
+        goal_source_mode=args.goal_source,
+        initial_goal=initial_goal,
+        goal_topic=args.goal_topic,
+        debug_topic=args.debug_topic,
+    ) as controller:
         time.sleep(2)  # wait for channels
         print("Initialization complete.")
         controller.start_custom_mode_conditionally()
@@ -359,7 +514,5 @@ if __name__ == "__main__":
         try:
             while controller.running:
                 controller.run()
-            controller.client.ChangeMode(RobotMode.kDamping)
         except KeyboardInterrupt:
             print("\nKeyboard interrupt received. Cleaning up...")
-            controller.cleanup()
