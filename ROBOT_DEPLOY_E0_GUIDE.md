@@ -371,6 +371,80 @@ common.dt: 0.002
 - MuJoCo/Booster Deploy if available
 - hoist test only after logs are clean
 
+## 8. Current ekay-fix Progress — 2026-07-30
+
+이번 `ekay-fix` 작업에서 real robot로 이어붙이기 위한 상단 harness는 INHA-Player 쪽에 들어갔다.
+
+구현된 것:
+
+- `src/brain/behavior_trees/locomotion_test.xml`
+  - `RobocupWalk`
+  - `ResetOdometry`
+  - `SelfLocateEnterField`
+  - `LocomotionTest`
+- `src/brain/include/mission_test.h`, `src/brain/src/mission_test.cpp`
+  - `/locomotion_test/command` subscribe
+  - `/locomotion_test/status` publish
+  - `/locomotion_test/goal_pose` publish
+  - `prep / ready / playing / finished` FSM
+  - mission별 map-frame path 생성
+  - pure-pursuit style lookahead target 생성
+- `src/brain/config/config.yaml`
+  - `locomotion_test.goal_reached_xy_m: 0.10`
+  - `locomotion_test.goal_reached_theta_deg: 6.0`
+  - mission별 repeat/goal/random seed/lookahead 설정
+
+현재 중요한 한계:
+
+```text
+현재 경로: LocomotionTest -> LocalPlanner -> RobotClient::setVelocity() -> SDK walk
+목표 경로: LocomotionTest -> GoalPoseAdapter -> E0 actor -> LowCmd
+```
+
+즉 지금 들어간 것은 BT mission harness와 lookahead generator다. E0 actor를 실기 low-level controller로 직접 호출하는 refactor는 아직 남아 있다.
+
+다음 refactor 단위:
+
+1. `export_model.py` import 수정 또는 호환 shim 추가.
+2. E0 actor-only TorchScript `.pt` export.
+3. `htwk-gym/deploy/utils/policy_goal_pose.py` 추가.
+4. `htwk-gym/deploy/configs/Goal_Pose_E0.yaml` 추가.
+5. `htwk-gym/deploy/deploy_goal_pose.py` 추가.
+6. INHA-Player `LocomotionTest`가 publish하는 `/locomotion_test/goal_pose`를 GoalPoseAdapter에서 subscribe.
+
+권장 연결 방식:
+
+```text
+/locomotion_test/status        # 사람 확인용
+/locomotion_test/goal_pose     # adapter 입력용, geometry/msg 또는 custom msg
+```
+
+현재는 `geometry_msgs/msg/PoseStamped`로 map-frame carrot을 낸다. 처음에는 topic이 가장 안전하다. 이유는 BT와 policy process를 분리해 한쪽 crash가 다른 쪽을 바로 죽이지 않고, `ros2 topic echo/bag`로 goal stream을 검증할 수 있기 때문이다. latency가 문제가 되면 같은 message contract를 유지한 채 shared memory 또는 in-process adapter로 옮긴다.
+
+policy 교체 방법:
+
+1. `locomotion_test.active_policy` 값을 `e0`, `e1_path`, `g1_speed` 등으로 바꾼다.
+2. adapter가 policy별 checkpoint/config/profile을 선택한다.
+3. `lookahead_default_m`, `lookahead_max_m`, `heading_blend_distance_m`만 policy profile에 맞춰 바꾼다.
+4. `locomotion_test.xml`과 mission sequence는 바꾸지 않는다.
+
+E0 기준 첫 값:
+
+```yaml
+locomotion_test:
+  active_policy: "e0"
+  lookahead_min_m: 0.25
+  lookahead_default_m: 0.55
+  lookahead_max_m: 0.90
+  heading_blend_distance_m: 0.60
+```
+
+판단 근거:
+
+- E0는 waypoint precision baseline이다. 현재 유효 결과는 위치 2.7 cm / p90 5.0 cm, heading 2.5°, strict 89.3%지만 path 학습은 없다.
+- `STATE_ESTIMATION.md` 기준 production GoalPose 입력 범위는 `dx∈[-2,2]`, `dy∈[-1.5,1.5]`다. 첫 실기는 이 범위를 벗기지 않는 짧은 lookahead가 맞다.
+- pure-pursuit 계열 문헌도 lookahead가 크면 smooth하지만 corner cutting과 tracking error가 커지고, 작으면 oscillation이 커지는 tradeoff를 말한다. 그래서 E0는 짧고 보수적인 값에서 시작한다.
+
 ## 9. What Not To Do
 
 - Do not replace `parameter_walk.pt` with E0 `.pt` while keeping `policy.py`.
