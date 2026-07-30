@@ -384,7 +384,9 @@ common.dt: 0.002
   - `LocomotionTest`
 - `src/brain/include/mission_test.h`, `src/brain/src/mission_test.cpp`
   - `/locomotion_test/command` subscribe
+  - `/locomotion_test/mission_id` subscribe (`std_msgs/msg/Int32`, 0=stop, 1..5=mission)
   - `/locomotion_test/status` publish
+  - `/locomotion_test/telemetry` publish (`std_msgs/msg/String` JSON, all angles in degree)
   - `/locomotion_test/goal_pose` publish
   - `prep / ready / playing / finished` FSM
   - mission별 map-frame path 생성
@@ -416,6 +418,7 @@ common.dt: 0.002
 
 ```text
 /locomotion_test/status        # 사람 확인용
+/locomotion_test/telemetry     # walk 비교/debug용 JSON stream
 /locomotion_test/goal_pose     # adapter 입력용, geometry/msg 또는 custom msg
 ```
 

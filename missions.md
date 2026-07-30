@@ -19,6 +19,7 @@ Laptop terminal
   -> BT LocomotionTest FSM
   -> map-frame mission path + lookahead target
   -> /locomotion_test/goal_pose
+  -> /locomotion_test/telemetry
   -> current: LocalPlanner -> RobotClient::setVelocity -> SDK walk
   -> E0 target: GoalPoseAdapter -> actor obs[6:16] -> LowCmd joint targets
 ```
@@ -52,16 +53,17 @@ ros2 launch brain launch.py tree:=locomotion_test
 ```bash
 ros2 topic echo /locomotion_test/status
 ros2 topic echo /locomotion_test/goal_pose
+ros2 topic echo /locomotion_test/telemetry
 ```
 
-mission 실행:
+mission 실행은 숫자 topic을 기본으로 쓴다. 숫자는 사용자가 지정한 mission 순서 그대로다.
 
 ```bash
-ros2 topic pub --once /locomotion_test/command std_msgs/msg/String "{data: mission1}"
-ros2 topic pub --once /locomotion_test/command std_msgs/msg/String "{data: mission2}"
-ros2 topic pub --once /locomotion_test/command std_msgs/msg/String "{data: mission3}"
-ros2 topic pub --once /locomotion_test/command std_msgs/msg/String "{data: mission4}"
-ros2 topic pub --once /locomotion_test/command std_msgs/msg/String "{data: mission5}"
+ros2 topic pub --once /locomotion_test/mission_id std_msgs/msg/Int32 "{data: 1}"
+ros2 topic pub --once /locomotion_test/mission_id std_msgs/msg/Int32 "{data: 2}"
+ros2 topic pub --once /locomotion_test/mission_id std_msgs/msg/Int32 "{data: 3}"
+ros2 topic pub --once /locomotion_test/mission_id std_msgs/msg/Int32 "{data: 4}"
+ros2 topic pub --once /locomotion_test/mission_id std_msgs/msg/Int32 "{data: 5}"
 ```
 
 수동 시작이 필요하면:
@@ -74,6 +76,7 @@ ros2 topic pub --once /locomotion_test/command std_msgs/msg/String "{data: play}
 정지/초기화:
 
 ```bash
+ros2 topic pub --once /locomotion_test/mission_id std_msgs/msg/Int32 "{data: 0}"
 ros2 topic pub --once /locomotion_test/command std_msgs/msg/String "{data: stop}"
 ros2 topic pub --once /locomotion_test/command std_msgs/msg/String "{data: status}"
 ```
@@ -94,7 +97,9 @@ ros2 topic pub --once /locomotion_test/command std_msgs/msg/String "{data: statu
 ```yaml
 locomotion_test:
   command_topic: "/locomotion_test/command"
+  mission_id_topic: "/locomotion_test/mission_id"
   status_topic: "/locomotion_test/status"
+  telemetry_topic: "/locomotion_test/telemetry"
   goal_topic: "/locomotion_test/goal_pose"
   active_policy: "e0"
   goal_reached_xy_m: 0.10
@@ -115,7 +120,37 @@ mission2:
   backward_x_m: -3.0
 ```
 
-주의: `command_topic`, `status_topic`, `goal_topic`은 subscription/publisher 생성 시점에 결정되므로 restart-only다. threshold, repeat, lookahead 숫자는 runtime `ros2 param set`으로 바꿔도 다음 tick부터 반영되도록 연결했다.
+주의: `command_topic`, `mission_id_topic`, `status_topic`, `telemetry_topic`, `goal_topic`은 subscription/publisher 생성 시점에 결정되므로 restart-only다. threshold, repeat, lookahead 숫자는 runtime `ros2 param set`으로 바꿔도 다음 tick부터 반영되도록 연결했다.
+
+## Telemetry stream
+
+`/locomotion_test/telemetry`는 `std_msgs/msg/String` JSON이다. 비교 실험에서 walk별 log를 같은 schema로 저장하기 위한 stream이다. 모든 각도는 degree 단위로 낸다.
+
+주요 필드:
+
+| field | 의미 |
+|---|---|
+| `original_timestamp` | Brain ROS clock 기준 원본 송출 timestamp |
+| `fsm_state` | `prep`, `ready`, `playing`, `finished` |
+| `mission.id` | 숫자 mission id. `1..5`, `0`은 없음/stop |
+| `mission.elapsed_sec` | 단일 mission playing duration. finished 상태에서는 완료 시 duration으로 고정 |
+| `waypoint.index/count` | 현재 수행 중인 waypoint index와 전체 count |
+| `ego_pose_map.{x_m,y_m,theta_deg}` | localization 기준 robot map pose |
+| `ego_velocity_map_diff.{vx_mps,vy_mps,speed_mps,vtheta_degps}` | ego pose 차분으로 계산한 실제 이동 속도 |
+| `planner_velocity_command.{vx_mps,vy_mps,vtheta_degps}` | LocalPlanner가 내고 있는 속도 명령. E0 direct adapter에서는 null 또는 별도 low-level field로 대체될 수 있음 |
+| `active_goal_map.pose` | 현재 하단 planner/adapter에 넘기는 carrot goal |
+| `active_waypoint_map.pose` | mission sequence상 현재 완료해야 하는 waypoint |
+| `pose_error_to_goal` | carrot goal 기준 map-frame error, robot-frame `goal_rel_x/y`, heading error |
+| `pose_error_to_waypoint` | 최종 waypoint 기준 error |
+| `thresholds` | 도달 판정 threshold와 lookahead 설정 |
+
+노트북에서 저장:
+
+```bash
+ros2 topic echo /locomotion_test/telemetry | tee locomotion_test_telemetry.log
+```
+
+JSON만 뽑아 CSV로 바꾸려면 `data:` 라인만 추출해서 Python `json.loads()`로 처리하면 된다.
 
 ## Mission 정의
 
