@@ -396,23 +396,59 @@ common.dt: 0.002
   - `locomotion_test.goal_reached_theta_deg: 6.0`
   - mission별 repeat/goal/random seed/lookahead 설정
 
-현재 중요한 한계:
+### 2026-07-30 업데이트 — position-policy refactor 반영됨
 
 ```text
-현재 경로: LocomotionTest -> LocalPlanner -> RobotClient::setVelocity() -> SDK walk
-목표 경로: LocomotionTest -> GoalPoseAdapter -> E0 actor -> LowCmd
+이전 경로: LocomotionTest -> LocalPlanner -> RobotClient::setVelocity() -> SDK walk
+현재 경로: LocomotionTest -> /locomotion_test/goal_pose (map-frame carrot, PoseStamped)
+목표 경로: goal_pose -> GoalPoseAdapter(goal_rel) -> E0 actor -> LowCmd
 ```
 
-즉 지금 들어간 것은 BT mission harness와 lookahead generator다. E0 actor를 실기 low-level controller로 직접 호출하는 refactor는 아직 남아 있다.
+INHA-Player `LocomotionTest`에서 velocity 제어기(LocalPlanner/setVelocity)를 **완전히 제거**했다. 이제 이 노드는 map-frame carrot goal만 publish한다. carrot은 현재 목표 waypoint 방향으로 `lookahead_max_m`(=2.0 m, E0 goal_rel_x 범위)까지 뻗는 점이고, spin mission은 heading을 60° 앞세운다. mission2/3는 heading 고정(후진/측면 gait). `locomotion_test.xml`에서 `RobocupWalk`(SDK gait 진입)도 제거했다 — E0 deploy가 CUSTOM 모드에서 low-level을 소유하므로 동시 구동 금지.
 
-다음 refactor 단위:
+refactor 단위 상태:
 
-1. `export_model.py` import 수정 또는 호환 shim 추가.
-2. E0 actor-only TorchScript `.pt` export.
-3. `htwk-gym/deploy/utils/policy_goal_pose.py` 추가.
-4. `htwk-gym/deploy/configs/Goal_Pose_E0.yaml` 추가.
-5. `htwk-gym/deploy/deploy_goal_pose.py` 추가.
-6. INHA-Player `LocomotionTest`가 publish하는 `/locomotion_test/goal_pose`를 GoalPoseAdapter에서 subscribe.
+1. [done] `export_model.py` import 수정 (`utils.model`).
+2. [사용자] E0 actor-only TorchScript `.pt` export (§4 명령). smoke `[1,54]->[1,12]` 확인.
+3. [done] `htwk-gym/deploy/utils/policy_goal_pose.py` — E0 obs layout, goal_rel 입력.
+4. [done] `htwk-gym/deploy/configs/Goal_Pose_E0.yaml` — arms `default_qpos[0:11]`만 TODO(ekay).
+5. [done] `htwk-gym/deploy/deploy_goal_pose.py` — fixed/stdin goal source + NaN·rpy safety.
+6. [pending] 실기 live 연동: INHA-Player가 goal_rel(robot-frame dx,dy,dθ)을 topic으로 내보내고 deploy가 subscribe. bring-up(§10)은 fixed goal이라 6번 없이 진행 가능.
+
+live bridge용 goal_rel 계약(§5 식과 동일):
+
+```text
+dx_world = goal_x_field - robot_x_field
+dy_world = goal_y_field - robot_y_field
+goal_rel_x =  cos(yaw)*dx_world + sin(yaw)*dy_world   # clamp [-2.0, 2.0]
+goal_rel_y = -sin(yaw)*dx_world + cos(yaw)*dy_world   # clamp [-1.5, 1.5]
+heading_error = wrap_pi(goal_yaw_field - robot_yaw_field)
+```
+
+이 세 값은 이미 INHA-Player telemetry `pose_error_to_goal.{goal_rel_x_m, goal_rel_y_m, heading_error_deg}`로 나오고 있다. live bridge는 그 값을 그대로 topic으로 옮겨 `deploy_goal_pose.py`(stdin 자리 대체)에 넣으면 된다.
+
+주의: 아래 deploy 코드는 실기에서 여기 환경으로는 실행/검증하지 못했다. §4 TorchScript smoke → §8-6 LowState replay → §10 hoist stage 순서로 반드시 검증 후 지면 접촉.
+
+### Deploy pipeline — 코드/정책이 로봇에 실리는 경로
+
+서버와 로봇은 별개다. **서버 = 학습/export 전용, 실행 = 로봇 Intel Board.** "서버에서 실행"이 아니라 "서버에서 export → `.pt`를 보드로 복사 → 보드에서 실행"이다.
+
+1. **Code → 서버**: 로컬에서 `git push` → 서버(`165.246.193.194:/mnt/DATA/workspace/ws_eungkyu/k1-goalpose`)에서 `git pull`. (`PULL.sh`는 반대 방향으로 checkpoint/log만 당겨온다. 코드는 항상 git.)
+2. **Export = 서버에서**: checkpoint(`.pth`)와 GPU/torch가 서버에 있으므로 `python export_model.py ...`를 서버에서 돌려 `.pt`를 만든다.
+3. **`.pt` → 로봇**: `.pt`는 대용량 바이너리라 git에 안 들어간다(`.gitignore`). rsync/scp로 옮긴다:
+   ```bash
+   # 서버 -> 보드로 직접, 또는 로컬 경유
+   scp <server>:.../nn/model_6200.pt  htwk-gym/deploy/models/goal_pose_e0.pt
+   ```
+4. **Deploy 실행 = 로봇 보드에서**(`deploy/README.md`):
+   ```bash
+   scp -r deploy/ <user>@<robot_ip>:/<dest>/      # models/goal_pose_e0.pt 포함
+   ssh <user>@<robot_ip> ; cd /<dest>/deploy
+   python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
+   # Booster SDK 설치, 로봇 PREP 모드
+   python deploy_goal_pose.py --config Goal_Pose_E0.yaml --net 127.0.0.1 --goal "0,0,0"
+   ```
+   `--net 127.0.0.1` = 보드 로컬 SDK. 서버에서 이 스크립트를 돌리는 게 아니다.
 
 권장 연결 방식:
 

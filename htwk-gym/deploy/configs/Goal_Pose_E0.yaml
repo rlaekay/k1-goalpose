@@ -1,0 +1,120 @@
+# E0 GoalPose position-policy deploy config.
+#
+# E0 is NOT a velocity walk. It consumes a goal-pose error (goal_rel_x,
+# goal_rel_y, heading_error) in the robot-local frame and outputs 12 leg joint
+# targets. See ROBOT_DEPLOY_E0_GUIDE.md and envs/K1/Goal_Pose_V7.yaml.
+#
+# 23-joint order: indices 0..10 = arms/head/waist (NOT policy-controlled),
+#                 indices 11..22 = legs (the 12 policy DOFs).
+
+common:
+  dt: 0.002
+  stiffness: [
+    20, 20,
+    20, 20, 20, 20,
+    20, 20, 20, 20,
+    200,
+    200, 200, 200, 200, 50, 50,
+    200, 200, 200, 200, 50, 50
+  ]
+  damping: [
+    0.2, 0.2,
+    0.5, 0.5, 0.5, 0.5,
+    0.5, 0.5, 0.5, 0.5,
+    5,
+    5, 5, 5, 5, 3, 3,
+    5, 5, 5, 5, 3, 3
+  ]
+  # legs [11:23] MUST match E0 training default_joint_angles
+  # (Hip_Pitch -0.2, Knee_Pitch 0.4, Ankle_Pitch -0.25, rest 0).
+  # arms/head/waist [0:11] = K1_locomotion.urdf arms-down pose, identical to
+  # Base_Walk.yaml and Parameter_Walk.yaml (shoulder_roll +/-1.35 rad ~= 77 deg
+  # splay), which is close to E0's ~80 deg armsdown training geometry. E0 does
+  # not observe/control the arms; the deploy layer just holds this posture.
+  default_qpos: [
+    0, 0,
+    0.2, -1.35, 0, -0.5,
+    0.2, 1.35, 0, 0.5,
+    0,
+    -0.2, 0, 0, 0.4, -0.25, 0,
+    -0.2, 0, 0, 0.4, -0.25, 0
+  ]
+  torque_limit: [
+    7, 7,
+    10, 10, 10, 10,
+    10, 10, 10, 10,
+    30,
+    60, 25, 30, 60, 24, 15,
+    60, 25, 30, 60, 24, 15
+  ]
+
+policy:
+  policy_path: "./models/goal_pose_e0.pt"   # actor-only TorchScript from export_model.py
+  num_actions: 12
+  num_observations: 54
+  leg_dof_start: 11          # first leg index in the 23-joint vector
+
+  # E0 deploy cadence. Trained range was [1.8, 2.4] Hz; 2.0 is the guide default.
+  gait_frequency: 2.0
+
+  # Goal command clamp = E0 trained goal range (Goal_Pose_V7.yaml commands.goal_dx/dy).
+  goal_clamp:
+    x_m: 2.0
+    y_m: 1.5
+
+  # Must equal envs/K1/Goal_Pose_V7.yaml `normalization`.
+  normalization:
+    gravity: 1.0
+    ang_vel: 1.0
+    goal_pos: 0.5              # scales goal_rel_x/y (Δx≤2m, Δy≤1.5m) toward ~[-1,1]
+    goal_heading: 0.31831     # = 1/pi, scales heading_error [-pi,pi] to [-1,1]
+    gait_frequency: 1.0
+    foot_yaw: 1.0
+    body_pitch_target: 1.0
+    body_roll_target: 1.0
+    feet_offset_x_target: 1.0
+    feet_offset_y_target: 1.0
+    dof_pos: 1.0
+    dof_vel: 0.1
+    clip_actions: 1.0
+
+  control:
+    action_scale: 1.0
+    decimation: 10            # 10 * dt(0.002) = 20 ms policy tick (50 Hz)
+
+mech:
+  parallel_mech_indexes: [15, 16, 21, 22]
+
+prepare:
+  stiffness: [
+    5., 5.,
+    40., 50., 20., 10.,
+    40., 50., 20., 10.,
+    100.,
+    350., 350., 180., 350., 450., 450.,
+    350., 350., 180., 350., 450., 450.,
+  ]
+  damping: [
+    0.1, 0.1,
+    0.5, 1.5, 0.2, 0.2,
+    0.5, 1.5, 0.2, 0.2,
+    5.0,
+    7.5, 7.5, 3., 5.5, 0.5, 0.5,
+    7.5, 7.5, 3., 5.5, 0.5, 0.5,
+  ]
+  default_qpos: [
+    0.0,  0.0,
+    0.25, -1.4, 0.0, -0.5,
+    0.25, 1.4, 0.0, 0.5,
+    0.0,
+    -0.1, 0.0, 0.0, 0.2, -0.1, 0.0,
+    -0.1, 0.0, 0.0, 0.2, -0.1, 0.0,
+  ]
+
+# Bring-up goal source (used only by deploy_goal_pose.py in --goal-source fixed).
+# Robot-local frame, metres/radians. Guide section 10 first target.
+deploy_goal:
+  goal_rel_x: 0.0
+  goal_rel_y: 0.0
+  heading_error: 0.0
+  stale_timeout_s: 0.5        # live source only: zero the goal if no update within this
