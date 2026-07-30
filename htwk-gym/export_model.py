@@ -3,7 +3,7 @@ import glob
 import yaml
 import argparse
 import torch
-from utils.model_thomas import *
+from utils.model import *  # ActorCritic lives here; utils.model_thomas does not exist
 
 def get_robot_type(task_name):
     """Determine robot type from task name."""

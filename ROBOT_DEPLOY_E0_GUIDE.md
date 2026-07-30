@@ -396,23 +396,102 @@ common.dt: 0.002
   - `locomotion_test.goal_reached_theta_deg: 6.0`
   - mission별 repeat/goal/random seed/lookahead 설정
 
-현재 중요한 한계:
+### 2026-07-30 업데이트 — position-policy refactor 반영됨
 
 ```text
-현재 경로: LocomotionTest -> LocalPlanner -> RobotClient::setVelocity() -> SDK walk
-목표 경로: LocomotionTest -> GoalPoseAdapter -> E0 actor -> LowCmd
+이전 경로: LocomotionTest -> LocalPlanner -> RobotClient::setVelocity() -> SDK walk
+현재 경로: LocomotionTest -> /locomotion_test/goal_pose (map-frame carrot, PoseStamped)
+목표 경로: goal_pose -> GoalPoseAdapter(goal_rel) -> E0 actor -> LowCmd
 ```
 
-즉 지금 들어간 것은 BT mission harness와 lookahead generator다. E0 actor를 실기 low-level controller로 직접 호출하는 refactor는 아직 남아 있다.
+INHA-Player `LocomotionTest`에서 velocity 제어기(LocalPlanner/setVelocity)를 **완전히 제거**했다. 이제 이 노드는 map-frame carrot goal만 publish한다. carrot은 현재 목표 waypoint 방향으로 `lookahead_max_m`(=2.0 m, E0 goal_rel_x 범위)까지 뻗는 점이고, spin mission은 heading을 60° 앞세운다. mission2/3는 heading 고정(후진/측면 gait). `locomotion_test.xml`에서 `RobocupWalk`(SDK gait 진입)도 제거했다 — E0 deploy가 CUSTOM 모드에서 low-level을 소유하므로 동시 구동 금지.
 
-다음 refactor 단위:
+refactor 단위 상태:
 
-1. `export_model.py` import 수정 또는 호환 shim 추가.
-2. E0 actor-only TorchScript `.pt` export.
-3. `htwk-gym/deploy/utils/policy_goal_pose.py` 추가.
-4. `htwk-gym/deploy/configs/Goal_Pose_E0.yaml` 추가.
-5. `htwk-gym/deploy/deploy_goal_pose.py` 추가.
-6. INHA-Player `LocomotionTest`가 publish하는 `/locomotion_test/goal_pose`를 GoalPoseAdapter에서 subscribe.
+1. [done] `export_model.py` import 수정 (`utils.model`).
+2. [사용자] E0 actor-only TorchScript `.pt` export (§4 명령). smoke `[1,54]->[1,12]` 확인.
+3. [done] `htwk-gym/deploy/utils/policy_goal_pose.py` — E0 obs layout, goal_rel 입력.
+4. [done] `htwk-gym/deploy/configs/Goal_Pose_E0.yaml` — arms `default_qpos[0:11]`만 TODO(ekay).
+5. [done] `htwk-gym/deploy/deploy_goal_pose.py` — fixed/stdin goal source + NaN·rpy safety.
+6. [pending] 실기 live 연동: INHA-Player가 goal_rel(robot-frame dx,dy,dθ)을 topic으로 내보내고 deploy가 subscribe. bring-up(§10)은 fixed goal이라 6번 없이 진행 가능.
+
+live bridge용 goal_rel 계약(§5 식과 동일):
+
+```text
+dx_world = goal_x_field - robot_x_field
+dy_world = goal_y_field - robot_y_field
+goal_rel_x =  cos(yaw)*dx_world + sin(yaw)*dy_world   # clamp [-2.0, 2.0]
+goal_rel_y = -sin(yaw)*dx_world + cos(yaw)*dy_world   # clamp [-1.5, 1.5]
+heading_error = wrap_pi(goal_yaw_field - robot_yaw_field)
+```
+
+이 세 값은 이미 INHA-Player telemetry `pose_error_to_goal.{goal_rel_x_m, goal_rel_y_m, heading_error_deg}`로 나오고 있다. live bridge는 그 값을 그대로 topic으로 옮겨 `deploy_goal_pose.py`(stdin 자리 대체)에 넣으면 된다.
+
+주의: 아래 deploy 코드는 실기에서 여기 환경으로는 실행/검증하지 못했다. §4 TorchScript smoke → §8-6 LowState replay → §10 hoist stage 순서로 반드시 검증 후 지면 접촉.
+
+### Deploy pipeline — 코드/정책이 로봇에 실리는 경로
+
+서버와 로봇은 별개다. **서버 = 학습/export 전용, 실행 = 로봇 Intel Board.** "서버에서 실행"이 아니라 "서버에서 export → `.pt`를 보드로 복사 → 보드에서 실행"이다.
+
+1. **Code → 서버**: 로컬에서 `git push` → 서버(`165.246.193.194:/mnt/DATA/workspace/ws_eungkyu/k1-goalpose`)에서 `git pull`. (`PULL.sh`는 반대 방향으로 checkpoint/log만 당겨온다. 코드는 항상 git.)
+2. **Export = 서버에서**: checkpoint(`.pth`)와 GPU/torch가 서버에 있으므로 `python export_model.py ...`를 서버에서 돌려 `.pt`를 만든다.
+3. **`.pt` → 로봇**: `.pt`는 대용량 바이너리라 git에 안 들어간다(`.gitignore`). rsync/scp로 옮긴다:
+   ```bash
+   # 서버 -> 보드로 직접, 또는 로컬 경유
+   scp <server>:.../nn/model_6200.pt  htwk-gym/deploy/models/goal_pose_e0.pt
+   ```
+4. **Deploy 실행 = 로봇 보드에서**(`deploy/README.md`):
+   ```bash
+   scp -r deploy/ <user>@<robot_ip>:/<dest>/      # models/goal_pose_e0.pt 포함
+   ssh <user>@<robot_ip> ; cd /<dest>/deploy
+   python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
+   # Booster SDK 설치, 로봇 PREP 모드
+   python deploy_goal_pose.py --config Goal_Pose_E0.yaml --net 127.0.0.1 --goal "0,0,0"
+   ```
+   `--net 127.0.0.1` = 보드 로컬 SDK. 서버에서 이 스크립트를 돌리는 게 아니다.
+
+### Mission 실행 런북 (E0 live, hoist 생략)
+
+**세 프로세스**가 같은 `ROS_DOMAIN_ID`(예: 로봇 보드)에서 동시에 돈다. hoist/fixed goal 없이 바로 mission만 돌리는 경로다.
+
+**① Brain** — localization(ekay 카메라 PF) + mission BT + goal_rel publish (C++, colcon 빌드 필요):
+```bash
+cd <INHA-Player ws>
+colcon build --packages-select brain && source install/setup.bash
+# vision/카메라 노드도 같이 떠 있어야 marker로 PF가 수렴한다
+ros2 launch brain launch.py tree:=locomotion_test
+```
+
+**② E0 deploy** — 정책 실행, goal_rel 구독 → LowCmd (파이썬, 빌드 없음, rclpy 필요):
+```bash
+# ROS2 sourced + booster SDK가 import되는 파이썬에서 실행
+cd deploy
+python deploy_goal_pose.py --config Goal_Pose_E0.yaml --goal-source ros --net 127.0.0.1
+# 로봇 PREP 상태에서 시작 → custom mode 진입 프롬프트를 따라 진행
+```
+
+**③ mission 발사** (다른 터미널):
+```bash
+ros2 topic echo /locomotion_test/telemetry     # odom_calibrated:true 될 때까지 대기
+ros2 topic pub --once /locomotion_test/mission_id std_msgs/msg/Int32 "{data: 1}"   # mission1
+# mission_id는 auto-start: start pose 도달 → 자동 PLAYING. 정지 = {data: 0}
+```
+
+**데이터 흐름:**
+```text
+camera ─► Brain(ekay PF) ─► robotPoseToField
+                          ─► LocomotionTest: carrot(2m cap) ─► goal_rel(robot frame)
+                          ─► /locomotion_test/goal_rel  (Vector3Stamped: x=fwd, y=left, z=heading_err[rad])
+        ─► deploy(--goal-source ros) ─► E0 actor obs[6:8] ─► LowCmd ─► 로봇 다리
+Brain이 goal_rel pub을 멈추면(READY/finished/idle) deploy가 stale ─► goal 0 ─► E0 정지.
+```
+
+**전제 3가지:**
+- ①②③가 같은 ROS 도메인(권장: 전부 로봇 보드). deploy 파이썬에 **rclpy가 import**돼야 함(ROS2 sourced 환경에서 실행).
+- 시작 위치에서 카메라가 **field marker를 봐야** PF가 수렴(`odom_calibrated=true`). 안 보이면 mission이 시작 안 된다(안전 게이트).
+- `config.yaml`에 `ekay_odom: true` (CUSTOM 모드에선 SDK odom이 없으므로 카메라 PF가 유일한 localization).
+
+**"custom mode엔 odom이 없다" 해결**: 맞다. 그래서 위치추정은 SDK가 아니라 **Brain의 카메라 PF(ekay_odom)**가 한다. E0 자체는 절대위치를 안 보고 goal_rel(로컬 오차)만 먹으므로 odom이 필요 없고, "field 목표 → goal_rel 변환"만 카메라 PF가 담당한다.
 
 권장 연결 방식:
 

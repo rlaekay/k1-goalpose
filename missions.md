@@ -136,11 +136,12 @@ mission2:
 | `mission.elapsed_sec` | 단일 mission playing duration. finished 상태에서는 완료 시 duration으로 고정 |
 | `waypoint.index/count` | 현재 수행 중인 waypoint index와 전체 count |
 | `ego_pose_map.{x_m,y_m,theta_deg}` | localization 기준 robot map pose |
-| `ego_velocity_map_diff.{vx_mps,vy_mps,speed_mps,vtheta_degps}` | ego pose 차분으로 계산한 실제 이동 속도 |
-| `planner_velocity_command.{vx_mps,vy_mps,vtheta_degps}` | LocalPlanner가 내고 있는 속도 명령. E0 direct adapter에서는 null 또는 별도 low-level field로 대체될 수 있음 |
-| `active_goal_map.pose` | 현재 하단 planner/adapter에 넘기는 carrot goal |
+| `ego_velocity_map_diff.{vx_mps,vy_mps}` | ego pose 차분으로 계산한 실제 이동 속도. **map(world) frame**. |
+| `ego_velocity_map_diff.{vx_body_mps,vy_body_mps}` | 같은 실측 속도를 body frame(forward/left)으로 회전한 값. |
+| `ego_velocity_map_diff.{speed_mps,vtheta_degps}` | frame 무관 speed와 yaw rate |
+| `active_goal_map.pose` | E0 adapter에 넘기는 carrot goal (map frame). velocity 제어기는 제거됨 — LocomotionTest는 goal pose만 낸다. |
 | `active_waypoint_map.pose` | mission sequence상 현재 완료해야 하는 waypoint |
-| `pose_error_to_goal` | carrot goal 기준 map-frame error, robot-frame `goal_rel_x/y`, heading error |
+| `pose_error_to_goal` | carrot goal 기준 error. robot-frame `goal_rel_x/y` + `heading_error`가 **곧 E0 policy 입력**(obs[6:8])이다. |
 | `pose_error_to_waypoint` | 최종 waypoint 기준 error |
 | `thresholds` | 도달 판정 threshold와 lookahead 설정 |
 
@@ -150,7 +151,7 @@ mission2:
 ros2 topic echo /locomotion_test/telemetry | tee locomotion_test_telemetry.log
 ```
 
-JSON만 뽑아 CSV로 바꾸려면 `data:` 라인만 추출해서 Python `json.loads()`로 처리하면 된다.
+JSON만 뽑아 CSV로 바꾸려면 `data:` 라인만 추출해서 Python `json.loads()`로 처리하면 된다. localization이 순간적으로 NaN/Inf를 내도 해당 숫자 field는 `null`로 나가므로 한 줄이 깨져서 capture 전체 parsing이 실패하는 일은 없다.
 
 ## Mission 정의
 
