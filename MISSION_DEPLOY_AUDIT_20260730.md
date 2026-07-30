@@ -42,10 +42,15 @@ policy bridge 가시성을 보강했다. `deploy_goal_pose.py`는 이제 CUSTOM 
 
 ### Mac
 
-- `k1-goalpose`: branch `ekay-fix`; 기존 local amend와 `origin/ekay-fix`가 1개씩 갈라져
-  있었음. 이번 수정은 이 워크스페이스에만 수행했다.
+- `k1-goalpose`: branch `ekay-fix`; 기존 local amend와 cached `origin/ekay-fix`의 갈라진
+  이력은 tree를 유지한 merge로 정리했다. mission hardening commit은 `fb8130f`, merge
+  commit은 `03f2f5d`다.
 - `INHA-Player`: `/Users/dmdrb/RoboCup/[07]sim2real/INHA-Player`, branch `ekay-fix`,
   `origin/ekay-fix`보다 `afb731d2` 1 commit ahead, worktree clean.
+- 두 repo 모두 GitHub hostname DNS 실패로 `git fetch/push`가 실패했다. 위 commit들은
+  로컬에만 있으며 서버/로봇이 pull할 수 있는 원격 branch에는 아직 올라가지 않았다.
+  robot staging에는 검증 대상 source를 SCP로 복사했기 때문에 이번 비구동 build 결과에는
+  영향이 없다.
 - `ros2`, `colcon`, PyTorch, PyYAML은 Mac 기본 Python에 없음. 따라서 Mac은 ROS node를
   직접 실행하지 않고 `missionctl.sh`가 SSH로 로봇의 ROS CLI를 호출한다.
 
@@ -345,8 +350,9 @@ mission 실행 중 acceptance:
 ## 아직 남은 blocker
 
 1. 서버 접속 복구.
-2. frozen run config와 deploy config의 normalization/default pose/action scale 최종 diff.
-3. E0@6200 export, hash 기록, robot staging copy와 **정확한 E0 actor** smoke.
-4. 사람이 로봇 옆에서 hoist 승격 gate 수행.
+2. Mac의 GitHub DNS/network 복구 후 두 repo `ekay-fix` push; 그 다음 server clean pull.
+3. frozen run config와 deploy config의 normalization/default pose/action scale 최종 diff.
+4. E0@6200 export, hash 기록, robot staging copy와 **정확한 E0 actor** smoke.
+5. 사람이 로봇 옆에서 hoist 승격 gate 수행.
 
-이 네 항목 전에는 “mission 수행용으로 준비 완료”가 아니라 **코드/Brain staging 완료**다.
+이 다섯 항목 전에는 “mission 수행용으로 준비 완료”가 아니라 **코드/Brain staging 완료**다.
