@@ -20,11 +20,11 @@
 - Framework: htwk-gym (Isaac Gym Preview 4)
 - Robot: K1
 - Hardware: A6000 x2
-- Server: user-ESC4000A-E12 (git clone at /mnt/DATA/workspace/ws_eungkyu/k1-goalpose,
+- Server: <SERVER_HOST> (git clone at <SERVER_WS>/k1-goalpose,
   htwk-gym이 그 안의 서브디렉토리 — 2026-07-23 변경 이력 참고)
 
 ## 🤝 공유 서버 운영 원칙 (2026-07-23부터, 항상 적용)
-서버(`user-ESC4000A-E12`)는 여러 사람이 같이 쓰는 장비다. 아래는 매번 학습을 돌릴 때마다
+서버(`<SERVER_HOST>`)는 여러 사람이 같이 쓰는 장비다. 아래는 매번 학습을 돌릴 때마다
 지켜야 하는 상시 규칙 — 아래 §변경 이력의 "왜 이렇게 됐는지"와 달리, 이건 **매번 반복 적용**한다.
 - **GPU**: 학습 시작 전 항상 `nvidia-smi`로 어느 GPU가 비어있는지 확인하고, 그 번호를
   `--sim_device`/`--rl_device`에 명시적으로 지정한다. 기본은 두 GPU를 동시에 잡지 않는다.
@@ -36,7 +36,7 @@
   멈춘 뒤 비어있는 다른 GPU로 옮긴다. (2026-07-23: root 소유 Isaac Lab 프로세스와 GPU 0에서
   충돌 → 우리 쪽을 GPU 1로 이동해서 해결한 실제 사례 있음.)
 - **디스크**: `$HOME`(루트 파티션, 서버 전체가 공유)은 절대 안 씀. conda·pip 캐시·저장소·
-  IsaacGym·체크포인트 전부 `/mnt/DATA/workspace/ws_eungkyu/` 안에만 둔다.
+  IsaacGym·체크포인트 전부 `<SERVER_WS>/` 안에만 둔다.
 - **삭제는 항상 본인 소유 파일에 한정**: 다른 사용자의 `ws_*` 디렉토리는 목록만 확인(`du -sh`
   등)하고 내용을 열거나 지우지 않는다.
 
@@ -116,10 +116,10 @@
   `git pull`. 체크포인트/로그/영상처럼 git에 안 맞는 큰 바이너리만 [PULL.sh](PULL.sh)
   (구 SYNC.sh의 pull 부분만 남긴 버전)로 rsync 회수. 자세한 명령은 README.md
   "코드 동기화 (git)" 절 참고.
-- **주의 (미착수)**: 서버의 기존 경로(`/mnt/DATA/workspace/ws_eungkyu/htwk-gym/`, 사용자가
+- **주의 (미착수)**: 서버의 기존 경로(`<SERVER_WS>/htwk-gym/`, 사용자가
   공유한 진단 결과 기준)는 예전 rsync push로 만들어진 구조(`htwk-gym/htwk-gym/` 이중 중첩
   + 빈 `tasks/`)라서 새 git 워크플로우와 안 맞는다. 서버에서 새로 `git clone`해서
-  `/mnt/DATA/workspace/ws_eungkyu/k1-goalpose/`로 옮기는 걸 권장(README 절차 참고).
+  `<SERVER_WS>/k1-goalpose/`로 옮기는 걸 권장(README 절차 참고).
   기존 디렉토리를 그대로 재사용하려면 먼저 정리 필요 — milestone -1에 포함.
 
 ### 2026-07-23 — milestone -1 완료: 서버 환경 구축 실기(實記)
@@ -128,12 +128,12 @@
   `/mnt/DATA` 자체가 7.0T 중 95% 사용 중). 이후 모든 설치를 아래 원칙으로 진행:
   - `$HOME`(`/dev/nvme0n1p2`, `/` 마운트, 879G 중 88% 사용, 전 사용자 공유)은 건드리지 않음
     — 여기가 차면 서버 전체(로그인/시스템 서비스)가 죽어 전원에게 피해가 감.
-  - 대신 **`/mnt/DATA/workspace/ws_eungkyu/`에만** conda(Miniconda3)·pip 캐시·저장소·IsaacGym을
-    전부 설치 (`ws_eungkyu`가 quota 없는 공용 풀에서 본인 몫으로 이미 관행적으로 쓰이던 영역).
+  - 대신 **`<SERVER_WS>/`에만** conda(Miniconda3)·pip 캐시·저장소·IsaacGym을
+    전부 설치 (`<SERVER_USER>`가 quota 없는 공용 풀에서 본인 몫으로 이미 관행적으로 쓰이던 영역).
   - GPU도 두 장 중 `cuda:0` 한 장만 `--sim_device`/`--rl_device`로 명시 지정, 다른 사용자가
     쓸 수도 있는 GPU 1은 건드리지 않음.
 - **실제 설치 순서** (재현 시 참고):
-  1. `/mnt/DATA/workspace/ws_eungkyu/miniconda3`에 Miniconda 설치 (`-b -p`로 무인 설치).
+  1. `<SERVER_WS>/miniconda3`에 Miniconda 설치 (`-b -p`로 무인 설치).
      `defaults` 채널은 Anaconda 이용약관 동의가 필요해서 걸리므로,
      `conda create -c conda-forge --override-channels python=3.8`로 conda-forge만 사용.
      (IsaacGym Preview4의 prebuilt 바인딩이 Python 3.8까지만 있어서 3.8 고정 필요 — 시스템
@@ -141,7 +141,7 @@
   2. `pip install torch==2.0.0+cu118 torchvision==0.15.0+cu118 torchaudio==2.0.0+cu118`
      (PyTorch 공식 cu118 인덱스). `torch.cuda.is_available() == True` 확인.
   3. IsaacGym Preview4는 NVIDIA 개발자 계정 로그인 필요라 자동화 불가 — 로컬에서 다운로드 후
-     `scp`로 `/mnt/DATA/workspace/ws_eungkyu/`에 업로드, `tar -xvf`(압축 안 됐으면 `-z` 빼도 됨)
+     `scp`로 `<SERVER_WS>/`에 업로드, `tar -xvf`(압축 안 됐으면 `-z` 빼도 됨)
      후 `isaacgym/python`에서 `pip install -e .`.
   4. **알려진 이슈 2개**:
      - `ImportError: libpython3.8.so.1.0: cannot open shared object file` — conda 환경의
@@ -852,7 +852,7 @@ v6 ep_peak_force_kN(제로액션 기준선 대비). 필요시 eval 스크립트 
 - **낙상 37회** (기준 0회). 낙상의 최다 유형은 `combined`(17회), 구간 시작 후 median 0.0s 시점. → 영상에서 해당 시점 확인(`--record_video`), `rewards.terminate_height`(0.35)와 `orientation`/`base_height` 페널티 균형 점검.
 - 눈으로 확인: `python eval_goal_pose.py ... --record_video` (env 0을 mp4로 저장) 또는 로컬에서 `play.py`.
 
-report saved to: /mnt/DATA/workspace/ws_eungkyu/k1-goalpose/htwk-gym/logs/K1/K1/Goal_Pose/2026-07-24-17-22-03_armB_goal_reached/eval/select_2026-07-25-14-57-08/winner_video
+report saved to: <SERVER_WS>/k1-goalpose/htwk-gym/logs/K1/K1/Goal_Pose/2026-07-24-17-22-03_armB_goal_reached/eval/select_2026-07-25-14-57-08/winner_video
 
 # GoalPose 평가 리포트 — 2026-07-25 15:38:03
 
@@ -939,7 +939,7 @@ report saved to: /mnt/DATA/workspace/ws_eungkyu/k1-goalpose/htwk-gym/logs/K1/K1/
 - **낙상 10회** (기준 0회). 낙상의 최다 유형은 `stand`(4회), 구간 시작 후 median 0.0s 시점. → 영상에서 해당 시점 확인(`--record_video`), `rewards.terminate_height`(0.35)와 `orientation`/`base_height` 페널티 균형 점검.
 - 눈으로 확인: `python eval_goal_pose.py ... --record_video` (env 0을 mp4로 저장) 또는 로컬에서 `play.py`.
 
-report saved to: /mnt/DATA/workspace/ws_eungkyu/k1-goalpose/htwk-gym/logs/K1/K1/Goal_Pose/2026-07-24-17-22-16_armC_200hz/eval/select_2026-07-25-15-24-51/winner_video
+report saved to: <SERVER_WS>/k1-goalpose/htwk-gym/logs/K1/K1/Goal_Pose/2026-07-24-17-22-16_armC_200hz/eval/select_2026-07-25-15-24-51/winner_video
 
 # GoalPose 평가 리포트 — 2026-07-25 15:37:30
 
@@ -1026,7 +1026,7 @@ report saved to: /mnt/DATA/workspace/ws_eungkyu/k1-goalpose/htwk-gym/logs/K1/K1/
 - **낙상 34회** (기준 0회). 낙상의 최다 유형은 `combined`(11회), 구간 시작 후 median 0.0s 시점. → 영상에서 해당 시점 확인(`--record_video`), `rewards.terminate_height`(0.35)와 `orientation`/`base_height` 페널티 균형 점검.
 - 눈으로 확인: `python eval_goal_pose.py ... --record_video` (env 0을 mp4로 저장) 또는 로컬에서 `play.py`.
 
-report saved to: /mnt/DATA/workspace/ws_eungkyu/k1-goalpose/htwk-gym/logs/K1/K1/Goal_Pose/2026-07-24-17-21-10_armA_continue/eval/select_2026-07-25-15-24-08/winner_video
+report saved to: <SERVER_WS>/k1-goalpose/htwk-gym/logs/K1/K1/Goal_Pose/2026-07-24-17-21-10_armA_continue/eval/select_2026-07-25-15-24-08/winner_video
 # GoalPose 평가 리포트 — 2026-07-25 15:02:51
 
 - checkpoint: `logs/K1/K1/Goal_Pose_V3/2026-07-25-04-07-04/nn/model_8000.pth`
@@ -1114,4 +1114,4 @@ report saved to: /mnt/DATA/workspace/ws_eungkyu/k1-goalpose/htwk-gym/logs/K1/K1/
 - **낙상 3회** (기준 0회). 낙상의 최다 유형은 `stand`(1회), 구간 시작 후 median 0.0s 시점. → 영상에서 해당 시점 확인(`--record_video`), `rewards.terminate_height`(0.35)와 `orientation`/`base_height` 페널티 균형 점검.
 - 눈으로 확인: `python eval_goal_pose.py ... --record_video` (env 0을 mp4로 저장) 또는 로컬에서 `play.py`.
 
-report saved to: /mnt/DATA/workspace/ws_eungkyu/k1-goalpose/htwk-gym/logs/K1/K1/Goal_Pose_V3/2026-07-25-04-07-04/eval/select_2026-07-25-14-54-43/winner_video
+report saved to: <SERVER_WS>/k1-goalpose/htwk-gym/logs/K1/K1/Goal_Pose_V3/2026-07-25-04-07-04/eval/select_2026-07-25-14-54-43/winner_video

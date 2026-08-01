@@ -7,9 +7,9 @@
 
 set -euo pipefail
 
-SERVER="${SERVER:-user@165.246.193.194}"
+SERVER="${SERVER:-<SERVER>}"
 # Path to the git-cloned repo root on the server (contains htwk-gym/).
-SERVER_REPO="${SERVER_REPO:-/mnt/DATA/workspace/ws_eungkyu/k1-goalpose}"
+SERVER_REPO="${SERVER_REPO:-<SERVER_REPO>}"
 LOCAL_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/htwk-gym"
 
 echo "📥 Pulling training artifacts from $SERVER:$SERVER_REPO/htwk-gym/ ..."

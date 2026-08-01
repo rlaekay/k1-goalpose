@@ -25,8 +25,8 @@ htwk-gym에서 태스크는 `tasks/`가 아니라 `envs/<robot>/<task>.py` +
 
 ### 서버 최초 설정 (한 번만)
 ```bash
-ssh user@user-ESC4000A-E12
-cd /mnt/DATA/workspace/ws_eungkyu
+ssh user@<SERVER_HOST>
+cd <SERVER_WS>
 git clone https://github.com/rlaekay/k1-goalpose.git
 # private repo라면: git clone 시 GitHub PAT 또는 SSH deploy key 필요
 #   HTTPS: git clone https://<PAT>@github.com/rlaekay/k1-goalpose.git
@@ -41,7 +41,7 @@ cd k1-goalpose/htwk-gym
 git add -A && git commit -m "..." && git push
 
 # 서버에서
-cd /mnt/DATA/workspace/ws_eungkyu/k1-goalpose
+cd <SERVER_REPO>
 git pull
 ```
 
@@ -54,7 +54,7 @@ git pull
 ## 서버에서 학습 실행 (전체 파이프라인)
 ```bash
 # 서버 tmux 창 1 — 학습 (GPU 번호는 nvidia-smi로 빈 쪽 확인 후 지정)
-cd /mnt/DATA/workspace/ws_eungkyu/k1-goalpose/htwk-gym
+cd <SERVER_REPO>/htwk-gym
 python train.py --task=K1/Goal_Pose --headless True \
   --checkpoint logs/warmstart/parameter_walk_actor_seed.pth \
   --num_envs 2048 --sim_device cuda:1 --rl_device cuda:1

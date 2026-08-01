@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-ROBOT_SSH="${ROBOT_SSH:-booster@192.168.10.102}"
+ROBOT_SSH="${ROBOT_SSH:-<ROBOT>}"
 SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-5}"
 SSH_ARGS=(-o "ConnectTimeout=${SSH_CONNECT_TIMEOUT}")
 
@@ -19,7 +19,7 @@ Usage:
   ./missionctl.sh watch status|telemetry|goal|goal-rel|policy
 
 Environment:
-  ROBOT_SSH=booster@192.168.10.102   SSH destination
+  ROBOT_SSH=<ROBOT>   SSH destination
   SSH_CONNECT_TIMEOUT=5              Connection timeout in seconds
 
 Mission 0/stop only stops the BT goal stream. For an emergency or policy fault,

@@ -447,20 +447,20 @@ heading은 degree, 실제 policy topic의 `vector.z`는 radian이다.
 
 서버와 로봇은 별개다. **서버 = 학습/export 전용, 실행 = 로봇 Intel Board.** "서버에서 실행"이 아니라 "서버에서 export → `.pt`를 보드로 복사 → 보드에서 실행"이다.
 
-1. **Code → 서버**: 로컬에서 `git push` → 서버(`165.246.193.194:/mnt/DATA/workspace/ws_eungkyu/k1-goalpose`)에서 `git pull`. (`PULL.sh`는 반대 방향으로 checkpoint/log만 당겨온다. 코드는 항상 git.)
+1. **Code → 서버**: 로컬에서 `git push` → 서버(`<SERVER_IP>:<SERVER_REPO>`)에서 `git pull`. (`PULL.sh`는 반대 방향으로 checkpoint/log만 당겨온다. 코드는 항상 git.)
 2. **Export = 서버에서**: checkpoint(`.pth`)와 GPU/torch가 서버에 있으므로 `python export_model.py ...`를 서버에서 돌려 `.pt`를 만든다.
 3. **`.pt` → 로봇**: `.pt`는 대용량 바이너리라 git에 안 들어간다(`.gitignore`). rsync/scp로 옮긴다:
    ```bash
    # 서버 -> 보드로 직접, 또는 로컬 경유
    # server -> robot direct route가 없으면 MISSION_DEPLOY_AUDIT_20260730.md의 Mac relay 사용
    scp .../nn/model_6200.pt \
-     booster@192.168.10.102:/home/booster/Workspace/k1-goalpose-mission/deploy/models/goal_pose_e0.pt
+     <ROBOT>:<ROBOT_WS>/deploy/models/goal_pose_e0.pt
    ```
 4. **Deploy 실행 = 로봇 보드에서**(`deploy/README.md`):
    ```bash
-   scp -r deploy/ booster@192.168.10.102:/home/booster/Workspace/k1-goalpose-mission/
-   ssh booster@192.168.10.102
-   cd /home/booster/Workspace/k1-goalpose-mission/deploy
+   scp -r deploy/ <ROBOT>:<ROBOT_WS>/
+   ssh <ROBOT>
+   cd <ROBOT_WS>/deploy
    source /opt/ros/humble/setup.bash
    # system Python에서 rclpy/PyTorch/Booster SDK import가 확인된 로봇 환경을 사용
    python deploy_goal_pose.py --config Goal_Pose_E0.yaml --net 127.0.0.1 \
@@ -477,8 +477,8 @@ E0@6200 hash/shape smoke와 fixed-goal hoist gate를 통과해야 한다. 이는
 **① camera-PF vision** — 기존 경기 install은 dependency underlay로 읽기만 한다:
 ```bash
 source /opt/ros/humble/setup.bash
-source /home/booster/Workspace/INHA-Soccer/INHA-Player/install/setup.bash
-source /home/booster/Workspace/k1-goalpose-mission/brain_ws/install/setup.bash
+source <ROBOT_GAME_WS>/install/setup.bash
+source <ROBOT_WS>/brain_ws/install/setup.bash
 ros2 launch vision launch.py vision_config_path:=/opt/booster \
   ekay_odom:=true save_data:=false show_det:=false
 ```
@@ -486,8 +486,8 @@ ros2 launch vision launch.py vision_config_path:=/opt/booster \
 **② mission-only Brain** — 새 staging build의 BT/FSM과 goal_rel publisher:
 ```bash
 source /opt/ros/humble/setup.bash
-source /home/booster/Workspace/INHA-Soccer/INHA-Player/install/setup.bash
-source /home/booster/Workspace/k1-goalpose-mission/brain_ws/install/setup.bash
+source <ROBOT_GAME_WS>/install/setup.bash
+source <ROBOT_WS>/brain_ws/install/setup.bash
 ros2 launch brain launch.py tree:=locomotion_test \
   vision_config_path:=/opt/booster disable_com:=true
 ```
@@ -495,7 +495,7 @@ ros2 launch brain launch.py tree:=locomotion_test \
 **③ E0 deploy** — 정책 실행, goal_rel 구독 → LowCmd (파이썬, 빌드 없음, rclpy 필요):
 ```bash
 source /opt/ros/humble/setup.bash
-cd /home/booster/Workspace/k1-goalpose-mission/deploy
+cd <ROBOT_WS>/deploy
 python3 deploy_goal_pose.py --config Goal_Pose_E0.yaml \
   --goal-source ros --net 127.0.0.1
 # 로봇 PREP 상태에서 시작 → custom mode 진입 프롬프트를 따라 진행

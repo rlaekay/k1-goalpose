@@ -50,9 +50,9 @@ Laptop terminal
 로봇의 **clean mission staging workspace**에서:
 
 ```bash
-cd /home/booster/Workspace/k1-goalpose-mission/brain_ws
+cd <ROBOT_WS>/brain_ws
 source /opt/ros/humble/setup.bash
-source /home/booster/Workspace/INHA-Soccer/INHA-Player/install/setup.bash
+source <ROBOT_GAME_WS>/install/setup.bash
 colcon build --packages-select brain --executor sequential --parallel-workers 1
 source install/setup.bash
 ```
@@ -63,15 +63,15 @@ source install/setup.bash
 ```bash
 # terminal A: camera-PF localization (기존 install의 vision package를 underlay로 사용)
 source /opt/ros/humble/setup.bash
-source /home/booster/Workspace/INHA-Soccer/INHA-Player/install/setup.bash
-source /home/booster/Workspace/k1-goalpose-mission/brain_ws/install/setup.bash
+source <ROBOT_GAME_WS>/install/setup.bash
+source <ROBOT_WS>/brain_ws/install/setup.bash
 ros2 launch vision launch.py vision_config_path:=/opt/booster \
   ekay_odom:=true save_data:=false show_det:=false
 
 # terminal B: mission-only Brain
 source /opt/ros/humble/setup.bash
-source /home/booster/Workspace/INHA-Soccer/INHA-Player/install/setup.bash
-source /home/booster/Workspace/k1-goalpose-mission/brain_ws/install/setup.bash
+source <ROBOT_GAME_WS>/install/setup.bash
+source <ROBOT_WS>/brain_ws/install/setup.bash
 ros2 launch brain launch.py tree:=locomotion_test \
   vision_config_path:=/opt/booster disable_com:=true
 ```

@@ -54,7 +54,7 @@ policy bridge 가시성을 보강했다. `deploy_goal_pose.py`는 이제 CUSTOM 
 - `ros2`, `colcon`, PyTorch, PyYAML은 Mac 기본 Python에 없음. 따라서 Mac은 ROS node를
   직접 실행하지 않고 `missionctl.sh`가 SSH로 로봇의 ROS CLI를 호출한다.
 
-### Robot `booster@192.168.10.102`
+### Robot `<ROBOT>`
 
 - Ubuntu 22.04, aarch64, real-time Tegra kernel.
 - ROS 2 Humble, `ROS_DOMAIN_ID=0`, `ros2`와 `colcon` 설치됨.
@@ -62,43 +62,43 @@ policy bridge 가시성을 보강했다. `deploy_goal_pose.py`는 이제 CUSTOM 
 - Booster Python SDK import 성공:
   `/usr/local/lib/python3.10/dist-packages/booster_robotics_sdk_python...so`.
 - `rclpy` import 성공.
-- 기존 경기 repo `/home/booster/Workspace/INHA-Soccer/INHA-Player`는 branch
+- 기존 경기 repo `<ROBOT_GAME_WS>`는 branch
   `sim2real`이며 `config.yaml`, `game.xml` 등 사용자 수정 7개가 있다. 이 worktree에는
   pull/switch/overwrite를 하지 않는다.
-- 기존 `/home/booster/Workspace/INHA-RL/deploy`는 동작 중인 velocity walk 환경이며
+- 기존 `<ROBOT_RL_WS>/deploy`는 동작 중인 velocity walk 환경이며
   `base_walk.pt`, `parameter_walk*.pt`, `velocity_command_walk_k1.pt`만 있다.
-- `/home/booster/Workspace/deploy/tasks/goto`에는 별도 `k1_goto_jit.pt`가 있으나 E0@6200이
+- `<ROBOT_DEPLOY_WS>/tasks/goto`에는 별도 `k1_goto_jit.pt`가 있으나 E0@6200이
   아니고 observation/goal-latching contract도 다르므로 대체품으로 쓰지 않는다.
 - `goal_pose_e0.pt`, `model_6200.pth`, `deploy_goal_pose.py`는 확인 당시 로봇에 없었다.
 - 기본 Booster agent/ROS bridge들은 실행 중이었지만 Brain과 E0 deploy는 실행 중이 아니었다.
 
 ### Training server
 
-- 실제 SSH endpoint는 `165.246.193.194:6666`이다. sshd가 IPv4/IPv6 all-address에서
-  6666 LISTEN 중이고 `user` 인증도 성공했다. 앞선 22번 포트 검사는 endpoint 자체가
+- 실제 SSH endpoint는 `<SERVER_IP>:<ssh-port>`이다. sshd가 IPv4/IPv6 all-address에서
+  <ssh-port> LISTEN 중이고 `user` 인증도 성공했다. 앞선 22번 포트 검사는 endpoint 자체가
   잘못됐다.
 - Mac에는 default route가 두 개다. 우선 route가 robot 전용 Ethernet
-  `192.168.10.10(en13) -> 192.168.10.1`이라 평범한 `ssh -p 6666`도 TCP timeout이 났다.
-  Wi-Fi는 `10.10.124.17(en0) -> 10.10.120.1`이며 이 주소를 bind하면 6666 연결이 성공한다.
-- Robot은 서버 트래픽을 별도 Wi-Fi `192.168.0.35 -> 192.168.0.1`로 보내므로
-  `nc 165.246.193.194 6666`이 성공했다. Robot을 ProxyJump로 쓴 SSH 인증도 성공했다.
+  `<mac-eth-ip>(en13) -> <eth-gw>`이라 평범한 `ssh -p <ssh-port>`도 TCP timeout이 났다.
+  Wi-Fi는 `<mac-wifi-ip>(en0) -> <mac-wifi-gw>`이며 이 주소를 bind하면 <ssh-port> 연결이 성공한다.
+- Robot은 서버 트래픽을 별도 Wi-Fi `<robot-wifi-ip> -> <robot-wifi-gw>`로 보내므로
+  `nc <SERVER_IP> <ssh-port>`이 성공했다. Robot을 ProxyJump로 쓴 SSH 인증도 성공했다.
 - 현재 Mac에서 직접 접속하는 명령:
 
   ```bash
   MAC_WIFI_IP=$(ipconfig getifaddr en0)
-  ssh -b "$MAC_WIFI_IP" -p 6666 user@165.246.193.194
+  ssh -b "$MAC_WIFI_IP" -p <ssh-port> <SERVER>
   ```
 
 - fallback jump 경로:
 
   ```bash
-  ssh -J booster@192.168.10.102 -p 6666 user@165.246.193.194
+  ssh -J <ROBOT> -p <ssh-port> <SERVER>
   ```
 
 - 서버 repo는 `main` commit `3d34d27`이고 기존 untracked sweep/video 항목이 있다. pull,
   checkout, edit를 하지 않았다.
 - checkpoint:
-  `/mnt/DATA/workspace/ws_eungkyu/k1-goalpose/htwk-gym/logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_E0_armB_armsdown/nn/model_6200.pth`
+  `<SERVER_REPO>/htwk-gym/logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_E0_armB_armsdown/nn/model_6200.pth`
   - size: `2,200,235 bytes`
   - SHA-256: `d646da18c7209b9477cd24e8fb9224d2fe9e1137fe2bec2ddb4ab75e0a86eb8c`
 - frozen `config.yaml` SHA-256:
@@ -122,7 +122,7 @@ frozen config와 deploy contract 비교:
 ### 이번 세션에서 실제로 만든 robot staging과 검증 결과
 
 기존 두 worktree는 수정하지 않고 새 경로
-`/home/booster/Workspace/k1-goalpose-mission`만 만들었다.
+`<ROBOT_WS>`만 만들었다.
 
 - `deploy/`: 이 repo의 전체 deploy 복사본을 배치했고, 최신
   `deploy_goal_pose.py`/`policy_goal_pose.py`의 robot-side `py_compile`을 통과했다. 최신
@@ -136,8 +136,8 @@ frozen config와 deploy contract 비교:
   `colcon build --packages-select brain --executor sequential --parallel-workers 1` 실행:
   `1 package finished [12min 47s]`.
 - 새 overlay의 `ros2 pkg prefix brain`은
-  `/home/booster/Workspace/k1-goalpose-mission/brain_ws/install/brain`, vision은 기존 read-only
-  underlay `/home/booster/Workspace/INHA-Soccer/INHA-Player/install/vision`을 가리킨다.
+  `<ROBOT_WS>/brain_ws/install/brain`, vision은 기존 read-only
+  underlay `<ROBOT_GAME_WS>/install/vision`을 가리킨다.
 - source/install의 `locomotion_test.xml` SHA-256이 일치했고, 설치 binary에
   `/locomotion_test/goal_rel` 문자열이 있으며 `ldd` missing dependency는 없었다.
 - `ros2 launch brain launch.py --show-args`가 성공했다. 실제 Brain/vision node는 시작하지
@@ -214,7 +214,7 @@ frozen run config가 최종 기준**이어야 한다. architecture는 54→12로
 joint default, action scale은 frozen config와 다시 대조한다.
 
 ```bash
-cd /mnt/DATA/workspace/ws_eungkyu/k1-goalpose/htwk-gym
+cd <SERVER_REPO>/htwk-gym
 conda activate k1goalpose
 
 CKPT=logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_E0_armB_armsdown/nn/model_6200.pth
@@ -238,19 +238,19 @@ sha256sum "${CKPT%.pth}.pt"
 
 ```bash
 scp logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_E0_armB_armsdown/nn/model_6200.pt \
-  booster@192.168.10.102:/home/booster/Workspace/k1-goalpose-mission/deploy/models/goal_pose_e0.pt
+  <ROBOT>:<ROBOT_WS>/deploy/models/goal_pose_e0.pt
 ```
 
 직접 route가 없으면 Mac relay를 쓴다:
 
 ```bash
 MAC_WIFI_IP=$(ipconfig getifaddr en0)
-scp -o BindAddress="$MAC_WIFI_IP" -P 6666 \
-  user@165.246.193.194:/mnt/DATA/workspace/ws_eungkyu/k1-goalpose/htwk-gym/logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_E0_armB_armsdown/nn/model_6200.pt \
+scp -o BindAddress="$MAC_WIFI_IP" -P <ssh-port> \
+  <SERVER>:<SERVER_REPO>/htwk-gym/logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_E0_armB_armsdown/nn/model_6200.pt \
   /tmp/goal_pose_e0.pt
 
 scp /tmp/goal_pose_e0.pt \
-  booster@192.168.10.102:/home/booster/Workspace/k1-goalpose-mission/deploy/models/goal_pose_e0.pt
+  <ROBOT>:<ROBOT_WS>/deploy/models/goal_pose_e0.pt
 ```
 
 복사 후 양쪽 `sha256sum`이 같아야 한다.
@@ -260,7 +260,7 @@ scp /tmp/goal_pose_e0.pt \
 기존 dirty 경기 repo와 기존 INHA-RL deploy를 덮어쓰지 않는다. 별도 경로만 쓴다.
 
 ```text
-/home/booster/Workspace/k1-goalpose-mission/
+<ROBOT_WS>/
   brain_ws/                 # clean ekay-fix mission Brain build
   deploy/
     deploy_goal_pose.py
@@ -270,7 +270,7 @@ scp /tmp/goal_pose_e0.pt \
 ```
 
 허용된 준비 작업은 이 새 staging 경로로 copy, clean branch pull/clone, build뿐이다.
-기존 `/home/booster/Workspace/INHA-Soccer/INHA-Player`의 사용자 변경은 보존한다.
+기존 `<ROBOT_GAME_WS>`의 사용자 변경은 보존한다.
 
 ## 최초 1회 승격 gate
 
@@ -297,8 +297,8 @@ mission에는 camera-PF localization이 필요하다. 기존 install의 vision p
 
 ```bash
 source /opt/ros/humble/setup.bash
-source /home/booster/Workspace/INHA-Soccer/INHA-Player/install/setup.bash
-source /home/booster/Workspace/k1-goalpose-mission/brain_ws/install/setup.bash
+source <ROBOT_GAME_WS>/install/setup.bash
+source <ROBOT_WS>/brain_ws/install/setup.bash
 ros2 launch vision launch.py vision_config_path:=/opt/booster \
   ekay_odom:=true save_data:=false show_det:=false
 ```
@@ -310,8 +310,8 @@ game-controller, sound를 함께 시작한다.
 
 ```bash
 source /opt/ros/humble/setup.bash
-source /home/booster/Workspace/INHA-Soccer/INHA-Player/install/setup.bash
-source /home/booster/Workspace/k1-goalpose-mission/brain_ws/install/setup.bash
+source <ROBOT_GAME_WS>/install/setup.bash
+source <ROBOT_WS>/brain_ws/install/setup.bash
 ros2 launch brain launch.py tree:=locomotion_test \
   vision_config_path:=/opt/booster disable_com:=true
 ```
@@ -322,7 +322,7 @@ marker가 보이지 않아 `odom_calibrated=false`이면 BT는 goal을 publish�
 ### Robot terminal C — E0 deploy
 
 ```bash
-cd /home/booster/Workspace/k1-goalpose-mission/deploy
+cd <ROBOT_WS>/deploy
 source /opt/ros/humble/setup.bash
 python3 deploy_goal_pose.py \
   --config Goal_Pose_E0.yaml \

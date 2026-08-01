@@ -17,9 +17,9 @@
 
 set -euo pipefail
 
-SERVER="${SERVER:-user@user-ESC4000A-E12}"
+SERVER="${SERVER:-user@<SERVER_HOST>}"
 PORT="${PORT:-22}"
-REMOTE_DIR="${REMOTE_DIR:-/mnt/DATA/workspace/ws_eungkyu/k1-goalpose/htwk-gym/shared_eval_videos}"
+REMOTE_DIR="${REMOTE_DIR:-<SERVER_WS>/k1-goalpose/htwk-gym/shared_eval_videos}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOCAL_DIR="${LOCAL_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)/K1_walk/v7}"
 PATTERN="${1:-}"
