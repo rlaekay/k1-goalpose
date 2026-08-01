@@ -16,10 +16,145 @@ from isaacgym.torch_utils import (
 
 assert gymtorch
 
+import math
 import numpy as np
 import torch
 
 from envs.K1.goal_pose_v7 import GoalPoseV7
+
+
+# These defaults are deliberately behind ``disturbance.scenario_aware.enabled``.
+# The released H0--H3 configs do not contain that switch, so their sampling and
+# random-number consumption stay unchanged.  They describe player-contact
+# *wrench proxies*, not a simulated second robot collision.  In particular the
+# old short 40--100 N frontal-collision class is not part of this distribution.
+SCENARIO_AWARE_DEFAULTS = (
+    {
+        "name": "omni_shove",
+        "weight": 0.50,
+        "force_n": (15.0, 40.0),
+        "duration_s": (0.25, 0.45),
+        "twist_nm": (0.0, 0.0),
+        "direction_mode": "uniform",
+    },
+    {
+        # A source behind the robot pushes approximately along +robot-x.  The
+        # force is still frozen in world coordinates once contact begins.
+        "name": "rear_push",
+        "weight": 0.30,
+        "force_n": (15.0, 40.0),
+        "duration_s": (0.25, 0.45),
+        "twist_nm": (0.0, 0.0),
+        "direction_mode": "rear_cone",
+        "half_angle_deg": 22.5,
+        "height_tiers": ("chest", "arm_proxy"),
+    },
+    {
+        "name": "arm_entanglement",
+        "weight": 0.20,
+        "force_n": (6.0, 18.0),
+        "duration_s": (0.30, 0.80),
+        "twist_nm": (1.0, 4.0),
+        "direction_mode": "uniform",
+        "height_tiers": ("arm_proxy",),
+    },
+)
+
+
+# Fixed arm links are collapsed into Trunk by the current asset import.  The
+# upper two tiers therefore use Trunk plus an off-COM contact point as an arm /
+# chest proxy.  Hip and shank tiers retain genuine loaded rigid bodies.  The
+# offset is expressed in robot axes from the selected body's COM; ``mirror_y``
+# samples the same arm envelope on both sides.
+HEIGHT_TIER_DEFAULTS = (
+    {
+        "name": "shank",
+        "weight": 0.05,
+        "body_weights": {"Left_Shank": 0.5, "Right_Shank": 0.5},
+        "offset_x_m": (-0.02, 0.02),
+        "offset_y_m": (-0.015, 0.015),
+        "offset_z_m": (-0.08, 0.08),
+    },
+    {
+        "name": "hip",
+        "weight": 0.05,
+        "body_weights": {"Left_Hip_Roll": 0.5, "Right_Hip_Roll": 0.5},
+        "offset_x_m": (-0.03, 0.03),
+        "offset_y_m": (-0.03, 0.03),
+        "offset_z_m": (-0.04, 0.04),
+    },
+    {
+        "name": "chest",
+        "weight": 0.30,
+        "body_weights": {"Trunk": 1.0},
+        "offset_x_m": (-0.04, 0.06),
+        "offset_y_m": (-0.08, 0.08),
+        "offset_z_m": (0.04, 0.14),
+    },
+    {
+        "name": "arm_proxy",
+        "weight": 0.60,
+        "body_weights": {"Trunk": 1.0},
+        "offset_x_m": (-0.04, 0.06),
+        "offset_y_m": (0.10, 0.25),
+        "offset_z_m": (0.14, 0.25),
+        "mirror_y": True,
+    },
+)
+
+
+def _merge_named_specs(defaults, overrides, label):
+    """Return validated named weighted specs without touching any RNG.
+
+    ``overrides`` may be a mapping keyed by name or a list of dictionaries.
+    Existing named defaults are updated; a new name must provide a complete
+    spec.  This helper intentionally uses only Python builtins so the schema can
+    be unit-tested on a machine without Isaac Gym or PyTorch.
+    """
+    merged = {item["name"]: dict(item) for item in defaults}
+    order = [item["name"] for item in defaults]
+    if overrides:
+        if isinstance(overrides, dict):
+            items = []
+            for name, value in overrides.items():
+                if not isinstance(value, dict):
+                    raise ValueError("{}.{} must be a mapping".format(label, name))
+                item = dict(value)
+                item.setdefault("name", name)
+                items.append(item)
+        elif isinstance(overrides, (list, tuple)):
+            items = list(overrides)
+        else:
+            raise ValueError("{} must be a mapping or list".format(label))
+        for item in items:
+            if not isinstance(item, dict) or not item.get("name"):
+                raise ValueError("each {} entry needs a name".format(label))
+            name = item["name"]
+            if name not in merged:
+                merged[name] = {}
+                order.append(name)
+            merged[name].update(item)
+
+    specs = [merged[name] for name in order if float(merged[name].get("weight", 0.0)) > 0.0]
+    if not specs:
+        raise ValueError("{} has no positive-weight entries".format(label))
+    total = sum(float(item["weight"]) for item in specs)
+    if not math.isfinite(total) or total <= 0.0:
+        raise ValueError("{} weights must have a finite positive sum".format(label))
+    for item in specs:
+        item["weight"] = float(item["weight"]) / total
+    return specs
+
+
+def _finite_range(value, label, nonnegative=False):
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError("{} must be [low, high]".format(label))
+    lo, hi = float(value[0]), float(value[1])
+    if not (math.isfinite(lo) and math.isfinite(hi) and lo <= hi):
+        raise ValueError("{} must be a finite ordered range".format(label))
+    if nonnegative and lo < 0.0:
+        raise ValueError("{} must be nonnegative".format(label))
+    return lo, hi
 
 
 class GoalPoseHBatch(GoalPoseV7):
@@ -57,7 +192,135 @@ class GoalPoseHBatch(GoalPoseV7):
             self.num_envs, device=self.device)
         self.dist_last_expected_torque_impulse = torch.zeros(
             self.num_envs, device=self.device)
+        # Vector event provenance.  ``expected`` is the analytic held-wrench
+        # integral, while ``submitted`` is accumulated from the tensor actually
+        # passed on every physics substep.  The latter verifies the scheduler and
+        # decimation plumbing; it is not a measurement of contact-free m*delta-v
+        # because feet, gravity and joint actuation also exchange momentum.
+        self.dist_last_expected_impulse_vec = torch.zeros(
+            self.num_envs, 3, device=self.device)
+        self.dist_last_expected_torque_impulse_vec = torch.zeros(
+            self.num_envs, 3, device=self.device)
+        self.dist_event_submitted_impulse_vec = torch.zeros(
+            self.num_envs, 3, device=self.device)
+        self.dist_event_submitted_torque_impulse_vec = torch.zeros(
+            self.num_envs, 3, device=self.device)
+        self.dist_last_submitted_impulse_vec = torch.zeros(
+            self.num_envs, 3, device=self.device)
+        self.dist_last_submitted_torque_impulse_vec = torch.zeros(
+            self.num_envs, 3, device=self.device)
+        self.dist_last_submitted_impulse = torch.zeros(
+            self.num_envs, device=self.device)
+        self.dist_last_submitted_torque_impulse = torch.zeros(
+            self.num_envs, device=self.device)
+        self.dist_last_direction_local = torch.zeros(
+            self.num_envs, 3, device=self.device)
+        self.dist_last_contact_offset_local = torch.zeros(
+            self.num_envs, 3, device=self.device)
+        self.dist_last_scenario_id = torch.zeros(
+            self.num_envs, dtype=torch.int8, device=self.device)
+        self.dist_last_height_tier = torch.full(
+            (self.num_envs,), -1, dtype=torch.int8, device=self.device)
+        self._configure_scenario_disturbance(
+            (self.cfg["randomization"].get("disturbance") or {}).get(
+                "scenario_aware") or {})
         self.dist_wrench_apply_calls = 0
+
+    def _configure_scenario_disturbance(self, scenario_cfg):
+        """Build immutable lookup tables for the optional player-contact model."""
+        self._dist_scenario_enabled = bool(scenario_cfg.get("enabled", False))
+        self.dist_scenario_names = ()
+        self.dist_height_tier_names = ()
+        if not self._dist_scenario_enabled:
+            return
+
+        scenarios = _merge_named_specs(
+            SCENARIO_AWARE_DEFAULTS, scenario_cfg.get("scenarios"),
+            "disturbance.scenario_aware.scenarios")
+        tiers = _merge_named_specs(
+            HEIGHT_TIER_DEFAULTS, scenario_cfg.get("height_tiers"),
+            "disturbance.scenario_aware.height_tiers")
+
+        tier_by_name = {item["name"]: i for i, item in enumerate(tiers)}
+        for spec in scenarios:
+            for key in ("force_n", "duration_s", "twist_nm"):
+                spec[key] = _finite_range(
+                    spec.get(key), "scenario {}.{}".format(spec["name"], key),
+                    nonnegative=True)
+            if spec["duration_s"][0] <= 0.0:
+                raise ValueError("scenario {} duration must be positive".format(
+                    spec["name"]))
+            mode = spec.get("direction_mode", "uniform")
+            if mode not in ("uniform", "rear_cone"):
+                raise ValueError("scenario {} has unknown direction_mode {}".format(
+                    spec["name"], mode))
+            # There is intentionally no frontal/high-speed collision mode.
+            if mode == "rear_cone":
+                half = float(spec.get("half_angle_deg", 22.5))
+                if not math.isfinite(half) or not 0.0 <= half <= 90.0:
+                    raise ValueError("scenario {} rear cone must be 0..90 deg".format(
+                        spec["name"]))
+            allowed = spec.get("height_tiers")
+            if allowed is None:
+                spec["height_tier_indices"] = tuple(range(len(tiers)))
+            else:
+                unknown = [name for name in allowed if name not in tier_by_name]
+                if unknown:
+                    raise ValueError("scenario {} has unknown height tiers {}".format(
+                        spec["name"], unknown))
+                spec["height_tier_indices"] = tuple(
+                    tier_by_name[name] for name in allowed)
+
+        for spec in tiers:
+            for key in ("offset_x_m", "offset_y_m", "offset_z_m"):
+                spec[key] = _finite_range(
+                    spec.get(key), "height tier {}.{}".format(spec["name"], key))
+            body_weights = spec.get("body_weights")
+            if not isinstance(body_weights, dict) or not body_weights:
+                raise ValueError("height tier {} needs body_weights".format(spec["name"]))
+            unknown = [name for name in body_weights if name not in self.body_names]
+            if unknown:
+                raise ValueError(
+                    "height tier {} references unloaded bodies {} (loaded: {})".format(
+                        spec["name"], unknown, self.body_names))
+            weights = [float(body_weights[name]) for name in body_weights]
+            if any((not math.isfinite(value) or value < 0.0) for value in weights):
+                raise ValueError("height tier {} body weights must be nonnegative".format(
+                    spec["name"]))
+            total = sum(weights)
+            if total <= 0.0:
+                raise ValueError("height tier {} body weights sum to zero".format(
+                    spec["name"]))
+            spec["body_indices"] = torch.tensor(
+                [self.body_names.index(name) for name in body_weights],
+                dtype=torch.long, device=self.device)
+            spec["body_probability"] = torch.tensor(
+                [value / total for value in weights],
+                dtype=torch.float, device=self.device)
+
+        self._dist_scenario_specs = scenarios
+        self._dist_height_tier_specs = tiers
+        self._dist_scenario_probability = torch.tensor(
+            [item["weight"] for item in scenarios],
+            dtype=torch.float, device=self.device)
+        self._dist_height_tier_probability = torch.tensor(
+            [item["weight"] for item in tiers],
+            dtype=torch.float, device=self.device)
+        self.dist_scenario_names = tuple(item["name"] for item in scenarios)
+        self.dist_height_tier_names = tuple(item["name"] for item in tiers)
+
+    def _finalize_submitted_impulse(self, env_mask):
+        """Snapshot the substep-integrated wrench for events that just ended."""
+        if not bool(env_mask.any()):
+            return
+        self.dist_last_submitted_impulse_vec[env_mask] = (
+            self.dist_event_submitted_impulse_vec[env_mask])
+        self.dist_last_submitted_torque_impulse_vec[env_mask] = (
+            self.dist_event_submitted_torque_impulse_vec[env_mask])
+        self.dist_last_submitted_impulse[env_mask] = torch.norm(
+            self.dist_event_submitted_impulse_vec[env_mask], dim=-1)
+        self.dist_last_submitted_torque_impulse[env_mask] = torch.norm(
+            self.dist_event_submitted_torque_impulse_vec[env_mask], dim=-1)
 
     # H1/H2 reflect the robot about its local y=0 plane.  Policy observation
     # and actions are handled by GoalPoseV3; the asymmetric critic channels
@@ -88,6 +351,13 @@ class GoalPoseHBatch(GoalPoseV7):
         self.last_feet_contact[env_ids] = False
         self.last_stability_vel[env_ids] = 0.0
         self.stability_accel_filtered[env_ids] = 0.0
+        if hasattr(self, "dist_event_submitted_impulse_vec"):
+            reset_mask = torch.zeros(
+                self.num_envs, dtype=torch.bool, device=self.device)
+            reset_mask[env_ids] = True
+            self._finalize_submitted_impulse(reset_mask)
+            self.dist_event_submitted_impulse_vec[env_ids] = 0.0
+            self.dist_event_submitted_torque_impulse_vec[env_ids] = 0.0
         d = self.cfg["randomization"].get("disturbance") or {}
         if d.get("enabled", False):
             lo, hi = d.get("interval_s", [8.0, 14.0])
@@ -101,6 +371,156 @@ class GoalPoseHBatch(GoalPoseV7):
         self.last_feet_contact[:] = self.feet_contact & ~done.unsqueeze(-1)
         self.last_stability_vel[:] = self.filtered_lin_vel
         return out
+
+    def _sample_scenario_events(self, fire):
+        """Install non-collision player-contact wrench proxies for ``fire``.
+
+        Isaac Gym's tensor API applies force at a rigid-body COM.  Because this
+        asset collapses fixed arms into Trunk, an arm/chest contact is represented
+        by an exactly equivalent rigid-body wrench: ``F`` at COM plus
+        ``r x F`` and an independent twist torque.  It reproduces the resultant
+        motion of the merged rigid body, but cannot reproduce arm-joint compliance,
+        contact geometry or a second robot's coupled dynamics.
+
+        Directions are sampled in robot coordinates at event onset, rotated to
+        ENV_SPACE once, and then held there.  Using LOCAL_SPACE would make a
+        person/contact direction rotate with the recovering robot.
+        """
+        k = len(fire)
+        scenario_id = torch.multinomial(
+            self._dist_scenario_probability, k, replacement=True)
+        tier_id = torch.empty(k, dtype=torch.long, device=self.device)
+
+        # Tier sampling is scenario-conditional (rear pushes target chest/arms;
+        # entanglement targets the folded-arm proxy), while omni shove exposes
+        # every height to every horizontal direction.
+        for sid, scenario in enumerate(self._dist_scenario_specs):
+            mask = scenario_id == sid
+            n = int(mask.sum().item())
+            if n == 0:
+                continue
+            allowed = torch.tensor(
+                scenario["height_tier_indices"], dtype=torch.long,
+                device=self.device)
+            weights = self._dist_height_tier_probability[allowed]
+            weights = weights / weights.sum()
+            sampled = torch.multinomial(weights, n, replacement=True)
+            tier_id[mask] = allowed[sampled]
+
+        body = torch.empty(k, dtype=torch.long, device=self.device)
+        contact_offset_local = torch.zeros(k, 3, device=self.device)
+        for tid, tier in enumerate(self._dist_height_tier_specs):
+            mask = tier_id == tid
+            n = int(mask.sum().item())
+            if n == 0:
+                continue
+            pick = torch.multinomial(
+                tier["body_probability"], n, replacement=True)
+            body[mask] = tier["body_indices"][pick]
+            for axis, key in enumerate(
+                    ("offset_x_m", "offset_y_m", "offset_z_m")):
+                lo, hi = tier[key]
+                value = torch_rand_float(
+                    lo, hi, (n, 1), device=self.device).squeeze(1)
+                if axis == 1 and bool(tier.get("mirror_y", False)):
+                    side = torch.where(
+                        torch.rand(n, device=self.device) < 0.5,
+                        -torch.ones(n, device=self.device),
+                        torch.ones(n, device=self.device))
+                    value = value.abs() * side
+                contact_offset_local[mask, axis] = value
+
+        force_magnitude = torch.zeros(k, device=self.device)
+        twist_magnitude = torch.zeros(k, device=self.device)
+        duration = torch.zeros(k, device=self.device)
+        angle_local = torch.zeros(k, device=self.device)
+        for sid, scenario in enumerate(self._dist_scenario_specs):
+            mask = scenario_id == sid
+            n = int(mask.sum().item())
+            if n == 0:
+                continue
+            flo, fhi = scenario["force_n"]
+            dlo, dhi = scenario["duration_s"]
+            tlo, thi = scenario["twist_nm"]
+            force_magnitude[mask] = torch_rand_float(
+                flo, fhi, (n, 1), device=self.device).squeeze(1)
+            duration[mask] = torch_rand_float(
+                dlo, dhi, (n, 1), device=self.device).squeeze(1)
+            twist_magnitude[mask] = torch_rand_float(
+                tlo, thi, (n, 1), device=self.device).squeeze(1)
+            if scenario.get("direction_mode", "uniform") == "uniform":
+                angle_local[mask] = torch_rand_float(
+                    -np.pi, np.pi, (n, 1), device=self.device).squeeze(1)
+            else:
+                half = math.radians(float(scenario.get("half_angle_deg", 22.5)))
+                angle_local[mask] = torch_rand_float(
+                    -half, half, (n, 1), device=self.device).squeeze(1)
+
+        direction_local = torch.stack((
+            torch.cos(angle_local), torch.sin(angle_local),
+            torch.zeros_like(angle_local)), dim=-1)
+        force_local = direction_local * force_magnitude.unsqueeze(-1)
+        force_world = quat_rotate(self.base_quat[fire], force_local)
+
+        # Gaussian direction normalized to the sphere is isotropic.  The legacy
+        # cube-normalized torque sampler remains untouched in the legacy branch.
+        twist_axis_local = torch.randn(k, 3, device=self.device)
+        twist_axis_local /= twist_axis_local.norm(
+            dim=-1, keepdim=True).clamp(min=1.0e-6)
+        twist_local = twist_axis_local * twist_magnitude.unsqueeze(-1)
+        twist_world = quat_rotate(self.base_quat[fire], twist_local)
+        offset_world = quat_rotate(
+            self.base_quat[fire], contact_offset_local)
+        moment_world = torch.cross(offset_world, force_world, dim=-1)
+        torque_world = moment_world + twist_world
+
+        duration_steps = torch.ceil(duration / self.dt).long().clamp(min=1)
+        applied_duration = duration_steps.float() * self.dt
+
+        self.pushing_forces[fire, body] = force_world
+        self.pushing_torques[fire, body] = torque_world
+        self.dist_active_body[fire] = body
+        # These are sustained support/entanglement events, not the excluded
+        # short full-speed collision. Keep the old evaluator's class as support;
+        # scenario identity is carried independently below.
+        self.dist_event_kind[fire] = 2
+        self.dist_last_event_kind[fire] = 2
+        self.dist_event_serial[fire] += 1
+        self.dist_steps_left[fire] = duration_steps
+
+        self.dist_last_expected_impulse[fire] = (
+            force_magnitude * applied_duration)
+        self.dist_last_expected_torque_impulse[fire] = (
+            torch.norm(torque_world, dim=-1) * applied_duration)
+        self.dist_last_expected_impulse_vec[fire] = (
+            force_world * applied_duration.unsqueeze(-1))
+        self.dist_last_expected_torque_impulse_vec[fire] = (
+            torque_world * applied_duration.unsqueeze(-1))
+        self.dist_last_direction_local[fire] = direction_local
+        self.dist_last_contact_offset_local[fire] = contact_offset_local
+        self.dist_last_scenario_id[fire] = (scenario_id + 1).to(torch.int8)
+        self.dist_last_height_tier[fire] = tier_id.to(torch.int8)
+        self.dist_event_submitted_impulse_vec[fire] = 0.0
+        self.dist_event_submitted_torque_impulse_vec[fire] = 0.0
+
+    def _record_legacy_event_telemetry(self, fire, body, applied_duration):
+        """Populate new provenance buffers without changing legacy sampling."""
+        force_world = self.pushing_forces[fire, body]
+        torque_world = self.pushing_torques[fire, body]
+        force_magnitude = torch.norm(force_world, dim=-1)
+        direction_world = force_world / force_magnitude.unsqueeze(-1).clamp(
+            min=1.0e-6)
+        self.dist_last_expected_impulse_vec[fire] = (
+            force_world * applied_duration.unsqueeze(-1))
+        self.dist_last_expected_torque_impulse_vec[fire] = (
+            torque_world * applied_duration.unsqueeze(-1))
+        self.dist_last_direction_local[fire] = quat_rotate_inverse(
+            self.base_quat[fire], direction_world)
+        self.dist_last_contact_offset_local[fire] = 0.0
+        self.dist_last_scenario_id[fire] = 0
+        self.dist_last_height_tier[fire] = -1
+        self.dist_event_submitted_impulse_vec[fire] = 0.0
+        self.dist_event_submitted_torque_impulse_vec[fire] = 0.0
 
     def _push_robots(self):
         d = self.cfg["randomization"].get("disturbance") or {}

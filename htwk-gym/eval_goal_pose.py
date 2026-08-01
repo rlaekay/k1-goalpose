@@ -41,6 +41,7 @@ import glob
 import time
 import random
 import argparse
+import math
 
 import isaacgym  # noqa: F401  (must be imported before torch)
 from envs import *  # noqa: F401,F403  (registers task classes)
@@ -522,9 +523,80 @@ def _apply_hbatch_common_eval(cfg, task):
     randomization["disturbance"] = copy.deepcopy(disturbance)
 
 
+def _validate_joint_dr_probe_value(name, value):
+    """Return a finite non-negative probe magnitude, preserving ``None``.
+
+    ``prepare_cfg`` is also imported by checkpoint-selection tools, so input
+    validation cannot live only in argparse.  In particular, NaN would make a
+    nominally reproducible protocol impossible to fingerprint and negative
+    magnitudes would silently invert the configured range.
+    """
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("{} must be a finite number >= 0".format(name))
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError("{} must be a finite number >= 0".format(name))
+    return value
+
+
+def _nonnegative_finite_float(text):
+    """argparse adapter for held-out joint-DR probe magnitudes."""
+    try:
+        return _validate_joint_dr_probe_value("joint DR probe", text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc))
+
+
+def _apply_joint_dr_probe(cfg, joint_encoder_bias_rad=None,
+                          joint_target_offset_rad=None,
+                          init_dof_std_rad=None):
+    """Apply explicit joint-DR severities after any common-eval override.
+
+    Encoder/target magnitudes denote symmetric uniform half-widths.  Initial
+    joint position denotes Gaussian standard deviation, matching the existing
+    randomization schema.  ``None`` means leave that config entry untouched;
+    explicit zero is therefore a useful nominal/ablation probe.
+    """
+    values = {
+        "joint_encoder_bias_rad": _validate_joint_dr_probe_value(
+            "joint_encoder_bias_rad", joint_encoder_bias_rad),
+        "joint_target_offset_rad": _validate_joint_dr_probe_value(
+            "joint_target_offset_rad", joint_target_offset_rad),
+        "init_dof_std_rad": _validate_joint_dr_probe_value(
+            "init_dof_std_rad", init_dof_std_rad),
+    }
+    randomization = cfg.setdefault("randomization", {})
+    uniform_keys = (
+        ("joint_encoder_bias_rad", "joint_encoder_bias"),
+        ("joint_target_offset_rad", "joint_target_offset"),
+    )
+    for probe_key, config_key in uniform_keys:
+        magnitude = values[probe_key]
+        if magnitude is not None:
+            randomization[config_key] = {
+                "range": [-magnitude, magnitude],
+                "operation": "additive",
+                "distribution": "uniform",
+            }
+    if values["init_dof_std_rad"] is not None:
+        randomization["init_dof_pos"] = {
+            "range": [0.0, values["init_dof_std_rad"]],
+            "operation": "additive",
+            "distribution": "gaussian",
+        }
+    values["active"] = any(value is not None for value in values.values())
+    cfg.setdefault("evaluation", {})["joint_dr_probe"] = copy.deepcopy(values)
+    return values
+
+
 def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
                 record_video=False, keep_perturbations=False, no_noise=False,
-                stress=None, goal_pattern=None, force_visualization_probe=False):
+                stress=None, goal_pattern=None, force_visualization_probe=False,
+                joint_encoder_bias_rad=None, joint_target_offset_rad=None,
+                init_dof_std_rad=None):
     """Apply the standard evaluation conditions to a task config, in place."""
     cfg["basic"]["task"] = task
     cfg["basic"]["headless"] = True
@@ -536,6 +608,10 @@ def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
     cfg["viewer"]["record_video"] = bool(record_video)
     cfg["viewer"]["record_env_idx"] = 0
     _apply_hbatch_common_eval(cfg, task)
+    joint_dr_probe = _apply_joint_dr_probe(
+        cfg, joint_encoder_bias_rad=joint_encoder_bias_rad,
+        joint_target_offset_rad=joint_target_offset_rad,
+        init_dof_std_rad=init_dof_std_rad)
     if not keep_perturbations:
         cfg["randomization"]["kick_interval_s"] = 1.0e9
         cfg["randomization"]["push_interval_s"] = 1.0e9
@@ -616,6 +692,7 @@ def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
         "goal_pattern": goal_pattern,
         "record_video": bool(record_video),
         "force_visualization_probe": bool(force_visualization_probe),
+        "joint_dr_probe": copy.deepcopy(joint_dr_probe),
     }
     evaluation = cfg.setdefault("evaluation", {})
     evaluation["effective_eval_protocol_sha"] = _stable_protocol_sha(
@@ -1801,6 +1878,8 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
             "effective_eval_protocol_sha"),
         "effective_disturbance_protocol": copy.deepcopy(
             eval_cfg.get("effective_disturbance_protocol") or {}),
+        "joint_dr_probe": copy.deepcopy(
+            eval_cfg.get("joint_dr_probe") or {}),
         "hbatch_gates": dict(eval_cfg.get("hbatch_gates", {}) or {}),
         "env_code_sha": env_code_sha(),
         "evaluation_protocol_sha": evaluation_protocol_sha(),
@@ -2635,6 +2714,11 @@ def render_report(r):
     if r.get("effective_eval_protocol_sha"):
         md.append("- effective eval protocol: `{}`".format(
             r["effective_eval_protocol_sha"]))
+    if r.get("joint_dr_probe", {}).get("active"):
+        md.append("- joint-DR probe (rad): encoder ±{}, target ±{}, init σ{}".format(
+            r["joint_dr_probe"].get("joint_encoder_bias_rad"),
+            r["joint_dr_probe"].get("joint_target_offset_rad"),
+            r["joint_dr_probe"].get("init_dof_std_rad")))
     md.append("- 조건: {} envs × {:.0f}s, {} 정책, 외란 {}, 관측노이즈 {}, seed {}".format(
         r["num_envs"], r["duration_s"],
         "결정론적" if r["deterministic"] else "확률적",
@@ -3140,6 +3224,8 @@ def summarize_stress(roll, cfg, num_envs, duration_s, dt, checkpoint, config_pat
         "effective_disturbance_protocol": copy.deepcopy(
             cfg.get("evaluation", {}).get(
                 "effective_disturbance_protocol") or {}),
+        "joint_dr_probe": copy.deepcopy(
+            cfg.get("evaluation", {}).get("joint_dr_probe") or {}),
         "num_envs": num_envs, "duration_s": duration_s, "seed": seed,
         "perturbations": bool(perturbations),
         "env_minutes": env_min,
@@ -3161,6 +3247,11 @@ def summarize_stress(roll, cfg, num_envs, duration_s, dt, checkpoint, config_pat
     if results.get("effective_eval_protocol_sha"):
         md.append("- effective eval protocol: `{}`".format(
             results["effective_eval_protocol_sha"]))
+    if results.get("joint_dr_probe", {}).get("active"):
+        md.append("- joint-DR probe (rad): encoder ±{}, target ±{}, init σ{}".format(
+            results["joint_dr_probe"].get("joint_encoder_bias_rad"),
+            results["joint_dr_probe"].get("joint_target_offset_rad"),
+            results["joint_dr_probe"].get("init_dof_std_rad")))
     md.append("- 조건: {} envs × {:.0f}s, 목표를 매 제어스텝(50 Hz) ±3 m 균일 재추첨, 외란 {}".format(
         num_envs, duration_s, "ON" if perturbations else "OFF"))
     md.append("- 누적 관측 시간: {:.0f} env·분".format(env_min))
@@ -3323,6 +3414,27 @@ def _artifact_sha256(path):
     return digest.hexdigest()
 
 
+def _file_provenance(path):
+    """Best-effort immutable identity for an evaluation input file."""
+    if not path:
+        return {"path": path, "sha256": None}
+    resolved = os.path.abspath(os.path.expanduser(os.fspath(path)))
+    try:
+        digest = _artifact_sha256(resolved) if os.path.isfile(resolved) else None
+    except OSError:
+        digest = None
+    return {"path": resolved, "sha256": digest}
+
+
+def _attach_input_provenance(results, checkpoint, source_config):
+    """Add optional fields without changing or removing the legacy schema."""
+    results["input_provenance"] = {
+        "checkpoint": _file_provenance(checkpoint),
+        "source_config": _file_provenance(source_config),
+    }
+    return results
+
+
 def write_eval_completion_marker(out_dir, completion_token=None, include_video=False):
     """Atomically attest that every generated artifact was closed completely.
 
@@ -3379,7 +3491,22 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--stochastic", action="store_true", help="sample actions instead of the deterministic mean")
     parser.add_argument("--keep_perturbations", action="store_true", help="keep random kicks/pushes on during eval")
-    parser.add_argument("--no_noise", action="store_true", help="disable observation noise")
+    parser.add_argument(
+        "--no_noise", action="store_true",
+        help="disable observation noise only; joint encoder/target/init DR, "
+             "including --joint_* probes, remains active")
+    parser.add_argument(
+        "--joint_encoder_bias_rad", type=_nonnegative_finite_float,
+        help="held-out encoder-bias half-width in rad: uniform [-v,+v], "
+             "applied after the HBatch common eval override; >=0")
+    parser.add_argument(
+        "--joint_target_offset_rad", type=_nonnegative_finite_float,
+        help="held-out motor-target offset half-width in rad: uniform [-v,+v], "
+             "applied after the HBatch common eval override; >=0")
+    parser.add_argument(
+        "--init_dof_std_rad", type=_nonnegative_finite_float,
+        help="held-out initial joint-position Gaussian stddev in rad, applied "
+             "after the HBatch common eval override; >=0")
     parser.add_argument("--record_video", action="store_true", help="also record an mp4 of env 0 (first --record_video_s seconds)")
     parser.add_argument("--record_video_s", type=float, default=8.0)
     parser.add_argument(
@@ -3417,7 +3544,10 @@ def main():
     prepare_cfg(cfg, args.task, num_envs, args.sim_device, args.rl_device,
                 record_video=args.record_video, keep_perturbations=args.keep_perturbations,
                 no_noise=args.no_noise, stress=args.stress, goal_pattern=args.goal_pattern,
-                force_visualization_probe=args.force_visualization_probe)
+                force_visualization_probe=args.force_visualization_probe,
+                joint_encoder_bias_rad=args.joint_encoder_bias_rad,
+                joint_target_offset_rad=args.joint_target_offset_rad,
+                init_dof_std_rad=args.init_dof_std_rad)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -3464,6 +3594,7 @@ def main():
             args.task, args.stress, args.keep_perturbations, setup_wall_s, args.seed,
             task_state_protocol=getattr(
                 env, "eval_task_state_protocol", "config_fixed"))
+        _attach_input_provenance(results, checkpoint, config_path)
         out_dir = args.out
         if not out_dir:
             run_dir = os.path.dirname(os.path.dirname(os.path.abspath(checkpoint)))
@@ -3492,6 +3623,7 @@ def main():
         setup_wall_s=setup_wall_s, seed=args.seed,
         task_state_protocol=getattr(
             env, "eval_task_state_protocol", "config_fixed"))
+    _attach_input_provenance(results, checkpoint, config_path)
     report_md = render_report(results)
 
     out_dir = args.out
