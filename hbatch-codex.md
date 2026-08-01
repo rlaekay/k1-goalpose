@@ -4,7 +4,7 @@
 
 ## Codex 서버 작업 경계
 
-- 서버에서는 사용자 소유 경로 `/mnt/DATA/workspace/ws_eungkyu/k1-goalpose` 안만 조회한다. 다른 사용자의 workspace는 열람하지 않는다.
+- 서버에서는 사용자 소유 경로 `<SERVER_WS>/k1-goalpose` 안만 조회한다. 다른 사용자의 workspace는 열람하지 않는다.
 - 진단 단계의 서버 작업은 검색·읽기 전용이다. 코드와 문서 수정, 검증, commit/push는 로컬 저장소에서 수행한다.
 - 로컬 수정이 모두 끝난 뒤에만 서버의 사용자 저장소를 동기화하고 최종 smoke/train harness를 실행한다.
 - 서버 비밀번호 같은 인증정보는 문서, 로그, commit 또는 영구 메모리에 저장하지 않는다.
@@ -268,7 +268,7 @@ bash tools/run_hbatch_suite.sh
 이전 launcher가 바꾼 네 YAML 때문에 `git pull`이 막힌 서버는 먼저 그 네 파일만 보존적으로 stash한다. 이 stash는 옛 generator 부산물이므로 새 config 위에 pop하지 않는다.
 
 ```bash
-cd /mnt/DATA/workspace/ws_eungkyu/k1-goalpose
+cd <SERVER_WS>/k1-goalpose
 git stash push -m "server-hbatch-yaml-before-codex-fix" -- \
   htwk-gym/sweeps/hbatch/H0-codex.yaml \
   htwk-gym/sweeps/hbatch/H1-codex.yaml \
@@ -297,6 +297,202 @@ bash tools/run_hbatch_suite.sh
 
 H0가 G1 speed/accuracy를 보존하지 못하면 H1–H3의 해석 전에 dose를 더 낮춘다. H1이 speed를 해치면 mirror coefficient를 0.5→0.25로 낮춘다. H2가 가속을 10% 이상 늦추면 global pitch를 만지지 않고 steady gate/scale만 낮춘다. H3는 H0 대비 fall 감소가 없을 때 두 arm 모두 0 fall이 아니라면 폐기한다. 둘 다 0 fall이면 heel-target share가 strict 개선되고 impact가 비열세인 경우에만 gait 가설을 지지한다.
 
+## 2026-08-01 HBatch 완료 결과와 변경사항별 판정
+
+### 데이터 반입·무결성·비교 가능성
+
+서버에서는 사용자의 프로젝트 경로 안에서 결과 이름만 확인하고, `shared_eval_videos/hbatch` 전체를 로컬 `hbatch-results-codex/`로 복사한 뒤 내용을 읽었다. 복사본에는 H0–H3 완료 suite 4개, Markdown 33개, JSON 61개, CSV 20개, MP4 4개가 있다. 28개 `eval-complete-codex.json`이 지시한 80개 artifact의 byte 수와 SHA-256을 다시 계산한 결과 mismatch는 0개였다. 네 top-level `COMPLETE`도 모두 존재한다.
+
+평가 protocol 자체도 cross-arm 비교 조건을 지켰다. 모든 arm은 protocol `2026-07-30-codex-v3`, seed 0, env/eval code SHA `3d34d274ef2d644ae763e90405dd80ba07f28949`를 쓰며, clean/force/jitter/combined/lateral/reverse/video-force 각각의 effective protocol SHA가 arm 사이에서 같다. 따라서 아래의 문제는 서로 다른 시험지를 비교해서 생긴 것이 아니다.
+
+하지만 **최종 policy 비교에는 결정적인 한계가 있다. H0·H1·H2·H3 selector가 모두 iteration 0인 `model_0.pth`를 골랐다.** launcher는 같은 G1@10700 warm-start를 각 run의 `model_0.pth`로 복사하므로, 최종 full suite는 네 개의 H intervention policy가 아니라 같은 학습 전 G1 weight를 네 번 평가한 것이다.
+
+| arm | 최종 선택 | 학습된 H 변경이 최종 policy에 들어갔나 | full-suite 용도 |
+|---|---|---|---|
+| H0 | `model_0.pth` | 아니오 | H 공통 시험에서 warm-start 절대성능 측정 |
+| H1 | `model_0.pth` | 아니오 | mirror/강화 joint DR 효과 판정 불가 |
+| H2 | `model_0.pth` | 아니오 | high-speed stability/강화 force/flicker 효과 판정 불가 |
+| H3 | `model_0.pth` | 아니오 | heel touchdown reward 효과 판정 불가 |
+
+이 해석은 단순히 checkpoint 이름만 본 추측이 아니다.
+
+- `hbatch-comparison-codex.json`의 H0–H3 `metrics` 객체가 field-by-field 완전히 같다.
+- clean, force, lateral, reverse, video-force의 `segments.csv`는 각 mode 안에서 네 arm의 SHA-256이 같다.
+- 네 MP4도 모두 1,618,931 bytes이고 SHA-256 `d5a3a3d442e0072e50186857b0e146cef2f3e29986fdcce44f3ce1ea8a6730a7`로 byte-identical이다.
+- jitter/combined를 포함한 report의 측정값도 같다. 다른 것은 checkpoint/config 경로, 생성 시각, wall-clock metadata뿐이다.
+
+따라서 comparison의 H1/H2/H3 `nonworse` PASS는 개선 증거가 아니라 동일 policy의 equality다. 올바른 결론은 두 층으로 나뉜다.
+
+1. **채택 결과는 유효하다:** selector가 arm당 평가한 32개 후보 중 31개 nonzero 학습 checkpoint가 warm-start보다 종합적으로 나빠서 배포 후보를 만들지 못했다. selector가 `model_0`을 보호한 것은 정상 동작이다. run마다 생성된 121개 전체를 정밀평가한 것은 아니므로, 평가되지 않은 checkpoint까지 모두 나쁘다고 확대 해석하지 않는다.
+2. **처치 효과의 정밀 full-suite 비교는 성립하지 않는다:** 동일 policy 결과에서 H1/H2/H3 modification의 효과가 0%였다고 주장하면 안 된다. 학습된 처치 policy가 full suite에 한 번도 노출되지 않았다.
+
+현재 비교기의 총 verdict는 H0/H1/H2/H3 모두 **FAIL**이다. `model_0`이 네 arm 중 현재 best로 남았다는 것과 H gate를 통과했다는 것은 전혀 다른 말이다.
+
+### 선택된 공통 warm-start의 절대 성능
+
+아래 값은 네 arm에서 동일하다. H 수정의 효과가 아니라, 공통 held-out H 시험에서 G1 warm-start가 보인 baseline이다.
+
+| 축 | 측정값 | 사전 기준 | 판정·댓글 |
+|---|---:|---:|---|
+| waypoint 위치 median | 6.899 cm | ≤5.52 cm | 25.0% 초과, FAIL |
+| waypoint 위치 p90 | 11.761 cm | ≤7.42 cm | 58.5% 초과, FAIL |
+| waypoint heading median | 3.593° | ≤2.54° | 41.5% 초과, FAIL |
+| never-arrived | 12.713% | ≤1.5% | 8.48배, anti-collapse FAIL |
+| 전체 fall | 24.473/1000 | ≤5/1000 | 4.89배, FAIL |
+| waypoint fall | 3.927/1000 | ≤2/1000 | 1.96배, FAIL |
+| path fall | 62.690/1000 | ≤5/1000 | 12.54배, 가장 큰 안전 실패 |
+| path speed median | 0.8748 m/s | ≥0.95 m/s | 7.92% 부족 |
+| 1 m/s 도달률 | 69.28% | ≥80% | 10.72%p 부족 |
+| 1 m/s 도달 p90 | 3.398 s | ≤3.0 s | 13.27% 느림 |
+| cruise pitch/roll/ωxy p90 | 7.5°/5.5°/1.30 rad/s | ≤20°/15°/3 | 값 자체는 PASS |
+| cruise coverage | 2.756% | ≥5% | 기준의 55.1%뿐, 고속 안정성 인증 불가 |
+| force 5 s survival | 97.193%, n=1,318 | ≥98% | 0.807%p 부족 |
+| force 90% speed recovery | 97.436%, p90 0.10 s, n=234 | ≥90%, ≤2 s | 회복은 PASS |
+| high-speed force recovery | 97.927%, p90 0.00 s, n=193 | H1/H2 상대 기준 | baseline 참고값 |
+| jitter fall | 0.4219/env·min | ≤0.5 | PASS |
+| combined fall | 0.4844/env·min | ≤0.5 | PASS이나 한계의 96.9%로 여유가 작음 |
+| jitter/combined angular p90 | 3.2/3.2 rad/s | ≤3.0 | 둘 다 6.67% 초과, FAIL |
+
+clean은 256 env×120 s에서 완료 4,584 segment와 fall 115회를 기록했다. 전체 시도 기준 4,699개 중 waypoint fall은 12회, path fall은 103회다. 즉 위치 오차만 약간 다듬으면 되는 상태가 아니라 **낙상의 89.6%가 path에서 난다.** path 명령속도 median 1.03 m/s에 실제 median 0.875 m/s이고 tracking ratio median은 0.88이다. speed bin이 높아질수록 ratio가 떨어져 현재 지속 가능한 ceiling은 대략 1.2–1.4 m/s 부근으로 보인다.
+
+외력 1,654 events에서는 살아남은 event의 90% 속도회복이 빠르지만, 5 s survival은 전체 97.19%, 고속 subset 94.57%다. 따라서 “로봇 간 충돌 외력에도 이미 충분히 괜찮았다”고 결론 내릴 수 없다. 특히 **회복시간 통계는 살아남고 recovery eligibility가 생긴 사건에 조건부**이므로, 빠른 p90 0.10 s가 survival 실패를 상쇄하지 않는다. collision 5 s survival은 97.26%, support는 97.16%로 두 class 모두 98% gate 아래다.
+
+goal jitter 단독은 fall budget을 통과하지만 angular p90이 3.2 rad/s라 흔들림 gate를 실패한다. force를 같이 넣으면 fall이 0.4219→0.4844/env·min으로 14.8% 증가하고 5 s survival은 95.27%가 된다. combined의 high-speed force record는 2개뿐이고 recovery eligible은 0개라, combined report로 고속 회복을 말하면 안 된다.
+
+급격한 방향전환은 “방향을 잡는 것”과 “높은 속도로 계속 가는 것”이 분리된다.
+
+- lateral 0.5 m/s: 99.87% 도달, p90 0.98 s; 0.8 m/s 58.2%, 1.0 m/s 9.57%.
+- reverse 0.5 m/s: 100% 도달, p90 0.62 s; 0.8 m/s 73.5%, 1.0 m/s 23.41%.
+
+따라서 옆/뒤 goal에서 속도가 급감한다는 관찰은 수치로도 맞다. 새 goal 방향으로의 0.5 m/s 응답은 빠르지만, 대부분이 0.8–1.0 m/s로 이어지지 않는다.
+
+### H0 — 공통 low-dose robustness bundle
+
+**의도:** G1의 속도/정확도를 보존하면서 작은 외란, goal jitter/flicker, encoder/target offset, 정확한 팔 asset을 추가한다.
+
+**결과 댓글:** H0는 강건성 방향의 신호는 만들었지만, 그 대가로 목표 수행을 포기하는 policy를 학습했다. 아래 clean 값은 20 s×32 후보 stage, combined 값은 같은 길이의 후속 paired robust screen에서 가져온 iteration 0→400 변화다.
+
+| 지표 | model 0 | model 400 | 변화 |
+|---|---:|---:|---:|
+| 위치 median | 7.25 cm | 17.16 cm | +136.5% 악화 |
+| 위치 p90 | 11.57 cm | 24.48 cm | +111.6% 악화 |
+| strict success | 17.42% | 7.76% | −55.5% |
+| never-arrived | 12.91% | 59.54% | +46.63%p |
+| raw fall | 29 | 3 | −89.7% |
+| path fall | 84.29/1000 | 11.41/1000 | −86.5% |
+| combined fall | 0.469/env·min | 0.328/env·min | −30.0% |
+| combined force 5 s survival | 94.16% | 97.74% | +3.59%p |
+| path speed | 0.911 m/s | 0.897 m/s | −1.5% |
+
+iteration 12000은 짧은 screen에서 fall 0이지만 위치 median/p90이 39.4/45.9 cm, never-arrived 59.9%, strict success 5.49%다. 이것은 “안전하게 목표를 수행”한 것이 아니라 **가만히 있거나 목표 약 0.4 m 전에서 멈춰 낙상 노출을 피하는 robustness–task-collapse**다. 최종 120 s에서도 model 0이 model 100보다 위치 6.67/11.20 cm vs 10.49/16.34 cm, strict success 26.49% vs 8.99%로 명확히 낫기 때문에 selector가 model 0을 고른 것은 타당하다.
+
+**판정:** H0 FAIL. H1–H3의 세부 레버보다 먼저 공통 H fine-tuning objective/distribution을 고쳐야 한다.
+
+### H1 — mirror augmentation/loss + 강화 joint-position DR
+
+**의도:** robot-local y축 대칭 augmentation와 mirror loss로 좌우 equivariance를 높이고, encoder ±0.025 rad/target ±0.020 rad/init-q σ0.075 rad로 calibration gap을 줄인다.
+
+**결과 댓글:** H1 full suite는 model 0이므로 H1 처치의 최종 효과를 측정하지 못했다. 그러나 selection screen의 모든 학습 checkpoint는 조합이 역방향으로 갔다는 강한 진단 근거를 준다.
+
+- warm-start mirror error p90은 0.080이다. 비zero checkpoint 31개의 범위는 0.135–0.165, 중앙값 0.150이고 기준 0.10 통과는 0/31이다. iteration 12000의 0.150은 초기보다 87.5% 크다.
+- touchdown L/R median bias는 warm-start 2.9 cm에서 학습 checkpoint 최소 6.5 cm, 중앙값 8.7 cm, iteration 12000 9.4 cm로 악화했다. 기준 2 cm 통과는 0/31이다.
+- H0/H1의 공통 비zero checkpoint 31개를 맞춰 비교하면 H1은 31/31에서 raw fall이 더 많고 strict success가 더 낮다. 31개 중 strict success가 정확히 0인 checkpoint도 20개다.
+
+| 공통 비zero checkpoint의 중앙값 | H0 | H1 | H1 변화 |
+|---|---:|---:|---:|
+| raw fall | 3 | 12 | 4배 |
+| strict success | 4.18% | 0% | 붕괴 |
+| path speed | 0.851 | 0.772 m/s | −9.2% |
+| path fall | 11.03 | 38.17/1000 | +246% |
+| 전체 fall | 4.04 | 16.22/1000 | +301% |
+| 1 m/s 도달률 | 82.69% | 73.47% | −9.22%p |
+| 1 m/s 도달 p90 | 3.20 | 3.40 s | +6.2% |
+
+120 s 후보 model 0→100에서도 위치 median 7.15→12.84 cm, p90 11.88→21.63 cm, strict success 23.56→8.06%, never-arrived 13.07→46.21%로 악화했다. fall은 96→89로 7.3%밖에 줄지 않았고 path fall은 51.78/1000으로 그대로다. combined screen도 fall 0.492→0.598/env·min, angular p90 3.20→3.46 rad/s, force survival 95.77→94.85%로 나빠졌다.
+
+**판정:** H1 FAIL. 현재 묶음은 speed/accuracy/fall뿐 아니라 직접 목표였던 mirror error와 touchdown 좌우 bias까지 악화했다. 다만 mirror와 강화 joint DR를 한 arm에 함께 넣었으므로 어느 요소가 원인인지 이 결과만으로 분리할 수 없다. 다음에는 `mirror-only`, `joint-DR-only`, `둘의 interaction`을 따로 둬야 한다. mirror coefficient를 바로 낮춰 재실행하기 전에 mirror map/gradient와 joint-offset sensitivity sweep을 각각 검증한다.
+
+### H2 — 가속 보존형 고속 안정화 + 강화 force/flicker bundle
+
+**의도:** 가속 중 lean은 허용하고 steady high-speed에서만 pitch/roll/ωxy를 줄이며, 더 잦은 고속 외란과 flicker로 회복을 학습한다. H2는 reward 하나가 아니라 stability+disturbance schedule+flicker의 bundle이다.
+
+**결과 댓글:** 선택된 H1/H2가 같은 model 0이므로 full suite의 차이는 전부 0이다. pitch 7.5°, roll 5.5°, ωxy 1.30 rad/s, 1 m/s p90 3.398 s, 고속 force recovery 97.927%/0 s는 H2의 성과가 아니라 공통 baseline이다. cruise coverage도 2.756%로 5% gate를 못 채웠다. comparison의 `nonworse`는 equality이고 `strictly improves`는 모두 FAIL이다.
+
+selection의 초기 paired combined screen에는 유망하지만 확정할 수 없는 신호가 있다.
+
+| checkpoint | H2 vs H1 combined fall | H2 vs H1 angular p90 | H2 vs H1 force survival |
+|---|---:|---:|---:|
+| iteration 100 | 0.398 vs 0.504, −20.9% | 3.36 vs 3.46, −2.9% | 96.95 vs 92.91%, +4.04%p |
+| iteration 200 | 0.410 vs 0.750, −45.3% | 3.52 vs 3.60, −2.2% | 96.60 vs 91.61%, +4.99%p |
+
+반면 clean은 iteration 100에서 H2 위치 median이 H1보다 7.0% 나쁘고, iteration 200에서는 8.2% 좋지만 raw fall이 44.4% 많아 일관되지 않는다. H2 iteration 12000도 model 0 대비 위치 median 7.25→39.58 cm(+445.7%), p90 11.57→45.61 cm(+294.3%), strict success 17.42→1.67%(−90.4%)로 공통 task collapse를 피하지 못했다. 같은 model 0의 짧은 robust screen도 arm/stage에 따라 survival이 약 2–3%p 흔들리므로 단일 seed·20 s 신호를 효과 확정으로 올리면 안 된다.
+
+**판정:** H2는 채택 FAIL, 개별 bundle 효과는 **미식별**이다. 초기 robustness 신호 때문에 영구 폐기할 근거도 없지만, common objective를 고치기 전에 12k 재학습할 근거도 없다. 이후 동일 nonzero iteration 100/200을 최소 3 seeds의 paired full suite에 강제로 올리고, signal이 재현될 때 stability-only/force-only/flicker-only/interaction을 분해한다.
+
+### H3 — forward heel touchdown gait-only ablation
+
+**의도:** H0에 first-contact heel placement reward 하나만 더해 고속 path fall을 줄이는지 본다.
+
+**선택 baseline의 gait 기술통계:** clean touchdown 20,520개로 표본 수는 충분하다. heel-ahead 26.657%, target±1σ 3.202%, overstride 0.0146%, heel x p10/median/p90 −15.8/−4.3/+3.6 cm, L/R bias 2.9 cm, precontact down-speed p90 1.98 m/s, contact-force p90 770 N이다. target share는 40% 기준의 8.0%뿐이고, 접지의 73.3%가 trunk 앞이 아니다. 하지만 H0/H3가 동일 model 0이므로 이것은 H3 결과가 아니라 시작점이다.
+
+**결과 댓글:** H3 reward가 들어간 checkpoint는 의도한 target share도 개선하지 못했다.
+
+- 20 s×32 checkpoint에서 target share 최고는 iteration 0의 2.508%다.
+- iteration 100/200/300/12000은 각각 1.734/1.159/0.816/0.990%다.
+- late checkpoint(≥3000) 중앙값은 0.949%이고, 어느 checkpoint도 iteration 0을 넘지 못했다.
+- 120 s model 0→100은 target 3.554→2.341%(−34.1%), 위치 median 6.765→9.975 cm(+47.5%), p90 11.464→15.672 cm(+36.7%)다. fall은 96→39(−59.4%), path speed는 0.830→0.865 m/s(+4.2%)지만 직접 gait 목표와 정확도를 잃었다.
+
+H0의 trained checkpoint에는 동일 raw touchdown metric이 모두 저장되지 않아 같은 iteration의 직접 H0/H3 gait 차이는 계산할 수 없다. 그럼에도 H3 내부에서 reward target이 일관되게 내려갔으므로 현재 구현/scale의 긍정적 증거는 없다.
+
+**판정:** H3 FAIL, 현재 heel reward는 보류한다. “기존 외란이 충분했으니 hardcoding이 불필요하다”는 주장도 force 5 s survival 97.19%, high-speed 94.57%, path fall 62.69/1000 때문에 성립하지 않는다. gait reward를 다시 만지기 전에 reward activation 횟수·평균 크기·전체 reward 대비 비중·접지 proxy의 정확성을 계측해야 한다.
+
+### 무엇은 실제로 성공했나
+
+정책 성능과 하네스/기구 검증을 분리하면 성공한 부분도 분명하다.
+
+- path controller는 426,921 step 중 steady 418,328 step을 확보했다. dwell-resume recovery를 제외한 `gap/lookahead<0.75`는 0%, leash 밖은 0.00234%, recovery share는 2.013%로 세 gate를 통과했다. 과거 lookahead-floor 실패는 controller 관점에서는 해결됐다.
+- fall context 분류는 완료됐고 survivor-bias 보정 분모가 쓰였다.
+- force는 5개 loadable body, collision/support class와 실제 event count를 남겼다. 외란은 한 군데에만 주지 않는다.
+- lateral/reverse는 새 goal 방향으로 투영한 속도로 측정되어 옛 방향 momentum을 성공으로 잘못 세지 않는다.
+- simulator-view 영상은 400 frames, force arrow 75, path carrot 400, trace 398을 report/manifest에 남겼다. 네 video가 동일한 것은 같은 model 0·seed·protocol의 추가 증거다.
+- 모든 artifact hash는 복사 뒤 다시 맞았다. 단 로컬 runtime에 MP4 decoder가 없어 400-frame decode는 독립 재실행하지 못했고, server completion attestation과 MP4 hash를 검증했다.
+
+### 공통 학습 붕괴의 가장 유력한 설명과 한계
+
+H0에도 동일한 붕괴가 있고 H3는 H0와 거의 같은 초기 trajectory를 보이므로 mirror/stability/heel 같은 arm-specific 레버가 공통 원인은 아니다. 네 arm에서 학습이 진행될수록 위치가 약 0.4 m로 모이고 fall은 줄어드는 패턴은 **공통 objective/distribution이 움직임 위험보다 목표 수행 포기를 더 유리하게 만든 local optimum**과 일치한다.
+
+코드상 특히 점검할 조합은 다음이다.
+
+- `goal_progress=0`: 먼 거리에서 닫히는 속도에 대한 직접 dense 보상이 없다.
+- `constellation_weight=0.2`: heading이 맞을 때 0.4 m 거리의 constellation 값은 `exp(-0.2×0.4²)=0.9685`로 목표점의 96.85%다. 즉 40 cm 앞에서 안전하게 멈춰도 dense goal reward 손실이 약 3.15%뿐이다.
+- `goal_reached=1.0`: 0.1 m 안에서 정지해야만 받는 sparse bonus다.
+- `only_positive_rewards=true`: motion cost가 큰 상태의 total reward가 0에 clip되면 과감히 접근하는 행동 사이의 차등 신호가 사라질 수 있다.
+- 35% moving path, all-active speed×curvature grid, mandatory goal noise/joint offsets/disturbance, fresh optimizer, 새 arm asset/path semantics가 네 arm의 공통 변경이다.
+
+이 조합은 데이터와 맞는 **원인 가설**이지 아직 단독 원인 증명은 아니다. 특히 학습 로그에 reward-term occupancy/크기와 gradient contribution이 없으므로 “오직 constellation 때문”이라고 단정하지 않는다. H0에서 robustness가 실제로 좋아진 만큼, 단순 코드 고장보다는 reward가 허용한 과도한 robustness–task trade-off가 더 유력하다.
+
+### 다음 실행의 객관적 순서
+
+1. **12k 재실행 금지:** 먼저 iteration 0/25/50/100/200만 저장한다. 100에서 waypoint median/p90, never-arrived, strict success, path speed/fall, combined survival을 model 0과 paired 비교하고 accuracy-preservation을 못 지키면 자동 중단한다.
+2. **공통 변경 ladder:** exact G1 → H arm asset만 → 새 path semantics만 → all-active grid → goal jitter → joint offsets → disturbance 순으로 하나씩 추가해 최초 붕괴 지점을 찾는다. 각 단계는 같은 checkpoint/seed/eval protocol을 쓴다.
+3. **reward 감사:** env-step별 constellation, goal-reached, survival, action-rate, orientation, collision 등 각 term의 mean/nonzero share와 clipped-to-zero share를 저장한다. 0.3–0.5 m에 정체된 env와 정상 도착 env를 분리한다. 이 증거 뒤에만 low-dose progress/sharper distance shaping 같은 reward arm을 정의한다.
+4. **selector 상태를 명시:** 모든 arm이 iteration 0을 선택하면 comparison을 숫자 equality로 PASS/FAIL하지 말고 `NO_TRAINED_ARM_SELECTED`; 개별 ablation은 `ABLATION_NOT_EVALUATED`로 표시한다. 배포 후보 보호는 유지하되 과학적 결론을 분리한다.
+5. **provenance 강화:** report에 policy checkpoint SHA-256, source warm-start SHA-256, effective training-config SHA를 넣고 모든 mode의 completion token을 non-null로 만든다. 현재 video 4개만 고유 token이 있고 non-video 24개는 token이 null이라 stale/misassociation 방어가 약하다.
+6. **H1 분해:** 1차는 200-iteration fine-tune으로 mirror-loss ablation과 joint-DR-only를 분리한다. 같은 방향의 survivor만 paired seeds로 재확인하고, 그 뒤 interaction을 추가한다. held-out joint-offset severity grid를 공통 eval에 둔다.
+7. **H2 분해:** iteration 100/200의 robustness 신호를 paired full suite로 재현한 뒤 stability-only, force schedule-only, flicker-only를 분리한다. cruise coverage≥5%가 아니면 고속 stability 결론을 내리지 않는다.
+8. **H3 보류:** 모든 arm에 같은 raw touchdown logger를 적용하고 H0/H3의 fixed nonzero iteration을 맞춘다. activation/magnitude 검증 전에는 heel reward를 키우지 않는다.
+
+최종 채택표:
+
+| arm | 배포 채택 | modification 효과 판정 | 다음 행동 |
+|---|---|---|---|
+| H0 | FAIL | robustness는 늘었으나 task collapse가 훨씬 큼 | 공통 objective/distribution 원인 격리 |
+| H1 | FAIL | 조합은 명백히 해로움; mirror와 DR 개별 원인은 미분리 | mirror-only/DR-only로 분해 |
+| H2 | FAIL | 짧은 robustness 신호는 있으나 full-suite 미식별 | common 수정 후 3-seed fixed-checkpoint 재시험 |
+| H3 | FAIL | 직접 touchdown target도 악화 | reward 보류, activation/proxy 감사 |
+
+결론은 **HBatch가 새 winner를 만들지 못했다**이다. 동시에 selector가 warm-start를 지켜 잘못된 학습 policy의 채택을 막았고, path/force/direction/video 평가 하네스는 원인 규명에 쓸 수 있는 수준의 자료를 남겼다. 다음 실험의 첫 질문은 “H1/H2/H3 중 누가 이겼나”가 아니라 “왜 H0부터 iteration 100 안에 정확도와 도달률을 버리는가”여야 한다.
+
 ## humanoid locomotion sim-to-real에서 가장 자주 부딪히는 문제
 
 우선순위는 다음과 같다.
@@ -305,9 +501,9 @@ H0가 G1 speed/accuracy를 보존하지 못하면 H1–H3의 해석 전에 dose�
 2. **지연과 clock jitter**: 50 Hz policy, sensor sampling, 20 Hz goal pipeline, inference/transport 지연이 고정값이 아니다. timing variation은 단순 DR만으로 충분하지 않을 수 있다. [Sandha et al., CoRL/PMLR 2021](https://proceedings.mlr.press/v155/sandha21a.html).
 3. **contact reality gap**: sole geometry, friction, compliance, floor unevenness, contact solver가 humanoid의 좁은 support polygon에서 큰 차이를 만든다. torso push만으로 link-level collision/contact를 대체할 수 없다.
 4. **mass/CoM/inertia와 URDF mismatch**: 팔 자세, 케이블, 카메라, 배터리, fastener가 CoM과 yaw inertia를 바꾼다. 이번 arm overlap은 단순 visual 문제가 아니라 dynamics 문제다.
-5. **encoder/IMU calibration**: joint zero, IMU mounting quaternion, bias/filter, observation order/normalization/default-q/action-unit 불일치가 policy 입력 전체를 어긋나게 한다.
+5. **encoder/IMU calibration**: joint zero, IMU mounting quaternion, bias/filter, observation order/normalization/default-q/action-unit 불일치가 policy 입력 전체를 어긋나게 한다. 현재 deploy 코드는 SDK의 index와 raw joint position을 그대로 쓰며 joint-name/order/zero 검증표가 없어 대비가 충분하지 않다. 실기에서는 무부하 기준자세에서 `/joint_states`의 name/position과 SDK serial index를 읽기 전용으로 수집하고, URDF zero/default-q와 signed offset table을 만들어 observation 직전에 적용해야 한다. 이 table의 SHA와 한-frame sim/real observation diff가 일치하기 전에는 motor command를 허용하지 않는다.
 6. **robustness–optimality trade-off**: 넓은 randomization은 정책을 보수적으로 만들 수 있다. 프로젝트 내부의 E2/G2가 같은 경고이고, 고전 실험도 randomization의 robustness와 peak performance trade-off를 보고한다. [Tan et al., RSS 2018 PDF](https://roboticsproceedings.org/rss14/p10.pdf).
-7. **외력 randomization의 한계와 효용**: random force와 episodic actuation offset은 transfer에 도움이 될 수 있지만 event 크기/위치/nominal 비중과 실제 평가가 필요하다. [Campanaro et al., L4DC/PMLR 2024](https://proceedings.mlr.press/v242/campanaro24a.html).
+7. **외력 randomization의 한계와 효용**: random force와 episodic actuation offset은 transfer에 도움이 될 수 있지만 event 크기/위치/nominal 비중과 실제 평가가 필요하다. [Campanaro et al., L4DC/PMLR 2024](https://proceedings.mlr.press/v242/campanaro24a.html). M1은 무조건 균일 body sampling을 쓰지 않고, `arm_proxy 0.60 + chest 0.30`으로 상체·팔에 90% 이상을 집중한다. 세기와 duration은 bounded uniform, 로봇 기준 수평방향과 tier 내 접촉 높이는 uniform으로 뽑아 특정 외란 하나를 외우지 못하게 한다.
 8. **reward/task/interface 반복설계**: sim-to-real은 one-shot이 아니며 state/action/reward 및 실제 interface를 반복 검증해야 한다. [Xie et al., Cassie CoRL/PMLR 2020](https://proceedings.mlr.press/v100/xie20a.html).
 9. **export parity와 safety**: PyTorch→TFLite/ONNX의 normalization/action clipping/order, saturation, thermal/current limit, E-stop, tether test가 동일해야 한다.
 10. **K1 공식 stack 차이**: Booster의 현재 training/deploy stack은 Isaac Lab/Isaac Sim, ONNX/TorchScript export, MuJoCo/real deployment 흐름을 제공한다. 현재 legacy Isaac Gym task와 asset/interface 차이를 diff해야 한다. [Booster Robotics `booster_train`](https://github.com/BoosterRobotics/booster_train).
@@ -324,13 +520,156 @@ H0가 G1 speed/accuracy를 보존하지 못하면 H1–H3의 해석 전에 dose�
 
 ## 최종 질문별 짧은 답
 
-- 고속 lean은 나쁜가? **가속 중 lean은 허용, steady cruise lean/ωxy만 줄인다.**
-- 기존 collision force는 충분히 컸나? **명목 설정은 컸지만 substep 적용 오류로 실제 impulse는 약 1/10이어서 충분했다고 볼 수 없다. H부터 전 substep 적용으로 수정했다.**
+- 고속 lean은 나쁜가? **가속 중 lean은 허용한다.** 이번 공통 원인 screen에서는 속도×가속 sigmoid reward와 그 curriculum을 모두 0으로 빼고, 다방향 force 학습 전후의 고속 생존·회복으로 먼저 검증한다.
+- 기존 collision force는 충분히 컸나? **아니다. 명목 설정과 실제 전달 impulse가 달랐으므로 기존 결과로 충분성을 주장할 수 없다.** 새 모델은 `omni_shove`, 뒤에서 미는 `rear_push`, 팔/그물 걸림 `arm_entanglement`만 두고 정면 전속력 collision class를 제거했다. eval은 설정 impulse와 physics substep에 실제 제출된 impulse의 median/p90/max 상대오차를 기록한다.
 - 그 force에도 괜찮았나? **외력 ON 평가가 없어 모른다.**
-- 외력은 한 군데였나? **기존은 Trunk 한 곳. H는 5개 body 중 하나로 분산한다.**
-- heel-ahead reward로 8번이 해결되나? **보장 못 하며 overstride 위험이 있어 H3로만 격리한다.**
-- joint position DR은 충분했나? **아니다. persistent encoder/motor offset이 빠져 있어 추가했다.**
-- 옆/뒤 goal에서 왜 느리고 같은 방향인데도 가끔 빠른가? **pose goal의 이동방향과 final heading이 분리되고 constellation이 둘을 묶어, 빠른 몸회전보다 느린 side/back-step이 보상상 합리적이기 때문이다. 반대로 path heading/combined `dtheta`가 진행방향과 맞거나 현재 yaw·momentum·gait phase가 이미 유리하면 빠르다. viewer의 world 방향과 robot-local goal 방향이 다른 것도 육안상 “같은 방향” 편차를 만든다.**
+- 외력은 한 군데였나? **기존은 Trunk 한 곳이었고 새 모델은 Trunk/양 hip/양 shank의 loadable body와 네 높이 tier를 쓴다.** 수평 8방향 count, tier/body count와 z-offset을 report에 남겨 편향을 검출한다.
+- heel-ahead reward로 8번이 해결되나? **탈락시켰다.** 모든 M-cell에서 scale 0이며 이후 production 후보에도 넣지 않는다.
+- joint position DR은 충분했나? **아니어서 진행한다.** M2는 persistent encoder `±0.015 rad`, motor target `±0.010 rad`만 M0에 추가하고, clean과 같은 held-out offset probe로 비용과 이득을 분리한다.
+- 옆/뒤 goal에서 왜 느리고 같은 방향인데도 가끔 빠른가? **현재 yaw·momentum·gait phase와 목표 발생 시점의 정렬 차이가 크고, 고정 cadence clock을 정책이 관측만 할 뿐 바꿀 수 없는 것이 편차를 키운다.** 단순 랜덤화는 phase coverage를 늘리지만 빠른 해로 수렴시킨다는 보장은 없다. 공통 M-cell 뒤에는 cadence를 policy action으로 늘리지 않고도 command speed/turn demand에 연속적으로 결합하는 phase-rate conditioning을 단독 ablation으로 시험한다. 이는 특정 방향 if문이 아니라 모든 명령에 같은 equivariant 관계를 적용하는 방법이다.
 - G1 압승인가? **G군 내부에서 정확도와 속도를 함께 유지한 usable arm으로는 yes. raw speed만 보면 G3/G4 일부 수치가 더 높지만 overspeed·정확도 붕괴·낙상 때문에 winner가 아니다. E0 대비 accuracy/falls는 열세이고 기존 path_lag/grid로 숙련까지 주장할 수 없다.**
-- E1/E0가 좋은가? **E0는 종합 accuracy 1위, E1은 구형 path 속도 1위지만 현재 deploy winner 근거는 없다.**
+- E1/E0가 좋은가? **E0의 자기-config waypoint 평가는 실제로 존재하고 core 수치는 유효하다:** model 6200, 4,633구간, position 2.72/5.01 cm, heading 2.52°, strict 89.29%, 낙상 2회다. 다만 provenance가 새 H protocol보다 약하고 path 표본이 0이므로 “모든 과제를 합친 종합 1위”가 아니라 **waypoint 정확도 1위**라고만 말한다. E1의 구형 path 수치는 현재 path 의미가 달라 deploy winner 근거가 아니다.
 - E2 robust는 왜 느려졌고 H에서 어떻게 막나? **요구속도는 같았는데 body p90이 44.8% 줄고 53.34%가 never-arrived한 저이득 collapse다. bundled no-ramp robustness와 action-rate/progress 구조가 가장 유력하며, H는 low-dose/ramp, early-checkpoint selection, 1.5% never-arrived·speed/acceleration gate와 공통 force-ON eval로 재발을 막는다.**
+- 팔: 모든 M-cell은 `K1_locomotion.urdf`의 고정 팔 각도를 이중검사해 복제한 `K1_locomotion_hbatch-codex.urdf`를 사용한다. 이 필수 dynamics 차이 때문에 M0는 byte-identical G1이 아니라 **minimum-allowed G1 continuation**으로 표기한다.
+- 학습: 구조/관측/액션을 바꾸지 않는 외란·offset·mirror-loss 평가는 짧은 fine-tune이 맞다. 200 iteration, checkpoint 0/25/50/100/200, fresh Adam `2e-6`(범위 `5e-7–2e-6`)으로 먼저 screen하고, 통과 레버만 paired seeds와 긴 학습으로 올린다. URDF DOF나 관측차원을 바꾸는 경우에는 이 결론을 재사용하지 않는다.
+
+## 2026-08-01 mirror augmentation/loss 코드 감사 및 최소 fine-tune 설계
+
+### 결론 댓글
+
+H1의 실패를 단순히 “mirror coefficient가 너무 컸다”로 결론 내리면 안 된다. 현재 **obs/action/privileged mirror map 자체에는 HBatch 설정에서 명백한 부호·순열 오류가 없지만, transition PPO augmentation의 importance-ratio 기준분포가 잘못되어 있다.** 또한 H1은 mirror 두 항과 강화 joint-position DR를 동시에 바꿔 처치 효과가 섞였고, augmentation을 켜는 순간 critic·KL controller까지 함께 달라진다. 따라서 기존 H1은 mirror의 유효성 시험이 아니라 `mirror loss + 통계적으로 편향된 mirror PPO + 강화 DR + 다른 KL 제어`의 bundle 시험이다.
+
+수치도 “좌우 대칭이 좋아졌지만 다른 성능을 희생했다”는 해석을 지지하지 않는다. warm-start의 mirror p90 `0.080`이 H1 비zero checkpoint 31개에서 `0.135–0.165`(중앙 `0.150`, 통과 `0/31`)로 오히려 커졌고, touchdown 좌우 bias도 `2.9 cm`에서 최소 `6.5`, 중앙 `8.7`, 마지막 `9.4 cm`로 악화했다. 같은 31개 checkpoint에서 H1은 H0보다 fall이 `31/31` 모두 많고 strict success가 `31/31` 모두 낮았다. 중앙값도 strict `4.18%→0%`, path speed `0.851→0.772 m/s`(−9.2%), path fall `11.03→38.17/1000`(+246%), 전체 fall `4.04→16.22/1000`(+301%)이다. 즉 현재 구현/조합에는 유효한 mirror 학습 신호가 관측되지 않았다.
+
+### mirror map 감사 댓글
+
+| 대상 | 현재 mapping | 감사 판정과 조건 |
+|---|---|---|
+| policy obs 54차원 | gravity-y, angular velocity x/z, goal-y, heading, body-roll target, feet-y target를 반전하고, L/R foot-yaw를 부호 반전하여 교환한다. gait cos/sin은 모두 반전하고, q/dq/last-action 세 12차원 block은 L/R 교환 뒤 Roll/Yaw만 부호를 바꾼다 (`goal_pose_v3.py:83–151`). | **현재 asset에서는 맞다.** obs 실제 layout은 `gravity 0:3 / ω 3:6 / command 6:16 / clock 16:18 / q 18:30 / dq 30:42 / action 42:54`와 일치한다 (`goal_pose.py:769–808`). cos/sin 동시 반전은 half-cycle 이동이고 L/R swing 중심이 0.25/0.75라 맞다 (`goal_pose.py:1043–1046`). |
+| action 12차원 | 이름의 `Left_↔Right_`; Pitch/Knee는 `+`, Roll/Yaw는 `−` (`goal_pose_v3.py:96–145`). | **현재 K1 URDF의 좌우 joint axis/기본 자세와 일치한다.** 다만 이름 문자열로 축을 추론하므로 asset이 바뀌면 joint axis·limit 기반 정적 검사를 반드시 다시 해야 한다. |
+| privileged obs 14차원 | raw COM-y latent `u→1-u`; body linear-vy와 force-y 반전; axial torque Tx/Tz 반전 (`goal_pose_hbatch.py:62–76`). | **현재 `base_com=U[-0.1,0.1]`에서 맞다.** `return_noise=True`가 실제 offset이 아니라 U[0,1] 원표본을 저장하기 때문이다 (`goal_pose.py:143–157`, `utils/utils.py:5–28`). Gaussian 또는 비대칭 범위로 바꾸면 `1-u`는 틀리므로 distribution/range를 static assert해야 한다. HBatch는 다섯 body 외력의 합을 robot frame으로 바꾼 뒤 critic 8:14에 넣으므로 vector 부호도 맞다 (`goal_pose_hbatch.py:263–273`). |
+
+joint encoder bias와 motor target offset은 privileged obs에 없다. 분포가 좌우대칭이면 기대값 수준의 MDP 대칭은 유지되지만, 각 rollout 표본의 숨은 offset을 실제로 mirror하지 않은 채 같은 advantage/return을 복사하는 것은 exact per-sample symmetry가 아니다. H1처럼 offset 범위를 키울수록 이 근사가 나빠질 수 있다. 이것은 map의 부호 오류는 아니지만 mirrored critic/PPO target의 추가 오차원이다.
+
+### loss·scale·gradient 감사 댓글
+
+1. **가장 큰 오류는 mirrored PPO denominator다.** rollout action은 `a~π_old(.|s)`이고 합성 표본은 `(Ms, Ma)`다. permutation/sign mirror의 Jacobian 절댓값은 1이므로 이 합성 action을 실제로 낸 behavior density는
+
+   `q(Ma|Ms) = π_old(a|s)`이다.
+
+   따라서 PPO denominator는 원 `old_logprob(s,a)` 또는 `M#π_old(.|s)`의 log-prob여야 한다. 현재 코드는 `π_old(.|Ms)`를 만들고 `log π_old(Ma|Ms)`를 denominator로 쓴다 (`runner_v3.py:183–195`, `295–298`). old policy가 이미 완전 대칭일 때만 두 값이 같다. update 시작 시 numerator와 이 잘못된 denominator가 같은 network라 ratio가 인위적으로 1이 되는 것은 on-policy 증명이 아니다. 5σ support filter (`runner_v3.py:197–210`)도 표본분포와 denominator 불일치를 고치지 못한다. 따라서 앞의 “원 sample old log-prob를 재사용하지 않는 것이 맞다”는 설명은 이번 감사로 **폐기**한다.
+2. **mirror actor scale은 평균이 아니라 추가 질량이다.** 총 loss는 ordinary actor `1.0`에 mirror actor `0.5`, symmetry MSE `0.5`를 별도로 더한다 (`runner_v3.py:306–319`, H1 YAML `45–46`). 즉 actor 쪽 score-gradient 질량만 nominal `1.5배`가 되고 consistency gradient까지 추가된다. 전체 gradient는 norm 1.0으로 한 번에 clip되므로 (`runner_v3.py:328–333`) mirror arm에서 clipping이 잦으면 value/ordinary PPO까지 함께 재조정된다. 항별 gradient norm·cosine·clip 빈도가 없어 실제 scale은 현재 로그로 감사할 수 없다.
+3. **valid sample 비율로 mirror loss를 낮추지 않는다.** valid subset 내부 평균을 그대로 `0.5`배 하므로 (`runner_v3.py:278–298`) valid share가 작아져도 선택된 tail-safe 표본의 전체 minibatch 가중치는 줄지 않는다. support threshold `0.1`은 학습을 멈추는 안전장치일 뿐 unbiased weighting이 아니다.
+4. **critic augmentation은 coefficient와 무관하게 항상 50:50이다.** augmentation coefficient가 양수이면 original/mirrored value MSE를 무조건 반씩 평균한다 (`runner_v3.py:257–265`). 그러므로 `mirror_augmentation_coef 0.5→0.25`로 낮춰도 critic symmetry 압력은 전혀 줄지 않는다. 같은 original return을 mirrored privileged state에 주는 근사와 hidden joint offsets가 함께 critic/advantage에 다시 피드백된다.
+5. **symmetry MSE는 mean만 묶는다.** `MSE(μ(Ms),Mμ(s))` 양쪽 branch 모두로 gradient가 흐르는 식 자체는 올바른 equivariance objective지만 (`runner_v3.py:314–319`), 항별 gradient 충돌을 측정하지 않았다. actor의 `logstd`는 action마다 하나씩 학습되는 12차원 parameter (`model.py:27–32`)인데 L/R pair equality가 강제되지 않는다. 현재 deterministic mirror-error가 좋아져도 stochastic policy 분포는 비대칭일 수 있으므로 pairwise `|logσ_L-logσ_R|`를 별도 지표로 둬야 한다.
+6. **augmentation이 KL schedule도 바꾼다.** H0/loss-only는 original KL만 보지만 augmentation arm은 optimizer step 뒤 original/mirror KL 중 큰 값으로 LR을 조절한다 (`runner_v3.py:343–380`). 그러므로 성능 차이는 data augmentation뿐 아니라 학습률 궤적 차이도 포함한다. original KL, mirror KL, LR을 모두 checkpoint마다 저장해야 한다.
+7. bound penalty와 entropy는 original-state distribution에만 계산된다 (`runner_v3.py:300–311`). 주원인으로 볼 근거는 없지만 mirror state의 action-bound/entropy가 관리되지 않는 작은 비대칭이다.
+
+### optimizer resume 감사 댓글
+
+최종 H1 재실행은 G1의 잘못된 Adam LR `1.7086e-4`를 이어받지 않았다. H1은 `load_optimizer_state: false`, configured LR `5e-6`, clamp `1e-6–1e-5`다 (H1 YAML `24`, `38`, `48–49`; `runner_v3.py:116–128`). loader도 model/env state만 읽고 fresh Adam을 유지한다 (`runner.py:190–216`). 따라서 과거의 34.17배 LR/첫 launch NaN은 **최종 H1 악화의 설명이 아니다.**
+
+반대로 짧은 실험을 중간 checkpoint에서 재개하면서 이 flag를 그대로 두면 매번 Adam moment를 버려 동일 run의 연속 학습이 아니게 된다. 아래 실험은 iteration 0부터 200까지 uninterrupted로 돌리고, 조기중단은 해당 run directory에 정확히 `STOP` 파일을 두어 checkpoint를 저장한 뒤 정상 종료한다 (`runner_v3.py:449–462`). 장애 후 같은 run을 진짜 resume할 때만 optimizer state를 복원하고 controller/param-group LR 일치를 확인한다.
+
+### H1에서 악화한 원인의 우선순위
+
+| 우선순위 | 가능한 원인 | 근거 | 현재 판정 |
+|---:|---|---|---|
+| 1 | mirrored PPO behavior-density mismatch | `π_old(a|s)` 표본에 `π_old(Ma|Ms)` denominator 사용 | **코드 수준 확정 오류**, augmentation 효과 판정 전에 수정 필요 |
+| 2 | mirror+DR 동시 변경 | H1은 mirror 0.5/0.5와 encoder ±0.025, target ±0.020, init-q σ0.075를 동시에 변경 (`make_hbatch_configs.py:202–211`) | **실험 설계상 확정 confound** |
+| 3 | 과도하고 불투명한 gradient scale | base actor +0.5 mirror actor +0.5 MSE, critic 50:50, global clip 1.0 | 유력; 항별 norm/cosine/clip 로그로 확인 필요 |
+| 4 | mirrored critic/advantage의 hidden-latent 근사 | stronger target/encoder offsets는 명시적으로 mirror되지 않음; 같은 return 재사용 | 가능한 interaction; DR 고정 factorial로 분리 |
+| 5 | logstd 대칭 누락 | mean equivariance만 직접 최적화 | deterministic p90과 stochastic 대칭의 괴리 가능 |
+| 6 | optimizer/LR 34배 resume bug | 최종 재실행은 fresh Adam `5e-6` | **최종 H1 원인에서 제외** |
+| 7 | obs/action/privileged sign/permutation 오류 | 현재 54/12/14 layout·URDF·vector 변환과 모두 일치 | **현재 asset/config에서는 제외**, config 변경 회귀검사만 유지 |
+
+### 2-GPU 최소 mirror-only fine-tune 실험
+
+**목적:** H0의 DR/objective를 한 글자도 바꾸지 않고 mirror mean loss와 transition augmentation의 주효과·상호작용만 분리한다. H1처럼 강화 joint DR를 섞지 않는다.
+
+| cell | symmetry coef | transition augmentation coef | 질문 |
+|---|---:|---:|---|
+| M00 | 0 | 0 | 동일 fine-tune 자체의 paired control |
+| M10 | 0.5 | 0 | mean-equivariance loss만 유효한가 |
+| M01 | 0 | 0.5 | corrected transition augmentation만 유효한가 |
+| M11 | 0.5 | 0.5 | 두 항이 보완/충돌하는가 |
+
+공통 조건은 같은 G1 checkpoint SHA, H0의 low-dose 외란/jitter와 mild joint DR, 4096 env, horizon 24, 5 mini-epochs, 4 minibatches, fresh Adam `5e-6`, checkpoint `0/25/50/100/200`이다. model 0은 네 cell·seed에서 byte-identical이어야 한다. train seed는 `42, 31415, 27182` 세 개를 cell 간 paired로 쓰고, 각 checkpoint는 고정 eval seed `0`의 같은 observation bank/trajectory protocol로 비교한다. iteration 50과 100 생존 cell은 held-out eval seed `1`도 추가한다. 두 GPU는 seed마다 wave A `GPU0=M00, GPU1=M10`, wave B `GPU0=M01, GPU1=M11`로 돌려 동시에 다른 seed를 섞지 않는다. 총 6 wave이며 12k 전체학습은 하지 않는다.
+
+다만 **현재 코드 그대로 M01/M11을 200까지 돌려 winner로 채택하면 안 된다.** 우선 현재 코드로 seed 42의 `0/25/50`까지만 4-cell 진단을 돌려 M10과 M01의 분리를 확인할 수는 있지만, M01/M11 결과는 위 denominator bug 재현 자료일 뿐 과학적인 augmentation 판정이 아니다. denominator와 weighting/diagnostic을 고친 뒤 세 seed 본 실험을 시작한다.
+
+평가는 on-policy 분포만 쓰면 cell마다 방문상태가 달라 mirror error를 유리하게 만들 수 있으므로 두 층으로 한다.
+
+- **고정 bank primary:** model 0/H0 rollout에서 미리 동결한 10만 obs에 대해 기존 정의의 mirror mean error median/p90/p99와 `|logσ_L-logσ_R|`의 6 joint-pair median/max를 계산한다.
+- **on-policy primary:** 각 cell의 clean 20 s와 combined(force+jitter) 20 s, 256 env에서 같은 mirror 지표를 다시 계산한다.
+- **task 보존:** waypoint position median/p90, strict success, never-arrived, path speed, 1 m/s 도달률·p90 time, 전체/path falls per 1000.
+- **stability/robustness:** touchdown L/R median bias, combined falls/env·min, body angular-velocity p90, force 5 s survival.
+- **학습 진단:** ordinary actor/mirror actor/symmetry/value loss; 각 항 단독 gradient norm과 pairwise cosine; total pre-clip norm·clip share; original/mirror KL와 LR; mirror valid share와 z p50/p90/max; `Δlogp=log π_old(Ma|Ms)-log π_old(a|s)` p50/p90/max; mirrored critic loss/explained variance; L/R logstd pair 값. `Δlogp`가 0이 아닌 정도가 바로 현재 denominator bias의 크기다.
+
+조기중단은 다음처럼 사전 고정한다.
+
+1. nonfinite, mirror valid share `<0.90`, checkpoint 누락/seed 불일치/model-0 hash 불일치는 즉시 중단한다.
+2. iteration 25/50에서 paired M00 및 model 0보다 fixed-bank mirror p90이 `20% 이상` 악화하면서 동시에 path falls `>1.5배`, path speed `<95%`, strict success `<70%`, never-arrived `+10%p` 중 하나라도 발생하면 해당 cell을 STOP한다.
+3. iteration 100에서 세 seed 집계 mirror p90이 M00보다 `≥10%` 개선되지 않으면 200으로 연장하지 않는다. 개선하더라도 position p90 `≤105%`, path speed `≥95%`, falls `≤105%`, touchdown bias 비열세를 모두 만족해야 한다.
+4. winner는 3 seed 중 최소 2개에서 같은 방향이고 paired bootstrap 95% CI가 mirror 개선 0을 넘지 않으며, 위 task/safety 비열세를 모두 만족한 cell이다. 이 survivor만 iteration 200에서 H 공통 full suite를 실행한다.
+
+**최종 판단:** fine-tuning 자체를 버릴 이유는 없다. 현재 결과는 12k가 필요하다는 뜻이 아니라 iteration 100 전 이미 잘못된 방향을 충분히 식별할 수 있었다는 뜻이다. 먼저 mirror augmentation estimator를 바로잡고, H0 조건의 200-iteration paired factorial로 학습 신호를 확인한 뒤 통과한 cell만 길게 학습하는 것이 시간과 인과성 모두에서 가장 안전하다.
+
+## 2026-08-01 하단 코멘트 실행안 — M-cell causal screen
+
+앞 절의 `M00/M10/M01/M11` mirror-only 4-cell 안은 **실행 전에 폐기·대체했다.** 이유는 두 가지다.
+
+1. 실제 서버의 G1 run config를 다시 대조하니 G1은 이미 `symmetry_coef=0.5`였다. 따라서 mirror 0→0.5를 “추가 효과”로 시험하면 실제 warm-start history와 맞지 않는다.
+2. H0 YAML은 G1과 asset뿐 아니라 `stand_posture -1`, stop angular threshold 0.3, path controller/goal noise/외란/optimizer가 달라 pure control이 아니다. H0를 기반으로 한 실험은 공통 붕괴를 다시 묶는다.
+
+새 screen은 recorder가 저장한 실제 G1 `config.yaml`의 SHA-256 `5eb9aa12a46759624babe1b9d7a3c1c52028b2c3c5f243e6512cc7fa47e3910c`를 입력에서 강제한다. hash가 다르면 GPU를 띄우지 않는다. G1의 command/path/reward/noise 의미를 보존하고, 필수 팔 asset·HBatch task class·fresh optimizer만 공통으로 바꾼다.
+
+| cell | M0 대비 유일한 처치 | 직접 묻는 질문 |
+|---|---|---|
+| `M0_control-codex` | 없음 | minimum-allowed G1 continuation 자체가 200 iteration 안에 무너지나 |
+| `M1_force-codex` | scenario-aware disturbance | 현실적 다방향 외란 노출이 clean 성능 비용 없이 5 s 생존/회복을 높이나 |
+| `M2_jointdr-codex` | encoder ±0.015, target ±0.010 rad | persistent joint calibration DR가 held-out offset에 실제 이득을 주나 |
+| `M3_mirror_off-codex` | G1 mirror loss 0.5→0 | 기존 mirror loss를 유지할 근거가 있나 |
+
+공통 optimizer는 saved G1 Adam을 복원하지 않는 fresh Adam이며 LR `2e-6`, adaptive bounds `5e-7–2e-6`, desired KL `0.003`이다. `runner.save_interval=25`, `runner.load_optimizer_state=false`를 올바른 schema 위치에 강제한다. model 0은 각 run에 같은 warm-start bytes를 복사하고 네 SHA가 다르면 eval을 거부한다.
+
+1차 diagnostic에서는 causal isolation을 위해 legacy global kick/push, external scenario, persistent joint offsets를 M0에서 모두 0으로 둔다. 이는 “이후 모든 **생산 후보**에는 외란과 jitter가 있어야 한다”는 원칙의 예외가 아니라, 레버 효과를 식별하기 위한 짧은 control이다. survivor를 합친 production candidate에는 low-dose scenario disturbance와 goal jitter/flicker를 반드시 다시 넣고 interaction을 확인한다.
+
+### 외란 구현·검증 변경
+
+- `scenario_aware.enabled`가 설정만 있고 scheduler fire path에서 호출되지 않던 연결 오류를 수정했다. event 생성 시 `_sample_scenario_events`가 실제 `pushing_forces/torques`를 채우고, Isaac Gym `ENV_SPACE` tensor API까지 이어진다.
+- event onset에서 robot-local 방향을 world로 한 번 회전한 뒤 contact 동안 고정한다. 로봇이 회전할 때 외력 방향이 같이 도는 비물리 현상을 막는다.
+- `omni_shove 0.50`, `rear_push 0.30`, `arm_entanglement 0.20`이며 정면 전속력 collision class는 없다. rear push는 robot `+x` 주변 ±22.5°, 나머지 두 class는 수평 전방향이다.
+- 높이 tier는 shank 0.05, hip 0.05, chest 0.30, arm proxy 0.60이다. scenario 조건까지 합치면 상체/팔 event의 기대비중은 95%다. fixed arm link가 Trunk에 collapse되므로 chest/arm 접촉은 Trunk COM force와 `r×F + twist`의 등가 wrench로 표현한다. 실제 두 로봇 contact dynamics라고 과장하지 않는다.
+- physics 500 Hz substep마다 실제 제출된 force/torque tensor를 적분하고 event analytic impulse와 비교한다. smoke는 max relative error `≤5e-4`를 요구한다.
+- eval report에는 scenario/tier/body count, robot-local 8 octant count, z contact offset, expected/submitted impulse 오차와 scenario별 5 s survival/회복을 남긴다. 이 값으로 “외란을 랜덤화했다”는 설정문이 실제 표본분포와 전달량으로 확인된다.
+
+### mirror와 joint DR 변경
+
+transition mirror PPO의 잘못된 denominator `log π_old(Ma|Ms)`를 source behavior density `log π_old(a|s)`로 수정했다. signed permutation의 Jacobian 절댓값이 1이기 때문이다. old mirrored policy는 tail-support 검사와 KL 진단에만 쓴다. 하지만 1차 M-cell은 이 수정과 별개로 augmentation coefficient를 전부 0으로 유지해 새 코드와 loss ablation을 섞지 않는다.
+
+joint DR는 세 층을 분리한다.
+
+- `init_dof_pos`: G1에도 있던 episode reset pose noise이며 전 cell 공통이다.
+- `joint_encoder_bias`: policy observation의 q에만 들어가는 episode-constant calibration error다.
+- `joint_target_offset`: PD motor target에만 들어가는 episode-constant actuator zero error다.
+
+M2는 뒤의 두 항만 추가한다. eval에서는 clean을 모두 0으로 만들고, 별도 joint mode에서 정확히 encoder ±0.015/target ±0.010 rad를 M0와 M2에 같은 seed로 준다. 따라서 “DR를 넣은 policy가 자기 training randomization에서만 좋아 보이는가”가 아니라 같은 held-out 오차에서 p90/never-arrived/path speed/fall이 실제 개선되는지를 본다.
+
+### 두 A6000 실행·평가 계획
+
+과거 동일 서버에서 카드당 2 process가 GPU 96–98%, VRAM 약 8 GB/49 GB였으므로 네 training cell을 한 wave로 둔다.
+
+- GPU 0: M0 + M2
+- GPU 1: M1 + M3
+
+각 cell은 4,096 env, horizon 24, 5 mini-epochs, 4 minibatches, 200 iteration이다. inference/mechanics smoke를 먼저 cell별로 통과시키고, 학습 시작 뒤 2 iteration의 post-update finite/gradient/LR health marker를 240초 안에 요구한다. 실패 cell만 별도 failure log로 보내고 통과 cell은 계속한다.
+
+평가는 “라운드로빈이라고 적고 실제로 순차 실행”하던 오류를 고쳐 GPU당 persistent worker queue 하나를 병렬 실행한다.
+
+- clean: 네 cell × iteration 0/50/100/200, observation/joint/external perturbation 모두 0.
+- force: M0/M1만 같은 held-out scenario force로 평가.
+- joint: M0/M2만 같은 held-out encoder/target offset으로 평가.
+- mirror: clean rollout의 `RMS(π(Ms)-Mπ(s))` p90을 M0/M3에서 비교.
+
+총 eval은 48회가 아니라 27회이고 model 0은 mode당 한 번만 평가한다. 1차 결과는 screening으로만 사용한다. clean task non-inferiority와 직접 목표(force survival, joint probe p90, mirror p90)를 동시에 만족한 레버만 train seeds `31415, 27182`를 추가한다. 그 뒤 survivor interaction과 mandatory low-dose 외란+jitter를 넣은 production candidate를 학습한다.

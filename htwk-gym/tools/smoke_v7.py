@@ -74,6 +74,10 @@ def main():
                     help="drive the env with this policy. With zero actions the robot "
                          "falls every second and the constant resets make the segment-rate "
                          "check meaningless. Pass '' to force zero actions.")
+    ap.add_argument(
+        "--disturbance_probe", action="store_true",
+        help="for a disturbance-enabled config, shorten only the smoke cadence "
+             "and force event_probability=1 so every scenario/tier is exercised")
     args = ap.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -84,6 +88,15 @@ def main():
     cfg["basic"]["rl_device"] = args.rl_device
     cfg["env"]["num_envs"] = args.num_envs
     cfg["viewer"]["record_video"] = False
+    disturbance_cfg = cfg.get("randomization", {}).get("disturbance") or {}
+    if args.disturbance_probe and disturbance_cfg.get("enabled", False):
+        disturbance_cfg.update({
+            # Stay above the longest 0.8 s entanglement event so the probe
+            # never replaces a live wrench while accelerating its cadence.
+            "interval_s": [1.0, 1.5],
+            "event_probability": 1.0,
+            "ramp_steps": 1,
+        })
 
     torch.manual_seed(0)
     np.random.seed(0)
@@ -351,6 +364,10 @@ def main():
     goal_heading_step_dwell = []
     push_f_seen, push_t_seen, push_active_steps = [], [], 0
     disturbance_bodies_seen, disturbance_kinds_seen = set(), set()
+    disturbance_scenarios_seen, disturbance_tiers_seen = set(), set()
+    disturbance_direction_octants_seen = set()
+    disturbance_scenario_events = 0
+    disturbance_upper_events = 0
     disturbance_max_active_bodies = 0
     disturbance_body_mismatch = 0
     disturbance_clear_transitions = 0
@@ -363,6 +380,8 @@ def main():
                        if hasattr(env, "path_dwell_left") else
                        torch.zeros(env.num_envs, dtype=torch.bool, device=env.device))
     prev_force_any = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    prev_event_serial = (env.dist_event_serial.clone()
+                         if hasattr(env, "dist_event_serial") else None)
 
     falls = 0
     dwell_seen = 0
@@ -384,6 +403,28 @@ def main():
         else:
             act = torch.zeros(env.num_envs, env.num_actions, device=env.device)
         obs, rew, done, infos = env.step(act)
+        if prev_event_serial is not None:
+            new_event = env.dist_event_serial != prev_event_serial
+            if bool(new_event.any()) and hasattr(env, "dist_last_scenario_id"):
+                ids = env.dist_last_scenario_id[new_event].long()
+                tiers = env.dist_last_height_tier[new_event].long()
+                disturbance_scenarios_seen.update(
+                    int(x) for x in ids.cpu().tolist() if int(x) > 0)
+                disturbance_tiers_seen.update(
+                    int(x) for x in tiers.cpu().tolist() if int(x) >= 0)
+                direction = env.dist_last_direction_local[new_event]
+                degrees = torch.rad2deg(torch.atan2(direction[:, 1], direction[:, 0]))
+                octants = torch.floor(((degrees + 22.5) % 360.0) / 45.0).long()
+                disturbance_direction_octants_seen.update(
+                    int(x) for x in octants.cpu().tolist())
+                disturbance_scenario_events += int(new_event.sum().item())
+                upper_ids = {
+                    i for i, name in enumerate(getattr(
+                        env, "dist_height_tier_names", ()))
+                    if name in ("chest", "arm_proxy")}
+                disturbance_upper_events += sum(
+                    int(x) in upper_ids for x in tiers.cpu().tolist())
+            prev_event_serial = env.dist_event_serial.clone()
         physical = infos.get("physical_failures")
         fell = (done & physical.to(done.device) if physical is not None
                 else done & ~infos["time_outs"].to(done.device))
@@ -508,10 +549,11 @@ def main():
         if bool(paired.any()):
             force_idx = torch.argmax(force_by_body, dim=-1)
             torque_idx = torch.argmax(torque_by_body, dim=-1)
+            torque_counts = torque_body_active.sum(dim=-1)
             mismatch = paired & (
                 (force_body_active.sum(dim=-1) != 1)
-                | (torque_body_active.sum(dim=-1) != 1)
-                | (force_idx != torque_idx))
+                | (torque_counts > 1)
+                | ((torque_counts == 1) & (force_idx != torque_idx)))
             if hasattr(env, "dist_active_body"):
                 mismatch |= paired & (force_idx != env.dist_active_body)
             disturbance_body_mismatch += int(mismatch.sum().item())
@@ -535,6 +577,8 @@ def main():
     disturbance_enabled = bool(
         (cfg["randomization"].get("disturbance") or {}).get("enabled", False))
     if hasattr(env, "dist_event_serial") and disturbance_enabled:
+        scenario_enabled = bool((cfg["randomization"]["disturbance"].get(
+            "scenario_aware") or {}).get("enabled", False))
         expected_apply_calls = args.steps * int(cfg["control"]["decimation"])
         check("disturbance wrench is submitted on every physics substep",
               int(getattr(env, "dist_wrench_apply_calls", -1)) == expected_apply_calls,
@@ -547,9 +591,11 @@ def main():
               "seen {} expected {}".format(
                   sorted(disturbance_bodies_seen),
                   sorted(int(x) for x in env.dist_body_indices.cpu().tolist())))
-        check("collision and support event classes both fire",
-              disturbance_kinds_seen == {1, 2},
-              "event kinds seen {}".format(sorted(disturbance_kinds_seen)))
+        expected_kinds = {2} if scenario_enabled else {1, 2}
+        check("configured disturbance event classes fire",
+              disturbance_kinds_seen == expected_kinds,
+              "event kinds seen {}, expected {}".format(
+                  sorted(disturbance_kinds_seen), sorted(expected_kinds)))
         check("at most one disturbance body is active per env",
               disturbance_max_active_bodies <= 1,
               "maximum active bodies in one env: {}".format(disturbance_max_active_bodies))
@@ -559,6 +605,45 @@ def main():
         check("expired disturbance wrench clears",
               disturbance_clear_transitions > 0,
               "{} active-to-clear transitions".format(disturbance_clear_transitions))
+        if scenario_enabled:
+            expected_scenarios = set(range(
+                1, len(getattr(env, "dist_scenario_names", ())) + 1))
+            expected_tiers = set(range(
+                len(getattr(env, "dist_height_tier_names", ()))))
+            check("every scenario-aware contact class is sampled",
+                  disturbance_scenarios_seen == expected_scenarios,
+                  "seen {} expected {}".format(
+                      sorted(disturbance_scenarios_seen),
+                      sorted(expected_scenarios)))
+            check("every configured height tier is sampled",
+                  disturbance_tiers_seen == expected_tiers,
+                  "seen {} expected {}".format(
+                      sorted(disturbance_tiers_seen), sorted(expected_tiers)))
+            check("omnidirectional force covers all robot-local octants",
+                  disturbance_direction_octants_seen == set(range(8)),
+                  "octants seen {}".format(
+                      sorted(disturbance_direction_octants_seen)))
+            upper_share = disturbance_upper_events / float(
+                max(disturbance_scenario_events, 1))
+            check("scenario force is concentrated on upper/arm tiers",
+                  upper_share >= 0.80,
+                  "{} / {} = {:.1%} upper events".format(
+                      disturbance_upper_events, disturbance_scenario_events,
+                      upper_share))
+            inactive = env.dist_steps_left == 0
+            expected_i = env.dist_last_expected_impulse[inactive]
+            submitted_i = env.dist_last_submitted_impulse[inactive]
+            delivered = (expected_i > 1.0e-6) & (submitted_i > 0.0)
+            if bool(delivered.any()):
+                rel = torch.abs(submitted_i[delivered] - expected_i[delivered]) \
+                    / expected_i[delivered]
+                delivery_max = float(rel.max().item())
+            else:
+                delivery_max = float("inf")
+            check("configured force impulse reaches physics substeps",
+                  bool(delivered.any()) and delivery_max <= 5.0e-4,
+                  "{} completed events, max relative error {:.6f}".format(
+                      int(delivered.sum().item()), delivery_max))
 
     # ---- path mode ---------------------------------------------------------
     if n_path > 0 and goal_step_move and gaps:
@@ -763,22 +848,33 @@ def main():
         if push_f_seen:
             fv = np.concatenate(push_f_seen)
             tv = np.concatenate(push_t_seen)
-            cmax = d["collision"]["force_n"][1]
-            smin = d["support"]["force_n"][0]
-            check("collision-class magnitudes present",
-                  fv.max() >= d["collision"]["force_n"][0] * 0.8,
-                  "max {:.1f} N (collision band {}-{} N)".format(
-                      fv.max(), *d["collision"]["force_n"]))
-            check("support-class magnitudes present",
-                  fv.min() <= d["support"]["force_n"][1] * 1.5,
-                  "min {:.1f} N (support band {}-{} N)".format(
-                      fv.min(), *d["support"]["force_n"]))
-            check("no force beyond the configured ceiling",
-                  fv.max() <= cmax * 1.5, "max {:.1f} N vs ceiling {:.1f}".format(fv.max(), cmax))
+            scenario_on = bool((d.get("scenario_aware") or {}).get(
+                "enabled", False))
+            if scenario_on:
+                specs = getattr(env, "_dist_scenario_specs", ())
+                force_min = min(float(x["force_n"][0]) for x in specs)
+                force_max = max(float(x["force_n"][1]) for x in specs)
+                check("scenario force magnitudes stay in their envelope",
+                      fv.min() >= force_min * 0.95
+                      and fv.max() <= force_max * 1.05,
+                      "observed {:.1f}-{:.1f} N, envelope {:.1f}-{:.1f} N".format(
+                          fv.min(), fv.max(), force_min, force_max))
+            else:
+                cmax = d["collision"]["force_n"][1]
+                check("collision-class magnitudes present",
+                      fv.max() >= d["collision"]["force_n"][0] * 0.8,
+                      "max {:.1f} N (collision band {}-{} N)".format(
+                          fv.max(), *d["collision"]["force_n"]))
+                check("support-class magnitudes present",
+                      fv.min() <= d["support"]["force_n"][1] * 1.5,
+                      "min {:.1f} N (support band {}-{} N)".format(
+                          fv.min(), *d["support"]["force_n"]))
+                check("no force beyond the configured ceiling",
+                      fv.max() <= cmax * 1.5,
+                      "max {:.1f} N vs ceiling {:.1f}".format(fv.max(), cmax))
             check("torque applied with force", tv.max() > 0.0, "max {:.2f} N*m".format(tv.max()))
             print("     force  p50 {:.1f}  p90 {:.1f}  max {:.1f} N".format(
                 np.percentile(fv, 50), np.percentile(fv, 90), fv.max()))
-            _ = smin
 
     # ---- reward wiring -----------------------------------------------------
     missing = [n for n, s in cfg["rewards"]["scales"].items()

@@ -1,32 +1,17 @@
-"""Evaluate and compare the M-cell factorial: 외란 / joint DR / mirror loss.
+#!/usr/bin/env python3
+"""Run and report the targeted two-GPU M-cell evaluation.
 
-Runs ONE paired protocol per (cell, checkpoint) instead of the seven-mode H
-suite, on both GPUs, and evaluates the shared `model_0` exactly once because it
-is byte-identical across cells by construction.
-
-    cells x checkpoints x modes = 4 x 3 x 2  + 2 (shared model_0)  = 26 runs
-    (the seven-mode suite over the same grid would be 140)
-
-WHAT IT ANSWERS
----------------
-Each cell is M0 plus exactly one lever, so the paired difference
-`cell(iter) - M0(iter)` IS that lever's effect, measured against a control that
-shares the seed, the warm start and the protocol. The H batch could not do this:
-H1 moved mirror loss, mirror augmentation, encoder bias, target offset and
-init-q sigma together.
-
-The primary readout is deliberately the DEGRADATION SLOPE, not the endpoint.
-Every H arm degraded monotonically from iteration 0 (7.3 -> ~10.5-13.2 cm by
-100), so "which cell is best at 200" is a weaker question than "which lever
-makes the slope worse, and by how much". A lever that is merely neutral on the
-slope is cheap and can be kept; one that steepens it is what broke the H batch.
-
-    python tools/compare_mcells.py                 # evaluate + report
-    python tools/compare_mcells.py --report_only   # re-render from cached json
+The two GPU workers are persistent queues, not a sequential loop with rotating
+device labels.  Clean evaluates every cell.  Force evaluates only M0/M1 and
+joint-offset evaluates only M0/M2; mirror error is already part of clean, so
+this answers the three causal questions with 27 rather than 48 evaluations.
 """
 
 import argparse
+import concurrent.futures
+import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -35,206 +20,345 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-
-CELLS = ["M0_control", "M1_force", "M2_jointdr", "M3_mirror"]
-ITERS = [0, 50, 100, 200]
-# clean isolates the task cost of each lever; combined (goal jitter + external
-# force) isolates whether the lever bought any robustness for that cost. E2 and
-# G2 both looked "safe" on clean because they had stopped moving, so neither
-# number means anything without the other.
-MODES = {
-    "clean": [],
-    "combined": ["--stress", "jitter", "--keep_perturbations"],
-}
+OUT_BASE = os.path.join(ROOT, "logs", "mcells", "compare")
+OUT = OUT_BASE
+EVAL_CONFIG = os.path.join("sweeps", "mcells", "M0_control-codex.yaml")
+ALL_CELLS = (
+    "M0_control-codex", "M1_force-codex", "M2_jointdr-codex",
+    "M3_mirror_off-codex")
+ITERS = (0, 50, 100, 200)
 DURATION_S = 40
 NUM_ENVS = 256
-OUT = os.path.join(ROOT, "logs", "mcells", "compare")
 
-# Every eval must be the same exam for every cell, or a treatment effect and a
-# harder test are indistinguishable. The cells' own training configs differ, so
-# the evaluation deliberately uses ONE config for all of them.
-EVAL_CONFIG = os.path.join("sweeps", "mcells", "M0_control.yaml")
+MODE = {
+    "clean": {
+        "cells": ALL_CELLS,
+        "args": ["--no_noise", "--joint_encoder_bias_rad", "0",
+                 "--joint_target_offset_rad", "0", "--init_dof_std_rad", "0"],
+    },
+    "force": {
+        "cells": ("M0_control-codex", "M1_force-codex"),
+        "args": ["--keep_perturbations", "--no_noise",
+                 "--joint_encoder_bias_rad", "0",
+                 "--joint_target_offset_rad", "0", "--init_dof_std_rad", "0"],
+    },
+    "joint": {
+        "cells": ("M0_control-codex", "M2_jointdr-codex"),
+        "args": ["--no_noise", "--joint_encoder_bias_rad", "0.015",
+                 "--joint_target_offset_rad", "0.010",
+                 "--init_dof_std_rad", "0"],
+    },
+}
 
 
-def ckpt_path(cell, it):
-    run = latest_run(cell)
-    return None if run is None else os.path.join(run, "nn", "model_{}.pth".format(it))
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
-def latest_run(cell):
-    base = os.path.join(ROOT, "logs", "K1", "K1", "Goal_Pose_HBatch")
-    if not os.path.isdir(base):
+def run_dir(state_dir, cell):
+    path = os.path.join(state_dir, "run-{}.txt".format(cell))
+    if not os.path.isfile(path):
         return None
-    hits = sorted(d for d in os.listdir(base) if cell in d)
-    return os.path.join(base, hits[-1]) if hits else None
+    with open(path, encoding="utf-8") as f:
+        value = f.readline().strip()
+    return value if os.path.isdir(value) else None
 
 
-def run_eval(cell, it, mode, gpu):
-    tag = "{}_{}_{}".format(cell, it, mode)
-    outdir = os.path.join(OUT, tag)
-    report = os.path.join(outdir, "report.json")
-    if os.path.exists(report):
-        return report
-    ck = ckpt_path(cell, it)
-    if ck is None or not os.path.exists(ck):
-        print("  MISSING {} -> {}".format(tag, ck))
+def checkpoint(state_dir, cell, iteration):
+    directory = run_dir(state_dir, cell)
+    if not directory:
         return None
+    return os.path.join(directory, "nn", "model_{}.pth".format(iteration))
+
+
+def tag(cell, iteration, mode):
+    return "{}_{}_{}-codex".format(cell, iteration, mode)
+
+
+def report_path(cell, iteration, mode):
+    return os.path.join(OUT, tag(cell, iteration, mode), "report.json")
+
+
+def run_eval(state_dir, cell, iteration, mode, gpu):
+    path = report_path(cell, iteration, mode)
+    if os.path.isfile(path):
+        return True, "cached {}".format(tag(cell, iteration, mode))
+    ckpt = checkpoint(state_dir, cell, iteration)
+    if not ckpt or not os.path.isfile(ckpt):
+        return False, "missing checkpoint {}".format(ckpt)
+    outdir = os.path.dirname(path)
     os.makedirs(outdir, exist_ok=True)
-    cmd = ["python", "-u", "eval_goal_pose.py",
-           "--task", "K1/Goal_Pose_HBatch",
-           "--config", EVAL_CONFIG,
-           "--checkpoint", ck,
-           "--num_envs", str(NUM_ENVS),
-           "--duration_s", str(DURATION_S),
-           "--seed", "0",
-           "--sim_device", "cuda:{}".format(gpu),
-           "--rl_device", "cuda:{}".format(gpu),
-           "--exploratory",   # these are diagnostics, not gate evaluations
-           "--out", outdir] + MODES[mode]
-    log = os.path.join(outdir, "eval.log")
-    with open(log, "w") as fh:
-        proc = subprocess.run(cmd, cwd=ROOT, stdout=fh, stderr=subprocess.STDOUT)
-    if proc.returncode != 0 or not os.path.exists(report):
-        # Silent eval failure is exactly how four v7 videos went missing; say so.
-        print("  FAILED  {} (exit {}) -> {}".format(tag, proc.returncode, log))
-        return None
-    return report
+    cmd = [
+        sys.executable, "-u", "eval_goal_pose.py",
+        "--task", "K1/Goal_Pose_HBatch", "--config", EVAL_CONFIG,
+        "--checkpoint", ckpt, "--num_envs", str(NUM_ENVS),
+        "--duration_s", str(DURATION_S), "--seed", "0",
+        "--sim_device", "cuda:{}".format(gpu),
+        "--rl_device", "cuda:{}".format(gpu),
+        "--exploratory", "--out", outdir,
+    ] + MODE[mode]["args"]
+    log = os.path.join(outdir, "eval-codex.log")
+    with open(log, "w", encoding="utf-8") as f:
+        proc = subprocess.run(
+            cmd, cwd=ROOT, stdout=f, stderr=subprocess.STDOUT)
+    ok = proc.returncode == 0 and os.path.isfile(path)
+    return ok, "{} {} on cuda:{} -> {}".format(
+        "PASS" if ok else "FAIL", tag(cell, iteration, mode), gpu, log)
 
 
-def jobs():
-    """(cell, iter, mode) grid, with model_0 evaluated once and reused."""
-    out = []
-    for mode in MODES:
-        out.append(("M0_control", 0, mode))       # shared warm start
-        for cell in CELLS:
-            for it in ITERS:
-                if it == 0:
+def verify_model_zero(state_dir, cells):
+    values = {}
+    for cell in cells:
+        path = checkpoint(state_dir, cell, 0)
+        if not path or not os.path.isfile(path):
+            raise ValueError("{} has no copied model_0".format(cell))
+        values[cell] = sha256(path)
+    if len(set(values.values())) != 1:
+        raise ValueError("model_0 hashes differ: {}".format(values))
+    return next(iter(values.values()))
+
+
+def jobs(cells):
+    work = []
+    for mode, spec in MODE.items():
+        eligible = [cell for cell in cells if cell in spec["cells"]]
+        for iteration in ITERS:
+            for cell in eligible:
+                if iteration == 0 and cell != eligible[0]:
                     continue
-                out.append((cell, it, mode))
+                work.append((cell, iteration, mode))
+    return work
+
+
+def worker(state_dir, gpu, queue):
+    out = []
+    for cell, iteration, mode in queue:
+        result = run_eval(state_dir, cell, iteration, mode, gpu)
+        print(result[1], flush=True)
+        out.append(result)
     return out
 
 
-def load(cell, it, mode):
-    # model_0 is byte-identical across cells (same warm start, load_optimizer_
-    # state False, no training) so all cells read the one measurement.
-    src = "M0_control" if it == 0 else cell
-    p = os.path.join(OUT, "{}_{}_{}".format(src, it, mode), "report.json")
-    if not os.path.exists(p):
+def load(cell, iteration, mode):
+    # All copied model_0 files are byte-identical, so each mode evaluates it
+    # once from M0 and reuses that observation bank for the other cells.
+    source = "M0_control-codex" if iteration == 0 else cell
+    path = report_path(source, iteration, mode)
+    if not os.path.isfile(path):
         return None
-    with open(p) as fh:
-        return json.load(fh)
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
 
-def g(d, *keys):
-    for k in keys:
-        if not isinstance(d, dict) or k not in d:
+def nested(value, *keys):
+    for key in keys:
+        if not isinstance(value, dict) or key not in value:
             return None
-        d = d[k]
-    return d
+        value = value[key]
+    return value
 
 
-def fmt(v, n=2):
-    return "-" if v is None else "{:.{}f}".format(v, n)
+def finite(value):
+    return isinstance(value, (int, float)) and math.isfinite(float(value))
 
 
-def report():
+def fmt(value, digits=2, scale=1.0):
+    return "-" if not finite(value) else ("{:.%df}" % digits).format(
+        float(value) * scale)
+
+
+def task_metrics(data):
+    return {
+        "pos_med_cm": (nested(data, "pos_err_m", "median") or 0.0) * 100.0,
+        "pos_p90_cm": (nested(data, "pos_err_m", "p90") or 0.0) * 100.0,
+        "strict_pct": (nested(data, "success_rate_strict") or 0.0) * 100.0,
+        "never_pct": (nested(data, "failure_modes", "never_arrived", "share") or 0.0) * 100.0,
+        "path_speed": nested(data, "path_tracking", "mean_speed_median"),
+        "falls_1000": nested(data, "overall_safety", "falls_per_1000_attempts"),
+        "path_falls_1000": nested(data, "path_safety", "falls_per_1000_attempts"),
+        "mirror_p90": nested(data, "symmetry_eval", "p90"),
+    } if data else {}
+
+
+def noninferior(candidate, control):
+    c, b = task_metrics(candidate), task_metrics(control)
+    if not c or not b:
+        return False
+    checks = (
+        c["pos_p90_cm"] <= 1.05 * b["pos_p90_cm"] + 0.25,
+        c["never_pct"] <= b["never_pct"] + 2.0,
+        c["strict_pct"] + 2.0 >= 0.95 * b["strict_pct"],
+        finite(c["path_speed"]) and finite(b["path_speed"])
+        and c["path_speed"] >= 0.95 * b["path_speed"],
+        finite(c["falls_1000"]) and finite(b["falls_1000"])
+        and c["falls_1000"] <= 1.10 * b["falls_1000"] + 1.0,
+    )
+    return all(checks)
+
+
+def render(cells, model_zero_sha):
     lines = []
-    W = lines.append
-    W("# M-cell 결과 — 외란 / joint DR / mirror loss\n")
-    W("각 셀은 **M0_control + 레버 1개**다. 따라서 `셀 − M0`가 그 레버의 효과다.\n")
+    add = lines.append
+    add("# M-cell 빠른 결과 — 외란·joint DR·mirror loss")
+    add("")
+    add("- protocol: `2026-08-01-codex-v1`")
+    add("- 공통 model 0 SHA-256: `{}`".format(model_zero_sha))
+    add("- 1 seed·200 iteration의 **screening**이며, survivor만 paired seed 재확인한다.")
+    add("- M0/M1/M2는 G1의 기존 mirror loss 0.5를 유지하고, M3만 이를 끈다. mirror PPO augmentation은 전 셀 0이다.")
 
-    for mode in MODES:
-        W("\n## {} 프로토콜 ({} s x {} env, seed 0, 공통 config)\n".format(
-            mode, DURATION_S, NUM_ENVS))
-        W("| 지표 | iter | " + " | ".join(CELLS) + " |")
-        W("|---|---:|" + "---:|" * len(CELLS))
-        metrics = [
-            ("위치 median (cm)", ("pos_err_m", "median"), 100.0, 2),
-            ("위치 p90 (cm)", ("pos_err_m", "p90"), 100.0, 2),
-            ("heading median (°)", ("heading_err_deg", "median"), 1.0, 2),
-            ("strict success (%)", ("success_rate_strict",), 100.0, 2),
-            ("낙상", ("falls",), 1.0, 0),
-        ]
-        for label, path, scale, nd in metrics:
-            for it in ITERS:
-                row = []
-                for cell in CELLS:
-                    d = load(cell, it, mode)
-                    v = g(d, *path) if d else None
-                    row.append(fmt(v * scale, nd) if v is not None else "-")
-                W("| {} | {} | {} |".format(label if it == ITERS[0] else "", it,
-                                            " | ".join(row)))
+    add("\n## Clean: fine-tune 비용과 task 보존")
+    add("")
+    add("| cell | iter | pos med/p90 cm | strict / never % | path speed m/s | falls all/path per1000 | mirror p90 |")
+    add("|---|---:|---:|---:|---:|---:|---:|")
+    for cell in cells:
+        for iteration in ITERS:
+            m = task_metrics(load(cell, iteration, "clean"))
+            if not m:
+                continue
+            add("| {} | {} | {:.2f}/{:.2f} | {:.1f}/{:.1f} | {} | {}/{} | {} |".format(
+                cell, iteration, m["pos_med_cm"], m["pos_p90_cm"],
+                m["strict_pct"], m["never_pct"], fmt(m["path_speed"], 3),
+                fmt(m["falls_1000"], 1), fmt(m["path_falls_1000"], 1),
+                fmt(m["mirror_p90"], 3)))
 
-    # ---- the actual verdict --------------------------------------------
-    W("\n## 레버별 판정 (clean, M0 대비 차이)\n")
-    W("| 레버 | Δ위치 med @100 | Δ위치 med @200 | Δ낙상 @200 | 판정 |")
-    W("|---|---:|---:|---:|---|")
-    base = {it: load("M0_control", it, "clean") for it in ITERS}
-    LEVER = {"M1_force": "외란(시나리오)", "M2_jointdr": "joint DR",
-             "M3_mirror": "mirror loss"}
-    for cell in CELLS[1:]:
-        d100, d200 = load(cell, 100, "clean"), load(cell, 200, "clean")
-        b100, b200 = base.get(100), base.get(200)
-        def delta(a, b, path, scale=100.0):
-            va, vb = g(a, *path) if a else None, g(b, *path) if b else None
-            return None if va is None or vb is None else (va - vb) * scale
-        dp100 = delta(d100, b100, ("pos_err_m", "median"))
-        dp200 = delta(d200, b200, ("pos_err_m", "median"))
-        df200 = delta(d200, b200, ("falls",), 1.0)
-        if dp200 is None:
-            verdict = "데이터 없음"
-        elif dp200 <= 0.5:
-            verdict = "✅ 비용 없음 — 채택 가능"
-        elif dp200 <= 2.0:
-            verdict = "⚠️ 경미한 비용 — dose 조정 후 재검"
-        else:
-            verdict = "❌ 이 레버가 열화를 만든다"
-        W("| {} | {} | {} | {} | {} |".format(
-            LEVER[cell], fmt(dp100), fmt(dp200), fmt(df200, 0), verdict))
+    if all(x in cells for x in ("M0_control-codex", "M1_force-codex")):
+        add("\n## 외란: 공통 다방향 scenario 시험")
+        add("")
+        add("| cell | iter | records | survival 5s / high-speed % | recovery≤5s % | force falls | delivery p90 err % |")
+        add("|---|---:|---:|---:|---:|---:|---:|")
+        for cell in ("M0_control-codex", "M1_force-codex"):
+            for iteration in ITERS:
+                d = load(cell, iteration, "force")
+                overall = nested(d, "disturbance_eval", "overall") or {}
+                high = nested(d, "disturbance_eval", "high_speed") or {}
+                audit = nested(d, "disturbance_eval", "delivery_audit", "force") or {}
+                add("| {} | {} | {} | {}/{} | {} | {} | {} |".format(
+                    cell, iteration, overall.get("records", "-"),
+                    fmt(overall.get("survival_5s"), 1, 100),
+                    fmt(high.get("survival_5s"), 1, 100),
+                    fmt(overall.get("recovery_90_within_5s_share"), 1, 100),
+                    nested(d, "disturbance_eval", "falls_during_force") or 0,
+                    fmt(audit.get("relative_error_p90"), 3, 100)))
+        probe = load("M0_control-codex", 0, "force") or {}
+        de = probe.get("disturbance_eval") or {}
+        add("")
+        add("- scenario counts: `{}`".format({
+            k: v.get("records", 0) for k, v in
+            (de.get("scenario_breakdown") or {}).items()}))
+        add("- height-tier counts: `{}`".format({
+            k: v.get("records", 0) for k, v in
+            (de.get("height_tier_breakdown") or {}).items()}))
+        add("- robot-local direction octants: `{}`".format(
+            de.get("direction_octants_robot_local") or {}))
 
-    W("\n> 판정 기준: H 배치에서 iteration 200까지의 열화가 H0 +5.1 cm, H1 +7.4 cm,")
-    W("> H2 +6.2 cm였다. 한 레버가 그 열화의 대부분을 설명하면 그 레버가 범인이고,")
-    W("> M0 자체가 크게 열화하면 범인은 레버가 아니라 **fine-tune 설정 자체**다.")
-    W("> M0의 절대 열화가 먼저 읽어야 할 숫자다.\n")
+    if all(x in cells for x in ("M0_control-codex", "M2_jointdr-codex")):
+        add("\n## Joint-offset probe: encoder ±0.015 / target ±0.010 rad")
+        add("")
+        add("| cell | iter | pos med/p90 cm | strict / never % | path speed | falls/1000 |")
+        add("|---|---:|---:|---:|---:|---:|")
+        for cell in ("M0_control-codex", "M2_jointdr-codex"):
+            for iteration in ITERS:
+                m = task_metrics(load(cell, iteration, "joint"))
+                if m:
+                    add("| {} | {} | {:.2f}/{:.2f} | {:.1f}/{:.1f} | {} | {} |".format(
+                        cell, iteration, m["pos_med_cm"], m["pos_p90_cm"],
+                        m["strict_pct"], m["never_pct"],
+                        fmt(m["path_speed"], 3), fmt(m["falls_1000"], 1)))
 
-    m0_200 = g(base.get(200), "pos_err_m", "median")
-    m0_0 = g(base.get(0), "pos_err_m", "median")
-    if m0_0 is not None and m0_200 is not None:
-        W("**M0 자체 열화: {:.2f} → {:.2f} cm ({:+.2f} cm)**".format(
-            m0_0 * 100, m0_200 * 100, (m0_200 - m0_0) * 100))
-        if (m0_200 - m0_0) * 100 > 3.0:
-            W("\n> ⛔ **레버를 하나도 켜지 않은 대조군이 이미 열화한다.** 원인은 외란·"
-              "joint DR·mirror가 아니라 fine-tune 설정(LR, KL, warm start 정합성)이다. "
-              "레버별 차이를 해석하기 전에 이것부터 고쳐야 한다.")
-        else:
-            W("\n> ✅ 대조군은 안정적이다. 따라서 위 레버별 차이를 그대로 해석할 수 있다.")
+    add("\n## 사전 고정 판정")
+    add("")
+    control0 = load("M0_control-codex", 0, "clean")
+    control200 = load("M0_control-codex", 200, "clean")
+    if control0 and control200:
+        stable = noninferior(control200, control0)
+        m0, m2 = task_metrics(control0), task_metrics(control200)
+        add("- M0 fine-tune: **{}** — pos p90 {:.2f}→{:.2f} cm, never {:.1f}→{:.1f}%, path speed {}→{} m/s.".format(
+            "PASS" if stable else "FAIL/STOP", m0["pos_p90_cm"],
+            m2["pos_p90_cm"], m0["never_pct"], m2["never_pct"],
+            fmt(m0["path_speed"], 3), fmt(m2["path_speed"], 3)))
+    else:
+        stable = False
+        add("- M0 fine-tune: 데이터 부족")
 
-    path = os.path.join(OUT, "mcell-report.md")
-    with open(path, "w") as fh:
-        fh.write("\n".join(lines) + "\n")
-    print("\n".join(lines))
-    print("\n=> {}".format(path))
+    if "M1_force-codex" in cells:
+        clean_ok = noninferior(load("M1_force-codex", 200, "clean"), control200)
+        b = nested(load("M0_control-codex", 200, "force"),
+                   "disturbance_eval", "overall", "survival_5s")
+        c = nested(load("M1_force-codex", 200, "force"),
+                   "disturbance_eval", "overall", "survival_5s")
+        benefit = finite(b) and finite(c) and c >= b
+        add("- scenario 외란: **{}** — clean 비열세 {}, 5s survival {}→{}%.".format(
+            "SURVIVE" if clean_ok and benefit else "DROP/REDOSE",
+            clean_ok, fmt(b, 2, 100), fmt(c, 2, 100)))
+    if "M2_jointdr-codex" in cells:
+        clean_ok = noninferior(load("M2_jointdr-codex", 200, "clean"), control200)
+        b = task_metrics(load("M0_control-codex", 200, "joint"))
+        c = task_metrics(load("M2_jointdr-codex", 200, "joint"))
+        benefit = bool(b and c and c["pos_p90_cm"] <= b["pos_p90_cm"])
+        add("- joint DR: **{}** — clean 비열세 {}, probe p90 {}→{} cm.".format(
+            "SURVIVE" if clean_ok and benefit else "DROP/REDOSE", clean_ok,
+            fmt(b.get("pos_p90_cm") if b else None),
+            fmt(c.get("pos_p90_cm") if c else None)))
+    if "M3_mirror_off-codex" in cells:
+        on = task_metrics(control200)
+        off_data = load("M3_mirror_off-codex", 200, "clean")
+        off = task_metrics(off_data)
+        keep = (on and off and finite(on["mirror_p90"])
+                and finite(off["mirror_p90"])
+                and on["mirror_p90"] <= off["mirror_p90"]
+                and noninferior(control200, off_data))
+        add("- G1 mirror loss 0.5: **{}** — loss ON/OFF mirror p90 {}/{}; task ON이 OFF 대비 비열세 {}.".format(
+            "KEEP" if keep else "UNRESOLVED/REMOVE", fmt(on.get("mirror_p90") if on else None, 3),
+            fmt(off.get("mirror_p90") if off else None, 3),
+            noninferior(control200, off_data) if off_data else False))
+
+    add("")
+    add("> 이 표의 SURVIVE는 본학습 채택이 아니다. 같은 방향을 보인 레버만 M0과 paired seeds `31415, 27182`로 재확인하고, 생산 후보에는 low-dose 외란과 goal jitter를 의무적으로 다시 넣는다.")
+    return "\n".join(lines) + "\n"
 
 
 def main():
+    global OUT
     ap = argparse.ArgumentParser()
+    ap.add_argument("--state_dir", required=True)
+    ap.add_argument("--cells", nargs="+", default=list(ALL_CELLS))
     ap.add_argument("--report_only", action="store_true")
     args = ap.parse_args()
+    OUT = os.path.join(
+        OUT_BASE, os.path.basename(os.path.abspath(args.state_dir)))
+    cells = [cell for cell in args.cells if cell in ALL_CELLS]
+    if "M0_control-codex" not in cells:
+        raise SystemExit("M0_control-codex is required for causal comparisons")
+    model_zero_sha = verify_model_zero(args.state_dir, cells)
+    failures = []
     if not args.report_only:
         os.makedirs(OUT, exist_ok=True)
-        todo = jobs()
-        print("평가 {}건 (2 GPU 라운드로빈)".format(len(todo)))
-        t0 = time.time()
-        # Round-robin across both cards; a serial sweep is what left GPU 1 idle
-        # for 30 minutes during the v7 re-eval.
-        procs = []
-        for i, (cell, it, mode) in enumerate(todo):
-            gpu = i % 2
-            print("[{}/{}] {} iter{} {} -> cuda:{}".format(
-                i + 1, len(todo), cell, it, mode, gpu))
-            run_eval(cell, it, mode, gpu)
-        print("총 {:.1f}분".format((time.time() - t0) / 60.0))
-    report()
+        work = jobs(cells)
+        queues = [work[0::2], work[1::2]]
+        print("{} evaluations, two persistent GPU queues: {} / {}".format(
+            len(work), len(queues[0]), len(queues[1])), flush=True)
+        started = time.time()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(worker, args.state_dir, gpu, queues[gpu])
+                       for gpu in (0, 1)]
+            for future in futures:
+                failures.extend(message for ok, message in future.result() if not ok)
+        print("evaluation wall {:.1f} min".format(
+            (time.time() - started) / 60.0), flush=True)
+    report = render(cells, model_zero_sha)
+    path = os.path.join(OUT, "mcell-report-codex.md")
+    os.makedirs(OUT, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(report)
+    print(report)
+    print("written {}".format(path))
+    if failures:
+        print("FAILED evaluations:\n  " + "\n  ".join(failures), file=sys.stderr)
+        return 1
     return 0
 
 

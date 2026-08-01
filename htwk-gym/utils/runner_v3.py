@@ -190,9 +190,6 @@ class RunnerV3(Runner):
                     old_mirror_dist = self.model.act(self.env.mirror_obs(self.buffer["obses"]))
                     old_mirror_mu = old_mirror_dist.loc.reshape(batch_size, -1)
                     old_mirror_sigma = old_mirror_dist.scale.reshape(batch_size, -1)
-                    old_mirror_logprob = old_mirror_dist.log_prob(
-                        self.env.mirror_actions(self.buffer["actions"])
-                    ).sum(dim=-1).reshape(batch_size)
 
             obs_b = self.buffer["obses"].reshape(batch_size, -1)
             priv_b = self.buffer["privileged_obses"].reshape(batch_size, -1)
@@ -213,7 +210,7 @@ class RunnerV3(Runner):
                 if use_mirror_aug:
                     finite_refs.extend([
                         old_mirror_mu, old_mirror_sigma,
-                        old_mirror_logprob, mirror_z])
+                        mirror_z])
                 self._require_finite(
                     "frozen PPO reference at iteration {}".format(it + 1),
                     *finite_refs)
@@ -285,15 +282,20 @@ class RunnerV3(Runner):
                                 mirrored_dist.scale[valid_pos])
                             mirror_logprob = valid_mirror_dist.log_prob(
                                 valid_actions).sum(dim=-1)
-                            # The reflected transition is a pseudo-on-policy
-                            # augmentation referenced to frozen pi_old(Ms).
-                            # Restrict it to transformed actions within the old
-                            # mirrored policy's configured Gaussian support;
-                            # the explicit mean-equivariance loss below covers
-                            # the remaining asymmetric samples without a tail
-                            # likelihood-ratio explosion.
+                            # The synthetic transition is obtained by the
+                            # deterministic signed-permutation
+                            #     (s, a) -> (Ms, Ma).
+                            # Its behaviour density is therefore the pushforward
+                            # q(Ma|Ms)=pi_old(a|s)/|det M|.  The action mirror is
+                            # a signed permutation, so |det M|=1 and the correct
+                            # PPO denominator is the SOURCE old log-probability.
+                            # Using pi_old(Ma|Ms) here (the previous code) is only
+                            # equivalent after the policy is already perfectly
+                            # symmetric and biases the very experiment intended
+                            # to learn that symmetry.  The old mirrored policy is
+                            # still used above solely as a tail-support guard.
                             mirror_actor_loss = _bounded_surrogate_loss(
-                                old_mirror_logprob[idx][valid_pos],
+                                old_logprob[idx][valid_pos],
                                 mirror_logprob, adv_b[idx][valid_pos],
                                 max_abs_log_ratio)
 

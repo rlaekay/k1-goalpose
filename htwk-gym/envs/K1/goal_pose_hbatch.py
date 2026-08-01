@@ -527,8 +527,14 @@ class GoalPoseHBatch(GoalPoseV7):
         if not d.get("enabled", False):
             return super()._push_robots()
 
+        was_active = self.dist_steps_left > 0
         self.dist_steps_left = (self.dist_steps_left - 1).clamp(min=0)
-        expired = self.dist_steps_left == 0
+        expired = was_active & (self.dist_steps_left == 0)
+        # Snapshot exactly the wrench submitted on the preceding physics
+        # ticks before clearing it.  Treating every already-inactive env as an
+        # expiration would overwrite the last completed event with zeros on
+        # every control step.
+        self._finalize_submitted_impulse(expired)
         self.pushing_forces[expired] = 0.0
         self.pushing_torques[expired] = 0.0
         self.dist_event_kind[expired] = 0
@@ -561,6 +567,9 @@ class GoalPoseHBatch(GoalPoseV7):
                 # maximum duration; this makes the invariant explicit in code.
                 self.pushing_forces[fire] = 0.0
                 self.pushing_torques[fire] = 0.0
+                if self._dist_scenario_enabled:
+                    self._sample_scenario_events(fire)
+                    return
                 body = self.dist_body_indices[
                     torch.randint(0, len(self.dist_body_indices), (k,), device=self.device)]
                 self.dist_active_body[fire] = body
@@ -600,6 +609,8 @@ class GoalPoseHBatch(GoalPoseV7):
                 axis /= axis.norm(dim=-1, keepdim=True).clamp(min=1e-6)
                 self.pushing_torques[fire, body] = axis * tmag.unsqueeze(-1)
                 self.dist_steps_left[fire] = duration_steps
+                self._record_legacy_event_telemetry(
+                    fire, body, applied_duration)
 
     def _apply_external_wrenches_substep(self):
         """Apply a held control-step wrench on every decimated physics tick.
@@ -612,6 +623,15 @@ class GoalPoseHBatch(GoalPoseV7):
         if not d.get("enabled", False):
             return
         self.dist_wrench_apply_calls += 1
+        # Integrate the exact tensors submitted on each 500 Hz physics tick.
+        # This proves scheduler/decimation delivery and is compared with the
+        # analytic event impulse.  It is not an observed robot momentum change,
+        # because feet, gravity and actuation exchange momentum concurrently.
+        sim_dt = float(self.cfg["sim"]["dt"])
+        self.dist_event_submitted_impulse_vec += (
+            self.pushing_forces.sum(dim=1) * sim_dt)
+        self.dist_event_submitted_torque_impulse_vec += (
+            self.pushing_torques.sum(dim=1) * sim_dt)
         # ENV_SPACE keeps a long support push fixed in the world instead of
         # rotating the force vector with the robot.  It is still a wrench proxy,
         # not a second simulated robot collision.

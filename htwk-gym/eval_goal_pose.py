@@ -843,7 +843,13 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
             "recovery_eligible", "recovery_censored_by_goal_protocol",
             "outcome_censored_by_episode_timeout",
             "outcome_censored_by_rollout_end", "recovery_90_s",
-            "survived_2s", "survived_5s")
+            "survived_2s", "survived_5s",
+            # Scenario provenance and delivery audit.  IDs are accompanied by
+            # immutable name tables in disturbance_eval so JSON stays compact.
+            "scenario_id", "height_tier_id", "body_index",
+            "direction_local_deg", "contact_offset_z_m",
+            "expected_impulse_ns", "expected_torque_impulse_nms",
+            "submitted_impulse_ns", "submitted_torque_impulse_nms")
     }
     fall_ctx = {k: [] for k in ("category", "goal_dist", "t_into_segment", "start_dist")}
     falls = 0
@@ -919,6 +925,18 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
         env.num_envs, dtype=torch.bool, device=env.device)
     force_goal_segment = torch.zeros(
         env.num_envs, dtype=torch.long, device=env.device)
+    force_scenario_id = torch.zeros(
+        env.num_envs, dtype=torch.int8, device=env.device)
+    force_height_tier_id = torch.full(
+        (env.num_envs,), -1, dtype=torch.int8, device=env.device)
+    force_body_index = torch.full(
+        (env.num_envs,), -1, dtype=torch.long, device=env.device)
+    force_direction_local = torch.zeros(env.num_envs, 3, device=env.device)
+    force_contact_offset_local = torch.zeros(env.num_envs, 3, device=env.device)
+    force_expected_impulse = torch.full(
+        (env.num_envs,), float("nan"), device=env.device)
+    force_expected_torque_impulse = torch.full(
+        (env.num_envs,), float("nan"), device=env.device)
 
     def close_force_records(mask, age_s):
         ids = mask.nonzero(as_tuple=False).flatten()
@@ -951,6 +969,43 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
             force_records["recovery_90_s"].append(recovery)
             force_records["survived_2s"].append(age >= 2.0)
             force_records["survived_5s"].append(age >= 5.0)
+            force_records["scenario_id"].append(
+                int(force_scenario_id[idx].item()))
+            force_records["height_tier_id"].append(
+                int(force_height_tier_id[idx].item()))
+            force_records["body_index"].append(
+                int(force_body_index[idx].item()))
+            direction = force_direction_local[idx]
+            force_records["direction_local_deg"].append(float(torch.rad2deg(
+                torch.atan2(direction[1], direction[0])).item()))
+            force_records["contact_offset_z_m"].append(float(
+                force_contact_offset_local[idx, 2].item()))
+            force_records["expected_impulse_ns"].append(float(
+                force_expected_impulse[idx].item()))
+            force_records["expected_torque_impulse_nms"].append(float(
+                force_expected_torque_impulse[idx].item()))
+            # The HBatch environment integrates the exact wrench tensor on
+            # every physics substep.  Because the minimum inter-event interval
+            # exceeds this five-second record window, this accumulator still
+            # belongs to the record being closed (including fall/reset closes).
+            submitted_i = float("nan")
+            submitted_t = float("nan")
+            if hasattr(env, "dist_event_submitted_impulse_vec"):
+                submitted_i = float(torch.norm(
+                    env.dist_event_submitted_impulse_vec[idx]).item())
+                if (submitted_i <= 1.0e-12
+                        and hasattr(env, "dist_last_submitted_impulse")):
+                    submitted_i = float(
+                        env.dist_last_submitted_impulse[idx].item())
+            if hasattr(env, "dist_event_submitted_torque_impulse_vec"):
+                submitted_t = float(torch.norm(
+                    env.dist_event_submitted_torque_impulse_vec[idx]).item())
+                if (submitted_t <= 1.0e-12
+                        and hasattr(env, "dist_last_submitted_torque_impulse")):
+                    submitted_t = float(
+                        env.dist_last_submitted_torque_impulse[idx].item())
+            force_records["submitted_impulse_ns"].append(submitted_i)
+            force_records["submitted_torque_impulse_nms"].append(submitted_t)
         force_live[ids] = False
         force_ended[ids] = False
         force_recovery[ids] = float("nan")
@@ -1369,6 +1424,30 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
                     force_kind[start] = env.dist_event_kind[start]
                 else:
                     force_kind[start] = 0
+                force_scenario_id[start] = 0
+                force_height_tier_id[start] = -1
+                force_body_index[start] = -1
+                force_direction_local[start] = 0.0
+                force_contact_offset_local[start] = 0.0
+                force_expected_impulse[start] = float("nan")
+                force_expected_torque_impulse[start] = float("nan")
+                if hasattr(env, "dist_last_scenario_id"):
+                    force_scenario_id[start] = env.dist_last_scenario_id[start]
+                if hasattr(env, "dist_last_height_tier"):
+                    force_height_tier_id[start] = env.dist_last_height_tier[start]
+                if hasattr(env, "dist_active_body"):
+                    force_body_index[start] = env.dist_active_body[start]
+                if hasattr(env, "dist_last_direction_local"):
+                    force_direction_local[start] = env.dist_last_direction_local[start]
+                if hasattr(env, "dist_last_contact_offset_local"):
+                    force_contact_offset_local[start] = (
+                        env.dist_last_contact_offset_local[start])
+                if hasattr(env, "dist_last_expected_impulse"):
+                    force_expected_impulse[start] = (
+                        env.dist_last_expected_impulse[start])
+                if hasattr(env, "dist_last_expected_torque_impulse"):
+                    force_expected_torque_impulse[start] = (
+                        env.dist_last_expected_torque_impulse[start])
                 force_impulse[start] = 0.0
                 force_torque_impulse[start] = 0.0
                 force_max_tilt[start] = 0.0
@@ -1704,11 +1783,16 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
 
     fr = {k: np.asarray(v) for k, v in force_records.items()}
 
-    def event_summary(kind=None, high_speed_only=False):
+    def event_summary(kind=None, high_speed_only=False, scenario_id=None,
+                      height_tier_id=None):
         count = len(fr["kind"])
         mask = np.ones(count, dtype=bool)
         if kind is not None:
             mask &= fr["kind"].astype(int) == kind
+        if scenario_id is not None:
+            mask &= fr["scenario_id"].astype(int) == scenario_id
+        if height_tier_id is not None:
+            mask &= fr["height_tier_id"].astype(int) == height_tier_id
         if high_speed_only:
             high_speed_threshold = float(env.cfg.get("evaluation", {}).get(
                 "high_speed_threshold_mps", 0.8))
@@ -1760,6 +1844,45 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
                                   if recovered.any() else float("nan")),
         }
 
+    scenario_names = list(getattr(env, "dist_scenario_names", ()))
+    height_tier_names = list(getattr(env, "dist_height_tier_names", ()))
+    scenario_breakdown = {
+        name: event_summary(scenario_id=i + 1)
+        for i, name in enumerate(scenario_names)
+    }
+    height_tier_breakdown = {
+        name: event_summary(height_tier_id=i)
+        for i, name in enumerate(height_tier_names)
+    }
+
+    # Eight robot-local horizontal octants make it obvious if a supposedly
+    # omnidirectional treatment silently degenerates into front/back only.
+    octant_labels = (
+        "+x", "+x+y", "+y", "-x+y", "-x", "-x-y", "-y", "+x-y")
+    direction_octants = {name: 0 for name in octant_labels}
+    if len(fr["direction_local_deg"]):
+        angles = fr["direction_local_deg"].astype(float)
+        valid_direction = np.isfinite(angles)
+        safe_angles = np.where(valid_direction, angles, 0.0)
+        octants = np.floor(((safe_angles + 22.5) % 360.0) / 45.0).astype(int)
+        for i, name in enumerate(octant_labels):
+            direction_octants[name] = int((valid_direction & (octants == i)).sum())
+
+    def delivery_error(expected_key, submitted_key):
+        expected = fr[expected_key].astype(float)
+        submitted = fr[submitted_key].astype(float)
+        valid = np.isfinite(expected) & np.isfinite(submitted) & (expected > 0.0)
+        relative = np.abs(submitted[valid] - expected[valid]) / expected[valid]
+        return {
+            "records": int(valid.sum()),
+            "relative_error_median": (_pct(relative, 50) if valid.any()
+                                      else float("nan")),
+            "relative_error_p90": (_pct(relative, 90) if valid.any()
+                                   else float("nan")),
+            "relative_error_max": (float(relative.max()) if valid.any()
+                                   else float("nan")),
+        }
+
     out["disturbance_eval"] = {
         "recovery_definition": (
             "path-only: filtered world velocity projected toward the current "
@@ -1791,6 +1914,22 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
         "high_speed": event_summary(high_speed_only=True),
         "collision": event_summary(1),
         "support": event_summary(2),
+        "scenario_names_by_id": {
+            str(i + 1): name for i, name in enumerate(scenario_names)},
+        "height_tier_names_by_id": {
+            str(i): name for i, name in enumerate(height_tier_names)},
+        "body_names_by_index": {
+            str(i): name for i, name in enumerate(getattr(env, "body_names", ()))},
+        "scenario_breakdown": scenario_breakdown,
+        "height_tier_breakdown": height_tier_breakdown,
+        "direction_octants_robot_local": direction_octants,
+        "delivery_audit": {
+            "force": delivery_error(
+                "expected_impulse_ns", "submitted_impulse_ns"),
+            "torque": delivery_error(
+                "expected_torque_impulse_nms",
+                "submitted_torque_impulse_nms"),
+        },
     }
     return out
 

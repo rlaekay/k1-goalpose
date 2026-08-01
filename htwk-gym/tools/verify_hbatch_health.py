@@ -14,7 +14,9 @@ def require(ok, message):
 
 
 def verify(path, token, num_envs, min_iterations,
-           horizon_length=24, mini_epochs=5, num_minibatches=4):
+           horizon_length=24, mini_epochs=5, num_minibatches=4,
+           expected_configured_lr=5.0e-6, min_lr=1.0e-6,
+           max_lr=1.0e-5):
     require(os.path.isfile(path), "health marker is missing")
     with open(path, encoding="utf-8") as f:
         marker = json.load(f)
@@ -52,11 +54,12 @@ def verify(path, token, num_envs, min_iterations,
     require(all(math.isfinite(x) for x in
                 (configured_lr, initial_lr, current_lr, grad_norm, mirror_share)),
             "health marker contains a nonfinite scalar")
-    require(configured_lr == 5.0e-6 and initial_lr == configured_lr,
+    require(configured_lr == expected_configured_lr and initial_lr == configured_lr,
             "checkpoint optimizer LR leaked into H warm start: configured {}, initial {}"
             .format(configured_lr, initial_lr))
-    require(1.0e-6 <= current_lr <= 1.0e-5,
-            "adaptive LR left the frozen H bounds: {}".format(current_lr))
+    require(min_lr <= current_lr <= max_lr,
+            "adaptive LR left the configured bounds [{}, {}]: {}".format(
+                min_lr, max_lr, current_lr))
     require(grad_norm >= 0.0 and 0.0 < mirror_share <= 1.0,
             "invalid grad norm or mirror support share")
     return marker
@@ -68,11 +71,16 @@ def main():
     parser.add_argument("--health_token", required=True)
     parser.add_argument("--num_envs", type=int, required=True)
     parser.add_argument("--min_iterations", type=int, default=2)
+    parser.add_argument("--expected_configured_lr", type=float, default=5.0e-6)
+    parser.add_argument("--min_lr", type=float, default=1.0e-6)
+    parser.add_argument("--max_lr", type=float, default=1.0e-5)
     args = parser.parse_args()
     try:
         marker = verify(
             os.path.abspath(args.marker), args.health_token,
-            args.num_envs, args.min_iterations)
+            args.num_envs, args.min_iterations,
+            expected_configured_lr=args.expected_configured_lr,
+            min_lr=args.min_lr, max_lr=args.max_lr)
     except Exception as exc:
         print("FAIL  HBatch training health: {}".format(exc), flush=True)
         return 1

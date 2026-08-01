@@ -1,194 +1,195 @@
 #!/bin/bash
-# M-cell short factorial: disturbance / joint DR / mirror loss, 4 cells, 2 GPUs.
-#
-#   nohup bash tools/run_mcells.sh > mcells.log 2>&1 &
-#   tail -f mcells.log
-#
-# WHY IT IS SHORT
-# ---------------
-# The H batch trained 4 arms x 12000 iterations (~10 h each) and its selector
-# picked model_0 -- the untrained warm start -- for every one. The four
-# selection tables show waypoint position median going 7.3 -> ~10.5-13.2 cm by
-# iteration 100 and saturating near 38-42 cm, while falls fall from 29 to 0-15.
-# The verdict was already legible at iteration 100. These cells stop at 200.
-#
-#   ~12000 iters/arm  ->  ~10 h/arm, 4 arms serialised over 2 GPUs  ~= 20 h
-#   ~200 iters/cell   ->  ~20 min/cell, 4 cells in ONE wave        ~= 25 min
-#
-# GPU PLAN
-# --------
-# 2 cells per GPU, all 4 concurrent in a single wave. Two-per-card is already
-# proven on this hardware: the G batch ran G1+G2 on cuda:0 and G3+G4 on cuda:1
-# at the same 4096 envs. Running all four together also means every cell sees
-# the same wall-clock conditions on the shared server, so a slow neighbour
-# cannot masquerade as a treatment effect.
-#
-#   cuda:0 -> M0_control  M2_jointdr
-#   cuda:1 -> M1_force    M3_mirror
-#
-# M0 and M1 are the pair most likely to diverge, so they sit on different cards;
-# if one card is throttled, the control and the disturbance cell are not both
-# on it.
-#
-# GATE
-# ----
-# Every cell is smoke-gated on its own config first. Cells that pass launch;
-# cells that fail do NOT block the others and get their own log under
-# logs/mcells/smoke_failures/. That is the fix for the G batch, where an
-# all-or-nothing launcher held two passing arms hostage to one failing one.
-#
-# Environment overrides:
-#   CKPT=...       G1 warm start (must be the same file for every cell)
-#   CELLS="..."    subset, default all four
-#   SESSION=m      tmux session name
+# End-to-end short screen: generate -> smoke -> train -> paired eval -> report.
+# Intended invocation on the two-A6000 compute server:
+#   nohup bash tools/run_mcells.sh > logs/mcells/launcher-codex.log 2>&1 &
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-cd "$REPO_ROOT"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$ROOT"
 
-SESSION="${SESSION:-m}"
-CELLS="${CELLS:-M0_control M1_force M2_jointdr M3_mirror}"
+BASE_CONFIG="${BASE_CONFIG:-logs/K1/K1/Goal_Pose_V7/2026-07-28-17-02-35_G1_speed/config.yaml}"
 CKPT="${CKPT:-logs/K1/K1/Goal_Pose_V7/2026-07-28-17-02-35_G1_speed/nn/model_10700.pth}"
 ENVS="${ENVS:-4096}"
-FAILDIR="logs/mcells/smoke_failures"
-mkdir -p "$FAILDIR"
+ITERS="${ITERS:-200}"
+SMOKE_ENVS="${SMOKE_ENVS:-256}"
+SMOKE_STEPS="${SMOKE_STEPS:-300}"
+HEALTH_TIMEOUT_S="${HEALTH_TIMEOUT_S:-240}"
+CELLS="${CELLS:-M0_control-codex M1_force-codex M2_jointdr-codex M3_mirror_off-codex}"
+RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
+STATE="logs/mcells/state-$RUN_ID-codex"
+FAIL="logs/mcells/failures-$RUN_ID-codex"
+mkdir -p "$STATE" "$FAIL"
 
 say() { echo "[$(date +%H:%M:%S)] $*"; }
+gpu_for() {
+  case "$1" in
+    M0_control-codex|M2_jointdr-codex) echo 0 ;;
+    *) echo 1 ;;
+  esac
+}
 
-say "=== M-cell factorial: 외란 / joint DR / mirror loss ==="
+say "M-cell causal screen $RUN_ID"
+say "base: $BASE_CONFIG"
 say "warm start: $CKPT"
 
-if [ ! -f "$CKPT" ]; then
-  say "!!! warm start 없음: $CKPT"
-  say "    확인: ls logs/K1/K1/Goal_Pose_V7/*G1_speed*/nn/model_*.pth | tail"
+if [ ! -f "$BASE_CONFIG" ] || [ ! -f "$CKPT" ]; then
+  say "FAIL: frozen G1 config or checkpoint is missing"
+  exit 1
+fi
+if [ "$ITERS" -ne 200 ]; then
+  say "FAIL: protocol is frozen at 200 iterations (got ITERS=$ITERS)"
   exit 1
 fi
 
-# The paired design only holds if every cell starts from the SAME bytes.
-CKPT_SHA=$(sha256sum "$CKPT" | cut -d' ' -f1)
-say "warm start sha256: ${CKPT_SHA:0:16}"
-
-# ---- 0) configs ------------------------------------------------------------
-say "=== config 생성 ==="
-if ! python tools/make_mcell_configs.py --checkpoint "$CKPT"; then
-  say "!!! config 생성 실패 — 중단"
-  exit 1
-fi
-
-# ---- 1) 정적 검사 ----------------------------------------------------------
-say "=== 이름/import 검사 ==="
-if ! python tools/check_names.py > /tmp/mcell_names.txt 2>&1; then
-  if grep -v "import \*" /tmp/mcell_names.txt | grep -qE "UNDEFINED|IMPORT|FORMAT"; then
-    say "!!! 정적 검사 실패 — 중단"
-    grep -E "UNDEFINED|IMPORT|FORMAT" /tmp/mcell_names.txt
+say "[1/5] generate and verify causal configs"
+python tools/make_mcell_configs.py \
+  --base_config "$BASE_CONFIG" --checkpoint "$CKPT" || exit 1
+python tools/make_mcell_configs.py \
+  --base_config "$BASE_CONFIG" --checkpoint "$CKPT" --check || exit 1
+python -m py_compile \
+  envs/K1/goal_pose_hbatch.py eval_goal_pose.py utils/runner_v3.py \
+  tools/make_mcell_configs.py tools/compare_mcells.py || exit 1
+if ! python tools/check_names.py > "$STATE/names-codex.log" 2>&1; then
+  if grep -v "import \*" "$STATE/names-codex.log" | grep -qE "UNDEFINED|IMPORT|FORMAT"; then
+    say "FAIL: name/import check (see $STATE/names-codex.log)"
     exit 1
   fi
 fi
-say "정적 검사 통과"
 
-# ---- 2) 셀별 스모크 --------------------------------------------------------
-# Round-robin the smoke across both cards too: a serial smoke on one card was
-# what left GPU 1 idle for 30 minutes during the re-eval.
-say "=== 스모크 (셀별, 실패해도 나머지는 계속) ==="
-PASSED=""
-i=0
+say "[2/5] independent inference/mechanics smoke (all cells in one GPU wave)"
+declare -A SMOKE_PID
 for cell in $CELLS; do
-  gpu=$((i % 2))
-  log="$FAILDIR/${cell}.log"
-  say "--- 스모크: $cell (cuda:$gpu)"
-  if python tools/smoke_hbatch.py --config "sweeps/mcells/${cell}.yaml" \
-       --checkpoint "$CKPT" --sim_device "cuda:$gpu" --rl_device "cuda:$gpu" \
-       > "$log" 2>&1; then
-    say "    ✅ $cell 통과"
-    rm -f "$log"
-    PASSED="$PASSED $cell"
-  else
-    say "    ❌ $cell 실패 — 로그: $log"
-    tail -20 "$log" | sed 's/^/        /'
-  fi
-  i=$((i + 1))
+  gpu="$(gpu_for "$cell")"
+  probe=""
+  [ "$cell" = "M1_force-codex" ] && probe="--disturbance_probe"
+  python -u tools/smoke_v7.py \
+    --task K1/Goal_Pose_HBatch \
+    --config "sweeps/mcells/$cell.yaml" \
+    --checkpoint "$CKPT" --num_envs "$SMOKE_ENVS" --steps "$SMOKE_STEPS" \
+    --sim_device "cuda:$gpu" --rl_device "cuda:$gpu" $probe \
+    > "$STATE/smoke-$cell.log" 2>&1 &
+  SMOKE_PID[$cell]=$!
+  say "  smoke $cell -> cuda:$gpu pid ${SMOKE_PID[$cell]}"
 done
 
+PASSED=""
+for cell in $CELLS; do
+  if wait "${SMOKE_PID[$cell]}"; then
+    PASSED="$PASSED $cell"
+    say "  PASS $cell"
+  else
+    cp "$STATE/smoke-$cell.log" "$FAIL/smoke-$cell-codex.log"
+    say "  FAIL $cell -> $FAIL/smoke-$cell-codex.log"
+  fi
+done
 PASSED="${PASSED# }"
 if [ -z "$PASSED" ]; then
-  say "!!! 통과한 셀이 없다. 아무것도 학습시키지 않는다."
-  exit 1
-fi
-say "통과: $PASSED"
-
-# ---- 3) tmux 실행 ----------------------------------------------------------
-if tmux has-session -t "$SESSION" 2>/dev/null; then
-  say "!!! tmux 세션 '$SESSION'이 이미 있다: tmux kill-session -t $SESSION"
-  exit 1
-fi
-if [ -z "${CONDA_PREFIX:-}" ]; then
-  say "!!! conda 환경 없음. 'conda activate k1goalpose' 후 재실행."
+  say "no cell passed smoke; nothing launched"
   exit 1
 fi
 
-# tmux windows inherit the tmux SERVER's environment, not this shell's, and that
-# server predates the conda activation -- without this prelude isaacgym cannot
-# find libpython3.8.so.1.0.
-CONDA_BASE="$(conda info --base 2>/dev/null || echo "${CONDA_PREFIX%/envs/*}")"
-ENV_NAME="${CONDA_DEFAULT_ENV:-$(basename "$CONDA_PREFIX")}"
-PRELUDE="source '$CONDA_BASE/etc/profile.d/conda.sh' && conda activate '$ENV_NAME' && export LD_LIBRARY_PATH='$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}' &&"
-
-launch() {  # cell gpu
-  local cell=$1 gpu=$2
-  # `python -u`: output behind `tee` is block-buffered otherwise, which made a
-  # healthy run look stalled for minutes during the v7 batch.
-  # TRAIN ONLY. train_and_eval_hbatch.sh runs seven evaluations (clean, force,
-  # jitter, combined, lateral, reverse, video) per run; across 4 cells x 5
-  # checkpoints that is 140 evaluations, i.e. the diagnostic would cost far more
-  # than the training it is diagnosing. compare_mcells.py instead runs ONE
-  # paired protocol over the checkpoints that matter, on both cards, and
-  # evaluates the shared model_0 exactly once.
-  local cmd="$PRELUDE cd $REPO_ROOT && python -u train_hbatch.py \
---task=K1/Goal_Pose_HBatch --config sweeps/mcells/${cell}.yaml --headless True \
---checkpoint $CKPT --num_envs $ENVS --max_iterations 200 \
---sim_device cuda:$gpu --rl_device cuda:$gpu 2>&1 | tee logs/mcells/${cell}.train.log"
-  if tmux has-session -t "$SESSION" 2>/dev/null; then
-    tmux new-window -t "$SESSION" -n "$cell" "$cmd; exec bash"
-  else
-    tmux new-session -d -s "$SESSION" -n "$cell" "$cmd; exec bash"
+train_one() { # cell gpu token health_path
+  local cell="$1" gpu="$2" token="$3" health="$4"
+  local log="$STATE/train-$cell.log"
+  HBATCH_HEALTH_MARKER="$health" \
+  HBATCH_HEALTH_TOKEN="$token" \
+  HBATCH_HEALTH_ITERATIONS=2 \
+  python -u train_hbatch.py \
+    --task K1/Goal_Pose_HBatch --config "sweeps/mcells/$cell.yaml" \
+    --headless True --checkpoint "$CKPT" --num_envs "$ENVS" \
+    --max_iterations "$ITERS" --sim_device "cuda:$gpu" --rl_device "cuda:$gpu" \
+    > "$log" 2>&1
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    cp "$log" "$FAIL/train-$cell-codex.log"
+    return "$rc"
   fi
-  say "  launched $cell on cuda:$gpu"
+  local run_dir
+  run_dir="$(sed -n -E 's|.*Saving model to (.*)/nn/model_[0-9]+\.pth.*|\1|p' "$log" | tail -1)"
+  if [ -z "$run_dir" ] || [ ! -d "$run_dir/nn" ]; then
+    cp "$log" "$FAIL/train-$cell-codex.log"
+    return 90
+  fi
+  cp "$CKPT" "$run_dir/nn/model_0.pth"
+  printf '%s\n' "$run_dir" > "$STATE/run-$cell.txt"
+  return 0
 }
 
-say "=== 실행 (2 GPU, 카드당 2셀 동시) ==="
+say "[3/5] train 4 cells concurrently (2 processes per A6000)"
+declare -A TRAIN_PID HEALTH TOKEN
 for cell in $PASSED; do
-  case "$cell" in
-    M0_control)  launch "$cell" 0 ;;
-    M2_jointdr)  launch "$cell" 0 ;;
-    M1_force)    launch "$cell" 1 ;;
-    M3_mirror)   launch "$cell" 1 ;;
-    *)           launch "$cell" 0 ;;
-  esac
+  gpu="$(gpu_for "$cell")"
+  TOKEN[$cell]="$RUN_ID-$cell"
+  HEALTH[$cell]="$STATE/health-$cell.json"
+  train_one "$cell" "$gpu" "${TOKEN[$cell]}" "${HEALTH[$cell]}" &
+  TRAIN_PID[$cell]=$!
+  say "  train $cell -> cuda:$gpu pid ${TRAIN_PID[$cell]}"
 done
 
-# ---- 4) 기동 확인 ----------------------------------------------------------
-say "기동 확인 (120s)..."
-sleep 120
-DEAD=""
+# Do not wait 25-40 minutes to discover a broken backward pass.  RunnerV3
+# atomically writes a signed marker after two full PPO iterations.
+say "  waiting up to ${HEALTH_TIMEOUT_S}s for two-iteration health markers"
+deadline=$((SECONDS + HEALTH_TIMEOUT_S))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  pending=0
+  for cell in $PASSED; do
+    [ -f "${HEALTH[$cell]}" ] || pending=$((pending + 1))
+  done
+  [ "$pending" -eq 0 ] && break
+  sleep 2
+done
+
+HEALTHY=""
 for cell in $PASSED; do
-  pid=$(tmux list-panes -t "$SESSION:$cell" -F '#{pane_pid}' 2>/dev/null | head -1)
-  if [ -n "$pid" ] && pstree -p "$pid" 2>/dev/null | grep -q python; then
-    say "  ✅ $cell 살아 있음"
+  if [ -f "${HEALTH[$cell]}" ] && python tools/verify_hbatch_health.py \
+      --marker "${HEALTH[$cell]}" --health_token "${TOKEN[$cell]}" \
+      --num_envs "$ENVS" --min_iterations 2 \
+      --expected_configured_lr 2e-6 --min_lr 5e-7 --max_lr 2e-6 \
+      > "$STATE/health-$cell.log" 2>&1; then
+    HEALTHY="$HEALTHY $cell"
+    say "  HEALTHY $cell"
   else
-    say "  ❌ $cell 죽었음"
-    DEAD="$DEAD $cell"
-    tmux capture-pane -p -t "$SESSION:$cell" 2>/dev/null | tail -25 \
-      > "logs/mcells/training_failures_${cell}.log"
+    say "  UNHEALTHY $cell -> $FAIL/health-$cell-codex.log"
+    cp "$STATE/health-$cell.log" "$FAIL/health-$cell-codex.log" 2>/dev/null || \
+      cp "$STATE/train-$cell.log" "$FAIL/health-$cell-codex.log"
+    kill "${TRAIN_PID[$cell]}" 2>/dev/null || true
   fi
 done
+HEALTHY="${HEALTHY# }"
+if [ -z "$HEALTHY" ]; then
+  say "no healthy cell; evaluation cancelled"
+  exit 1
+fi
 
-say ""
-say "=== 요약 ==="
-say "실행 중: ${PASSED}"
-[ -n "$DEAD" ] && say "죽음:$DEAD (로그: logs/mcells/training_failures_*.log)"
-say "진행:   tmux attach -t $SESSION"
-say "완료 후: python tools/compare_mcells.py"
-say ""
-say "예상 소요: 200 iter x 4셀, 카드당 2셀 동시 -> 약 25-40분"
+TRAINED=""
+for cell in $HEALTHY; do
+  if wait "${TRAIN_PID[$cell]}"; then
+    TRAINED="$TRAINED $cell"
+    say "  COMPLETE $cell"
+  else
+    say "  FAIL during training $cell -> $FAIL/train-$cell-codex.log"
+  fi
+done
+TRAINED="${TRAINED# }"
+if [ -z "$TRAINED" ]; then
+  say "no completed cell; evaluation cancelled"
+  exit 1
+fi
+
+say "[4/5] paired targeted evaluation (two persistent GPU queues)"
+python -u tools/compare_mcells.py \
+  --state_dir "$STATE" --cells $TRAINED \
+  > "$STATE/eval-and-report-codex.log" 2>&1
+EVAL_RC=$?
+if [ "$EVAL_RC" -ne 0 ]; then
+  cp "$STATE/eval-and-report-codex.log" "$FAIL/eval-codex.log"
+  say "evaluation/report failed -> $FAIL/eval-codex.log"
+  exit "$EVAL_RC"
+fi
+
+say "[5/5] COMPLETE"
+say "report: logs/mcells/compare/$(basename "$STATE")/mcell-report-codex.md"
+say "state:  $STATE"
+say "failures (only failed cells/stages): $FAIL"

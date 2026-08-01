@@ -1,68 +1,28 @@
-"""Generate the M-cell short factorial: disturbance / joint DR / mirror loss.
+#!/usr/bin/env python3
+"""Generate the short causal M-cell screen from the *actual* G1 run config.
 
-WHY THIS EXISTS
----------------
-The 2026-07-30 H batch trained four arms to 12000 iterations and the checkpoint
-selector picked `model_0.pth` -- the untouched G1 warm start -- for all four.
-Reading the four selection.md candidate tables side by side shows why, and it is
-the same curve every time:
+The H batch cannot identify disturbance, joint DR, or mirror effects: every
+arm changed a common bundle and every selector returned the untouched model 0.
+This screen keeps the G1 objective/path distribution and changes one lever per
+cell for only 200 PPO iterations:
 
-    iter |  H0    H1    H2    H3    (waypoint position median, cm)
-    -----+---------------------------------
-       0 |  7.3   7.3   7.3   7.3
-     100 | 10.7  12.3  13.2  10.5
-     200 | 12.4  14.7  13.5  13.9
-   2600+ | ~38   ~38   ~38   ~39
+  M0_control-codex    minimum-allowed G1 continuation
+  M1_force-codex      M0 + scenario-aware contact wrenches
+  M2_jointdr-codex    M0 + persistent encoder/target offsets
+  M3_mirror_off-codex M0 - G1's existing symmetry loss
 
-Position degrades monotonically from the first checkpoint while falls DROP
-(29 -> 0..15). That is the E2/G2 signature: the policy buys safety by moving
-less. It happened in H0 too, and H0 was supposed to be the control -- so the
-cause lives in the layer all four share, not in any arm's own intervention.
+G1 already trained with symmetry_coef=0.5.  Therefore adding 0.5 is not a
+mirror experiment; removing it is the causal ablation.  Transition mirror PPO
+augmentation remains off in every cell.
 
-Two consequences drive this file:
-
-1. The signal is already unambiguous at iteration 100. Training to 12000 to
-   learn it costs ~10 h/arm and taught us nothing extra. These cells stop at
-   200 and checkpoint at 0/25/50/100/200.
-2. Nobody ever ran "fine-tune G1 and change NOTHING". Without that cell we
-   cannot tell an intervention's cost from the cost of fine-tuning itself.
-   M0 is that cell, and every other cell is M0 plus exactly one lever.
-
-THE FACTORIAL
--------------
-    M0_control   G1 continued, every new lever off        <- the missing control
-    M1_force     + scenario-aware disturbance
-    M2_jointdr   + encoder bias and PD target offset
-    M3_mirror    + symmetry (mean-equivariance) loss
-
-Each cell differs from M0 by ONE lever, so each main effect is a paired
-difference against a control that shares the seed, the warm start and the
-protocol. This is deliberately NOT H1's design: H1 moved mirror loss, mirror
-augmentation, encoder bias, target offset and init-q sigma together, so its
-result cannot be attributed.
-
-Mirror *augmentation* is excluded on purpose. The transition-augmentation path
-computes its PPO denominator as log pi_old(Ma|Ms) while the samples are drawn
-from pi_old(a|s) (runner_v3.py:183-195, 295-298); those agree only if the old
-policy is already perfectly symmetric, so the ratio is biased by construction.
-M3 uses symmetry_coef only, which does not touch that path. Fix the denominator
-before asking whether augmentation helps.
-
-RAMP
-----
-`disturbance.ramp_steps` is counted in CONTROL steps. A 200-iteration run is
-200 * horizon(24) = 4800 control steps per env, so H0's inherited
-`ramp_steps: 12000` would leave the disturbance at ~40% of nominal for the whole
-experiment -- the treatment would never actually be applied. M1 sets it to 1.
-Anything short must check this; it is silent otherwise.
-
-Usage (server, where PyYAML exists):
-    python tools/make_mcell_configs.py --checkpoint <G1 model_10700.pth>
-    python tools/make_mcell_configs.py --check      # verify committed files
+The base is deliberately the recorder's immutable G1 ``config.yaml``, not a
+current source YAML and not H0.  H0 changed path semantics, stop/stand rewards,
+noise, disturbances and the optimizer, so it is not a valid no-treatment base.
 """
 
 import argparse
 import copy
+import hashlib
 import os
 import sys
 
@@ -71,28 +31,37 @@ import yaml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-BASE = os.path.join(ROOT, "sweeps", "hbatch", "H0-codex.yaml")
+DEFAULT_BASE = os.path.join(
+    ROOT, "logs", "K1", "K1", "Goal_Pose_V7",
+    "2026-07-28-17-02-35_G1_speed", "config.yaml")
+TEMPLATE = os.path.join(ROOT, "sweeps", "hbatch", "H0-codex.yaml")
 OUTDIR = os.path.join(ROOT, "sweeps", "mcells")
 
+# Copied read-only from the completed server run.  A mismatch means the causal
+# base changed and must be reviewed instead of silently becoming a new M0.
+EXPECTED_G1_CONFIG_SHA256 = (
+    "5eb9aa12a46759624babe1b9d7a3c1c52028b2c3c5f243e6512cc7fa47e3910c")
 ITERATIONS = 200
 SAVE_INTERVAL = 25
-# 0/25/50/100/200 are the comparison points. 25 exists because H0 had already
-# lost 3.4 cm by iteration 100 and we need to see whether the loss starts
-# immediately or builds.
 CHECKPOINTS = (0, 25, 50, 100, 200)
 
-
-def deep_set(cfg, dotted, value):
-    node = cfg
-    parts = dotted.split(".")
-    for key in parts[:-1]:
-        if key not in node or not isinstance(node[key], dict):
-            node[key] = {}
-        node = node[key]
-    node[parts[-1]] = value
+CELLS = (
+    "M0_control-codex",
+    "M1_force-codex",
+    "M2_jointdr-codex",
+    "M3_mirror_off-codex",
+)
 
 
-def deep_get(cfg, dotted, default=None):
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def get(cfg, dotted, default=None):
     node = cfg
     for key in dotted.split("."):
         if not isinstance(node, dict) or key not in node:
@@ -101,159 +70,237 @@ def deep_get(cfg, dotted, default=None):
     return node
 
 
-# ---- the four cells -------------------------------------------------------
-#
-# COMMON is applied to every cell, including M0. It turns OFF everything the H
-# batch turned on, so M0 really is "G1, continued". Each cell then re-enables
-# exactly one thing.
+def put(cfg, dotted, value):
+    node = cfg
+    keys = dotted.split(".")
+    for key in keys[:-1]:
+        node = node.setdefault(key, {})
+    node[keys[-1]] = copy.deepcopy(value)
 
-COMMON = {
-    "basic.max_iterations": ITERATIONS,
-    "basic.save_interval": SAVE_INTERVAL,
-    # H3's heel_strike_ahead reward is dropped for good: the user's call, and
-    # the H3 selection table showed it neutral through iteration 100 (10.5 vs
-    # H0's 10.7) while carrying an overstride risk nobody measured.
-    "rewards.scales.heel_strike_ahead": 0.0,
-    # The cruise-stability reward is gated on a speed x steady-acceleration
-    # sigmoid, i.e. it is a schedule. Removed here so no cell contains an
-    # implicit curriculum -- if high-speed stability needs a reward, that is a
-    # separate question asked after the common layer is trusted again.
-    "rewards.scales.high_speed_stability": 0.0,
-    # mirror off by default; M3 re-enables the loss only
-    "algorithm.symmetry_coef": 0.0,
-    "algorithm.mirror_augmentation_coef": 0.0,
-    # disturbance off by default; M1 re-enables it
-    "randomization.disturbance.enabled": False,
-    # joint DR off by default; M2 re-enables it
-    "randomization.joint_encoder_bias.range": [0.0, 0.0],
-    "randomization.joint_target_offset.range": [0.0, 0.0],
-    # G1 never saw goal-observation noise. Leaving it on in "the control" would
-    # reproduce E2's collapse and blame it on fine-tuning.
-    "noise.goal_pos.range": [0.0, 0.0],
-    "noise.goal_heading.range": [0.0, 0.0],
-    "noise.goal_pos_bias.range": [0.0, 0.0],
-    "noise.goal_heading_bias.range": [0.0, 0.0],
-    "noise.goal_bt_flicker.prob_per_step": 0.0,
-}
 
-CELLS = {
-    "M0_control": {},
-    "M1_force": {
-        "randomization.disturbance.enabled": True,
-        # Scenario-aware sampling is already implemented in goal_pose_hbatch.py
-        # but no released config ever switched it on. It replaces the 40-150 N
-        # frontal-collision class -- which cannot happen to a robot that has a
-        # camera and does not run head-first into another one -- with the three
-        # contacts that actually occur: an omnidirectional shove, a push from
-        # behind at walking speed, and an arm snagging on another robot or the
-        # net. Height tiers put 90% of the wrench on chest/arm level.
-        "randomization.disturbance.scenario_aware.enabled": True,
-        # See module docstring: a 12000-step ramp inside a 4800-step run applies
-        # ~40% of the treatment and calls it a result.
-        "randomization.disturbance.ramp_steps": 1,
-        "randomization.disturbance.event_probability": 0.35,
-        "randomization.disturbance.interval_s": [6.0, 12.0],
-    },
-    "M2_jointdr": {
-        # The mild H0 dose, not H1's stronger one: H1 confounded this with
-        # mirror, so the mild level is the one with a clean prior.
-        "randomization.joint_encoder_bias.range": [-0.015, 0.015],
-        "randomization.joint_target_offset.range": [-0.010, 0.010],
-    },
-    "M3_mirror": {
+def zero_range(cfg, name):
+    node = cfg.setdefault("randomization", {}).setdefault(name, {})
+    node.update({
+        "range": [0.0, 0.0],
+        "operation": "additive",
+        "distribution": "uniform",
+    })
+
+
+def assert_g1_base(base, path, expected_sha):
+    problems = []
+    actual_sha = file_sha256(path)
+    if expected_sha and actual_sha != expected_sha:
+        problems.append("G1 config sha256 {} != frozen {}".format(
+            actual_sha, expected_sha))
+    expected = {
+        "basic.description": "G1_speed",
+        "asset.file": "resources/K1/K1_locomotion_armsdown.urdf",
+        "commands.path.speed_grid.enabled": True,
+        "randomization.disturbance.enabled": False,
+        "rewards.scales.stand_posture": 0.0,
+        "rewards.stop_ang_speed_threshold": 0.0,
         "algorithm.symmetry_coef": 0.5,
-        "algorithm.mirror_augmentation_coef": 0.0,   # see module docstring
-    },
-}
+    }
+    for key, value in expected.items():
+        if get(base, key) != value:
+            problems.append("{}={!r}, expected {!r}".format(
+                key, get(base, key), value))
+    for key in (
+            "noise.goal_pos.range", "noise.goal_heading.range",
+            "noise.goal_pos_bias.range", "noise.goal_heading_bias.range"):
+        if get(base, key) != [0.0, 0.0]:
+            problems.append("{} must be G1-clean [0,0]".format(key))
+    if float(get(base, "noise.goal_bt_flicker.prob_per_step", -1.0)) != 0.0:
+        problems.append("G1 goal flicker must be off")
+    if problems:
+        raise ValueError("invalid G1 causal base:\n  - " + "\n  - ".join(problems))
+    return actual_sha
 
 
-def build(base, name, checkpoint, seed):
+def scenario_disturbance(template, event_probability):
+    d = copy.deepcopy(template["randomization"]["disturbance"])
+    d.update({
+        "enabled": True,
+        "interval_s": [6.0, 12.0],
+        "event_probability": float(event_probability),
+        "ramp_steps": 1,
+        "high_speed_probability_boost": 1.0,
+        "body_names": [
+            "Trunk", "Left_Hip_Roll", "Right_Hip_Roll",
+            "Left_Shank", "Right_Shank",
+        ],
+        "scenario_aware": {"enabled": True},
+    })
+    return d
+
+
+def common(base, template, checkpoint, seed):
     cfg = copy.deepcopy(base)
-    for dotted, value in COMMON.items():
-        deep_set(cfg, dotted, value)
-    for dotted, value in CELLS[name].items():
-        deep_set(cfg, dotted, value)
-    deep_set(cfg, "basic.description", name)
-    deep_set(cfg, "basic.seed", seed)
+    put(cfg, "basic.task", "K1/Goal_Pose_HBatch")
+    put(cfg, "basic.max_iterations", ITERATIONS)
+    put(cfg, "basic.seed", int(seed))
     if checkpoint:
-        deep_set(cfg, "basic.checkpoint", checkpoint)
-    # Every cell must start from byte-identical weights or the paired
-    # difference is not paired.
-    deep_set(cfg, "algorithm.load_optimizer_state", False)
+        put(cfg, "basic.checkpoint", checkpoint)
+    # The reference arm angles are mandatory, so this is explicitly a
+    # minimum-allowed G1 continuation rather than a byte-identical dynamics run.
+    put(cfg, "asset.file", "resources/K1/K1_locomotion_hbatch-codex.urdf")
+    put(cfg, "runner.save_interval", SAVE_INTERVAL)
+    put(cfg, "runner.load_optimizer_state", False)
+    put(cfg, "runner.use_wandb", False)
+
+    # Fresh, conservative Adam.  All cells share this; the saved G1 Adam had an
+    # adaptive LR far above its declared value and is unsafe to restore.
+    put(cfg, "algorithm.learning_rate", 2.0e-6)
+    put(cfg, "algorithm.min_learning_rate", 5.0e-7)
+    put(cfg, "algorithm.max_learning_rate", 2.0e-6)
+    put(cfg, "algorithm.desired_kl", 0.003)
+    put(cfg, "algorithm.finite_checks", True)
+    put(cfg, "algorithm.max_abs_log_ratio", 10.0)
+    put(cfg, "algorithm.mirror_augmentation_coef", 0.0)
+    put(cfg, "algorithm.mirror_augmentation_max_std", 5.0)
+    put(cfg, "algorithm.mirror_augmentation_min_valid_share", 0.90)
+
+    # Diagnostic cells omit all legacy/global wrench sources.  Production
+    # candidates re-enable a low mandatory scenario dose only after this screen.
+    for name in ("push_force", "push_torque", "kick_lin_vel", "kick_ang_vel"):
+        zero_range(cfg, name)
+    put(cfg, "randomization.disturbance",
+        scenario_disturbance(template, event_probability=0.0))
+    put(cfg, "randomization.disturbance.enabled", False)
+    put(cfg, "randomization.joint_encoder_bias", {
+        "range": [0.0, 0.0], "operation": "additive",
+        "distribution": "uniform"})
+    put(cfg, "randomization.joint_target_offset", {
+        "range": [0.0, 0.0], "operation": "additive",
+        "distribution": "uniform"})
+
+    # HBatch-only reward methods must exist in the table but remain off.
+    put(cfg, "rewards.scales.heel_strike_ahead", 0.0)
+    put(cfg, "rewards.scales.high_speed_stability", 0.0)
+    put(cfg, "rewards.heel_strike", copy.deepcopy(
+        template["rewards"].get("heel_strike", {})))
+    put(cfg, "rewards.high_speed_stability", copy.deepcopy(
+        template["rewards"].get("high_speed_stability", {})))
+
+    # One frozen exam for every policy.  Replace its old two-class force with
+    # the same scenario model, at a held-out probability independent of M1's
+    # training dose.  Clean/joint evals explicitly disable it.
+    put(cfg, "evaluation", copy.deepcopy(template["evaluation"]))
+    put(cfg, "evaluation.hbatch_common_eval.disturbance",
+        scenario_disturbance(template, event_probability=0.50))
+    put(cfg, "evaluation.mcell_protocol", {
+        "version": "2026-08-01-codex-v1",
+        "base_config_sha256": EXPECTED_G1_CONFIG_SHA256,
+        "iterations": list(CHECKPOINTS),
+        "diagnostic_only": True,
+    })
     return cfg
 
 
-def verify(cfg, name):
-    """Fail loudly on the things that would silently void the experiment."""
+def build(base, template, name, checkpoint, seed):
+    cfg = common(base, template, checkpoint, seed)
+    put(cfg, "basic.description", name.replace("-codex", "_codex"))
+    if name == "M1_force-codex":
+        put(cfg, "randomization.disturbance",
+            scenario_disturbance(template, event_probability=0.35))
+    elif name == "M2_jointdr-codex":
+        put(cfg, "randomization.joint_encoder_bias.range", [-0.015, 0.015])
+        put(cfg, "randomization.joint_target_offset.range", [-0.010, 0.010])
+    elif name == "M3_mirror_off-codex":
+        put(cfg, "algorithm.symmetry_coef", 0.0)
+    return cfg
+
+
+def verify(cfg, name, base):
     problems = []
-    if deep_get(cfg, "basic.max_iterations") != ITERATIONS:
-        problems.append("max_iterations != {}".format(ITERATIONS))
-    if deep_get(cfg, "algorithm.load_optimizer_state", False):
-        problems.append("load_optimizer_state must be False (G1's saved Adam LR "
-                        "is 1.71e-4, 34x the declared 5e-6)")
-    if deep_get(cfg, "randomization.disturbance.enabled", False):
-        horizon = int(deep_get(cfg, "algorithm.horizon_length", 24) or 24)
-        ramp = int(deep_get(cfg, "randomization.disturbance.ramp_steps", 1) or 1)
-        budget = ITERATIONS * horizon
-        if ramp > budget // 4:
-            problems.append(
-                "ramp_steps {} vs {} control steps in the run: the disturbance "
-                "never reaches nominal".format(ramp, budget))
-    # exactly one lever off the control
-    levers = sum([
-        bool(deep_get(cfg, "randomization.disturbance.enabled", False)),
-        float(deep_get(cfg, "randomization.joint_encoder_bias.range", [0, 0])[1] or 0) > 0,
-        float(deep_get(cfg, "algorithm.symmetry_coef", 0.0) or 0.0) > 0,
-        float(deep_get(cfg, "algorithm.mirror_augmentation_coef", 0.0) or 0.0) > 0,
-    ])
-    expected = 0 if name == "M0_control" else 1
-    if levers != expected:
-        problems.append("{} active levers, expected {}".format(levers, expected))
+    if get(cfg, "basic.max_iterations") != ITERATIONS:
+        problems.append("max_iterations")
+    if get(cfg, "runner.save_interval") != SAVE_INTERVAL:
+        problems.append("runner.save_interval")
+    if get(cfg, "runner.load_optimizer_state") is not False:
+        problems.append("runner.load_optimizer_state")
+    if get(cfg, "algorithm.mirror_augmentation_coef") != 0.0:
+        problems.append("mirror augmentation must remain off")
+    if get(cfg, "commands") != get(base, "commands"):
+        problems.append("G1 command/path distribution drifted")
+    if get(cfg, "noise") != get(base, "noise"):
+        problems.append("G1 observation-noise distribution drifted")
+    force = bool(get(cfg, "randomization.disturbance.enabled", False))
+    joint = get(cfg, "randomization.joint_encoder_bias.range") != [0.0, 0.0]
+    mirror_off = float(get(cfg, "algorithm.symmetry_coef", 0.0)) == 0.0
+    expected = {
+        "M0_control-codex": (False, False, False),
+        "M1_force-codex": (True, False, False),
+        "M2_jointdr-codex": (False, True, False),
+        "M3_mirror_off-codex": (False, False, True),
+    }[name]
+    if (force, joint, mirror_off) != expected:
+        problems.append("lever tuple {} != {}".format(
+            (force, joint, mirror_off), expected))
+    if force:
+        if not get(cfg, "randomization.disturbance.scenario_aware.enabled", False):
+            problems.append("scenario force not enabled")
+        horizon = int(get(cfg, "runner.horizon_length", 24))
+        if int(get(cfg, "randomization.disturbance.ramp_steps", 0)) > (
+                ITERATIONS * horizon // 4):
+            problems.append("force ramp exceeds short-run budget")
+    for legacy in ("push_force", "push_torque", "kick_lin_vel", "kick_ang_vel"):
+        if get(cfg, "randomization.{}.range".format(legacy)) != [0.0, 0.0]:
+            problems.append("legacy source {} is nonzero".format(legacy))
     return problems
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", default=None,
-                    help="G1 warm start, e.g. logs/.../G1_speed/nn/model_10700.pth")
+    ap.add_argument("--base_config", default=DEFAULT_BASE)
+    ap.add_argument("--template_config", default=TEMPLATE)
+    ap.add_argument("--checkpoint")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--check", action="store_true",
-                    help="verify the committed files instead of writing them")
+    ap.add_argument("--expected_base_sha", default=EXPECTED_G1_CONFIG_SHA256)
+    ap.add_argument("--check", action="store_true")
     args = ap.parse_args()
 
-    with open(BASE) as fh:
-        base = yaml.safe_load(fh)
-
-    if not os.path.isdir(OUTDIR):
-        os.makedirs(OUTDIR)
+    with open(args.base_config, encoding="utf-8") as f:
+        base = yaml.safe_load(f)
+    with open(args.template_config, encoding="utf-8") as f:
+        template = yaml.safe_load(f)
+    try:
+        base_sha = assert_g1_base(
+            base, args.base_config, args.expected_base_sha or None)
+    except ValueError as exc:
+        print("INVALID {}".format(exc), file=sys.stderr)
+        return 1
+    os.makedirs(OUTDIR, exist_ok=True)
 
     bad = 0
     for name in CELLS:
+        cfg = build(base, template, name, args.checkpoint, args.seed)
+        problems = verify(cfg, name, base)
         path = os.path.join(OUTDIR, name + ".yaml")
-        cfg = build(base, name, args.checkpoint, args.seed)
-        problems = verify(cfg, name)
-        for p in problems:
-            print("INVALID {}: {}".format(name, p))
-            bad += 1
+        if problems:
+            bad += len(problems)
+            for problem in problems:
+                print("INVALID {}: {}".format(name, problem), file=sys.stderr)
+            continue
         if args.check:
-            if not os.path.exists(path):
-                print("MISSING {}".format(path))
-                bad += 1
-                continue
-            with open(path) as fh:
-                on_disk = yaml.safe_load(fh)
-            if on_disk != cfg:
-                print("DRIFT   {} differs from the generator".format(path))
+            if not os.path.isfile(path):
+                print("MISSING {}".format(path), file=sys.stderr)
                 bad += 1
             else:
-                print("ok      {}".format(os.path.relpath(path, ROOT)))
+                with open(path, encoding="utf-8") as f:
+                    disk = yaml.safe_load(f)
+                if disk != cfg:
+                    print("DRIFT {}".format(path), file=sys.stderr)
+                    bad += 1
+                else:
+                    print("ok {}".format(os.path.relpath(path, ROOT)))
         else:
-            with open(path, "w") as fh:
-                yaml.safe_dump(cfg, fh, sort_keys=False, default_flow_style=False)
-            print("wrote   {}".format(os.path.relpath(path, ROOT)))
-
-    print("\ncheckpoints saved at iterations: {}".format(
-        ", ".join(str(c) for c in CHECKPOINTS)))
+            with open(path, "w", encoding="utf-8") as f:
+                yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
+            print("wrote {}".format(os.path.relpath(path, ROOT)))
+    print("base sha256 {}".format(base_sha))
+    print("checkpoints {}".format(",".join(map(str, CHECKPOINTS))))
     return 1 if bad else 0
 
 
