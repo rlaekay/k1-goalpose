@@ -771,6 +771,37 @@ class Controller:
                                "CUSTOM without knowing the current mode" % age)
         if mode == RobotModeId.PREPARE:
             return
+
+        # A robot that is down cannot be stood up with ChangeMode(kPrepare) --
+        # that is not the get-up routine, so the request would simply time out.
+        # Get it up first. Measured on hardware: HAS_FALLEN -> IS_READY in 8.0 s.
+        if self.fall_monitor is not None and self.fall_monitor.available:
+            fstate, recov_ok, fage = self.fall_monitor.snapshot()
+            if fage < 5.0 and fstate == FallState.HAS_FALLEN:
+                if not recov_ok:
+                    raise RuntimeError(
+                        "robot has fallen and the SDK reports get-up unavailable; "
+                        "stand it up manually before starting")
+                self.logger.warning("[mode-gate] robot has fallen -- calling GetUp "
+                                    "before CUSTOM entry")
+                try:
+                    self.client.SendApiRequest(B1LocoApiId(API_ID_GET_UP), "")
+                except Exception as exc:
+                    raise RuntimeError("GetUp call failed: %s" % exc)
+                up_deadline = time.monotonic() + float(rec.get("getup_timeout_s", 20.0))
+                while time.monotonic() < up_deadline:
+                    time.sleep(0.3)
+                    fstate, _ok, fage = self.fall_monitor.snapshot()
+                    if fage < 5.0 and fstate == FallState.IS_READY:
+                        self.logger.info("[mode-gate] get-up complete")
+                        break
+                else:
+                    raise RuntimeError("robot did not stand up within the get-up "
+                                       "timeout; refusing to enter CUSTOM")
+                time.sleep(float(rec.get("prepare_settle_s", 1.0)))
+                mode, age = self.mode_monitor.snapshot()
+                if age < 5.0 and mode == RobotModeId.PREPARE:
+                    return
         if mode == RobotModeId.CUSTOM:
             self.logger.info("[mode-gate] already in CUSTOM")
             return
