@@ -18,7 +18,7 @@ mkdir -p "$DST"
 echo "서버 $HOST:$PORT"
 echo "  $SRC"
 echo "  -> $DST"
-rsync -avz --partial --info=progress2 -e "ssh -p $PORT" \
+rsync -avz --partial -e "ssh -p $PORT" \
       "${INC[@]}" --exclude='*' "$HOST:$SRC" "$DST"
 echo
 echo "완료. 최근 리포트:"
