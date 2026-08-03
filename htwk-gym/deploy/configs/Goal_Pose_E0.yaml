@@ -51,7 +51,7 @@ common:
   ]
 
 policy:
-  policy_path: "./models/goal_pose_e0.pt"   # actor-only TorchScript from export_model.py
+  policy_path: "./models/goal_pose_i2a.pt"   # actor-only TorchScript from export_model.py
   num_actions: 12
   num_observations: 54
   leg_dof_start: 10          # first leg index in the 22-joint vector

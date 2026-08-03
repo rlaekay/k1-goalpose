@@ -82,6 +82,12 @@ fi
 SERVER_PORT="${SERVER_PORT:-22}"
 ROBOT_PORT="${ROBOT_PORT:-22}"
 CONDA_ENV="${CONDA_ENV:-k1goalpose}"
+# Resolve a python on the server without relying on conda being on PATH.
+if [ -n "${CONDA_BASE:-}" ]; then
+  SERVER_PY="${CONDA_BASE}/envs/${CONDA_ENV}/bin/python"
+else
+  SERVER_PY="python"
+fi
 
 SSH_OPTS=()
 SCP_OPTS=()
@@ -92,15 +98,22 @@ fi
 
 run_server() {
   if [ "${DRY_RUN}" -eq 1 ]; then printf '  [dry-run] server$ %s\n' "$*"; return 0; fi
-  ssh "${SSH_OPTS[@]}" -p "${SERVER_PORT}" "${SERVER}" "$@"
+  ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -p "${SERVER_PORT}" "${SERVER}" "$@"
 }
 run_robot() {
   if [ "${DRY_RUN}" -eq 1 ]; then printf '  [dry-run] robot$ %s\n' "$*"; return 0; fi
   ssh -p "${ROBOT_PORT}" "${ROBOT}" "$@"
 }
 
-PT_PATH="${CHECKPOINT%.pth}.pt"
-FROZEN_CONFIG="$(dirname "$(dirname "${CHECKPOINT}")")/config.yaml"
+# Resolve to absolute paths. A relative --checkpoint is convenient (it is what
+# you type on the server, from htwk-gym/), but ssh and scp both start in the
+# home directory, so anything relative silently misses.
+case "${CHECKPOINT}" in
+  /*) CKPT_ABS="${CHECKPOINT}" ;;
+  *)  CKPT_ABS="${SERVER_REPO}/htwk-gym/${CHECKPOINT}" ;;
+esac
+PT_PATH="${CKPT_ABS%.pth}.pt"
+FROZEN_CONFIG="$(dirname "$(dirname "${CKPT_ABS}")")/config.yaml"
 
 echo
 info "policy   : ${POLICY_NAME}"
@@ -114,9 +127,7 @@ if [ "${SKIP_EXPORT}" -eq 0 ]; then
   info "1/5 exporting on server (${SERVER})"
   run_server "set -e
     cd '${SERVER_REPO}/htwk-gym'
-    source \"\$(conda info --base)/etc/profile.d/conda.sh\" 2>/dev/null || true
-    conda activate '${CONDA_ENV}' 2>/dev/null || true
-    python export_model.py --task '${TASK}' --checkpoint '${CHECKPOINT}'
+    '${SERVER_PY}' export_model.py --task '${TASK}' --checkpoint '${CKPT_ABS}'
   "
 else
   info "1/5 skipping export (--skip-export)"
@@ -126,9 +137,7 @@ fi
 info "2/5 verifying exported actor is (1,54) -> (1,12) and finite"
 run_server "set -e
   cd '${SERVER_REPO}/htwk-gym'
-  source \"\$(conda info --base)/etc/profile.d/conda.sh\" 2>/dev/null || true
-  conda activate '${CONDA_ENV}' 2>/dev/null || true
-  python - <<'PY'
+  '${SERVER_PY}' - <<'PY'
 import torch
 m = torch.jit.load('${PT_PATH}', map_location='cpu').eval()
 with torch.inference_mode():
@@ -174,12 +183,27 @@ if [ "${DRY_RUN}" -eq 0 ]; then
     warn "could not read frozen config at ${FROZEN_CONFIG}; comparing against hardware only"
     SERVER_FROZEN="{}"
   fi
-  CHECK_ARGS=(--deploy-config "${REPO_ROOT}/htwk-gym/deploy/configs/${DEPLOY_CONFIG}"
-              --frozen-config -)
-  [ -n "${LAYOUT_LOCAL}" ] && CHECK_ARGS+=(--robot-layout "${LAYOUT_LOCAL}")
   CHECK_RC=0
-  printf '%s' "${SERVER_FROZEN}" | python3 "${SCRIPT_DIR}/check_policy_contract.py" \
-      "${CHECK_ARGS[@]}" || CHECK_RC=$?
+  if python3 -c "import yaml" 2>/dev/null; then
+    CHECK_ARGS=(--deploy-config "${REPO_ROOT}/htwk-gym/deploy/configs/${DEPLOY_CONFIG}"
+                --frozen-config -)
+    [ -n "${LAYOUT_LOCAL}" ] && CHECK_ARGS+=(--robot-layout "${LAYOUT_LOCAL}")
+    printf '%s' "${SERVER_FROZEN}" | python3 "${SCRIPT_DIR}/check_policy_contract.py" \
+        ${CHECK_ARGS[@]+"${CHECK_ARGS[@]}"} || CHECK_RC=$?
+  else
+    # No PyYAML here (this Mac cannot reach PyPI). Run the check on the robot,
+    # which has PyYAML and already holds the layout dump.
+    info "      (no local PyYAML -- running the contract check on the robot)"
+    printf '%s' "${SERVER_FROZEN}" | run_robot "cat > /tmp/frozen_config.yaml"
+    scp -q -P "${ROBOT_PORT}" "${SCRIPT_DIR}/check_policy_contract.py" \
+        "${ROBOT}:${ROBOT_WS}/" 2>/dev/null || true
+    scp -q -P "${ROBOT_PORT}" "${REPO_ROOT}/htwk-gym/deploy/configs/${DEPLOY_CONFIG}" \
+        "${ROBOT}:/tmp/deploy_config.yaml" 2>/dev/null || true
+    run_robot "cd '${ROBOT_WS}' && python3 check_policy_contract.py \
+        --frozen-config /tmp/frozen_config.yaml \
+        --deploy-config /tmp/deploy_config.yaml \
+        --robot-layout /tmp/robot_layout.json" || CHECK_RC=$?
+  fi
   [ -n "${LAYOUT_LOCAL}" ] && rm -f "${LAYOUT_LOCAL}"
   if [ "${CHECK_RC}" -ne 0 ]; then
     if [ "${FORCE}" -eq 1 ]; then
@@ -209,7 +233,7 @@ else
   trap 'rm -f "${TMP_LOCAL}"' EXIT
   # Relay through this machine: the server usually has no route to the robot's
   # private network.
-  scp "${SCP_OPTS[@]}" -P "${SERVER_PORT}" "${SERVER}:${PT_PATH}" "${TMP_LOCAL}"
+  scp ${SCP_OPTS[@]+"${SCP_OPTS[@]}"} -P "${SERVER_PORT}" "${SERVER}:${PT_PATH}" "${TMP_LOCAL}"
   scp -P "${ROBOT_PORT}" "${TMP_LOCAL}" "${ROBOT}:${DEST}"
 fi
 
