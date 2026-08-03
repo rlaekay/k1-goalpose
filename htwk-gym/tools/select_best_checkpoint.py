@@ -364,6 +364,11 @@ def main():
     p.add_argument("--tail_frac", type=float, default=0.6,
                    help="search the last X of the iteration range (early checkpoints are never best)")
     p.add_argument("--include", default="", help="comma-separated iterations to force into the candidate set")
+    p.add_argument("--terrain", choices=["as_trained", "plane"], default=None,
+                   help="지형만 덮어쓴다. 기본은 arm의 자기 config -- 그래서 I2b_terrain은 "
+                        "자기 trimesh 위에서 채점됐다. 평지에서 비교하려면 plane. "
+                        "--config로 다른 yaml을 통째로 주는 것과 다르다: 그쪽은 지형뿐 "
+                        "아니라 goal_mode_mixture 같은 과제 자체를 바꿔버린다.")
     p.add_argument("--sim_device")
     p.add_argument("--rl_device")
     p.add_argument("--seed", type=int, default=0)
@@ -412,6 +417,15 @@ def main():
         config_path = os.path.join("envs", "{}.yaml".format(args.task))
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.load(f.read(), Loader=yaml.FullLoader)
+    # The ground is part of the exam, not part of the policy -- the same rule
+    # eval_goal_pose.py:648 already applies. Overriding ONLY terrain keeps the
+    # task identical; swapping the whole yaml does not.
+    if args.terrain:
+        os.environ["EVAL_TERRAIN"] = args.terrain
+        if args.terrain == "plane":
+            cfg.setdefault("terrain", {})["type"] = "plane"
+        print("terrain: {} (config {} 그대로, 지형만 덮어씀)".format(
+            args.terrain, os.path.basename(config_path)))
     eval_cfg = cfg.setdefault("evaluation", {})
     hbatch_profile = bool(eval_cfg.get("hbatch_gates"))
     num_envs = args.num_envs or eval_cfg.get("num_envs", 256)
