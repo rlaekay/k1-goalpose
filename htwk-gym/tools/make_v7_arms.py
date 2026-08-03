@@ -32,7 +32,13 @@ import argparse
 import copy
 import os
 
-import yaml
+# yaml is only needed to WRITE configs. Importing it at module scope made
+# `--gpu-of` (and therefore the pre-launch arm check) fail on any machine
+# without PyYAML, which is exactly where you want that check to still run.
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 BASE = os.path.join("envs", "K1", "Goal_Pose_V7.yaml")
 BASE_V8 = os.path.join("envs", "K1", "Goal_Pose_V8.yaml")
@@ -249,10 +255,24 @@ I_ARMS = {
 # save_interval 100 gave R0 exactly two checkpoints (0 and 200), so watch_eval
 # scored one of them and the stop rule could only fire at the very end -- the
 # early-stop budget was zero. 25 gives eight scoring points across the round.
-_I1_BASE = dict(**_OFF_PATH, **_OFF_ROBUST, **_OFF_PROTECT,
-                **{"asset.feet_edge_pos": FOOT_EDGE_REAL,
-                   "rewards.base_height_target": 0.55,
-                   "runner.save_interval": 25})
+def merge(*layers):
+    """Later layers override earlier ones.
+
+    dict(**a, **b) raises on a shared key, and the robustness levers legitimately
+    re-specify keys that _OFF_ROBUST already sets to their off value -- that is
+    the whole point of a lever. Overriding must be allowed and must be explicit
+    about who wins.
+    """
+    out = {}
+    for d in layers:
+        out.update(d)
+    return out
+
+
+_I1_BASE = merge(_OFF_PATH, _OFF_ROBUST, _OFF_PROTECT,
+                 {"asset.feet_edge_pos": FOOT_EDGE_REAL,
+                  "rewards.base_height_target": 0.55,
+                  "runner.save_interval": 25})
 # Low dose. E2 and G2 both collapsed to a near-stationary policy when the whole
 # robustness bundle went on at once, so this turns on ONLY the two-class contact
 # wrench -- no goal jitter, no bias, no flicker, no staleness.
@@ -267,10 +287,10 @@ _I1_FORCE = {
 _I1_CADENCE = {"commands.cadence_coupling.enabled": True}
 
 I1_ARMS = {
-    "I1a_base": dict(_I1_BASE),
-    "I1b_force": dict(**_I1_BASE, **_I1_FORCE),
-    "I1c_cadence": dict(**_I1_BASE, **_I1_CADENCE),
-    "I1d_both": dict(**_I1_BASE, **_I1_FORCE, **_I1_CADENCE),
+    "I1a_base": merge(_I1_BASE),
+    "I1b_force": merge(_I1_BASE, _I1_FORCE),
+    "I1c_cadence": merge(_I1_BASE, _I1_CADENCE),
+    "I1d_both": merge(_I1_BASE, _I1_FORCE, _I1_CADENCE),
 }
 
 ARMS_ON_E0 = {"I0a_repro", "I0b_foot", "I0c_h055", "I0d_h058",
@@ -319,6 +339,11 @@ def default_checkpoint(arm):
                              or arm in V8_ARMS) else DEFAULT_CKPT
 
 
+def _need_yaml():
+    if yaml is None:
+        raise SystemExit('PyYAML이 필요하다: pip install pyyaml')
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", default=None,
@@ -332,10 +357,13 @@ def main():
     ap.add_argument("--only", help="generate just this arm")
     args = ap.parse_args()
     if args.gpu_of:
+        # Reaching here proves every arm dict above was built without a
+        # duplicate-key TypeError -- the failure that killed the I1 launch.
         print(GPU_OF.get(args.gpu_of, 'cuda:0').split(':')[-1])
         return 0
 
 
+    _need_yaml()
     arms = ALL_ARMS if not args.only else {args.only: ALL_ARMS[args.only]}
     with open(BASE, "r", encoding="utf-8") as f:
         base_v7 = yaml.load(f.read(), Loader=yaml.FullLoader)

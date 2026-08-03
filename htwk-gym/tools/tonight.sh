@@ -66,6 +66,7 @@ nvidia-smi --query-compute-apps=pid,used_memory --format=csv 2>/dev/null | sed '
 # ---- 2) 정적 검사 (즉시, GPU 불필요) ---------------------------------------
 # ---- 모니터: 서버가 headless라 이게 없으면 진행 상황을 볼 방법이 없다 --------
 # 이미 떠 있으면 다시 띄우지 않는다. 폴링 전용이라 죽어도 학습에는 영향이 없다.
+PY="${PY:-python}"        # conda 환경엔 `python`이 있고, 맥 로컬 검증엔 PY=python3
 MON_PORT="${MON_PORT:-8420}"
 SRV_IP=$(hostname -I 2>/dev/null | awk '{print $1}'); SRV_IP="${SRV_IP:-localhost}"
 if [ "$DRYRUN" = "1" ]; then
@@ -95,7 +96,18 @@ say "이름 검사 통과"
 
 # ---- 3) arm별 config 생성 + 스모크 -----------------------------------------
 if [ "$DRYRUN" = "1" ]; then
-  say "DRYRUN: 여기까지 변수/문구 검사 통과. GPU 작업은 건너뛴다."
+  # Force make_v7_arms to import and build every arm dict. The I1 arms died at
+  # import time on a duplicate key (dict(**a, **b) with a shared lever), and
+  # nothing before the GPU had touched that module -- so the failure surfaced
+  # 28 minutes into a launch instead of in one second here.
+  for a in $ARMS; do
+    if ! "$PY" tools/make_v7_arms.py --gpu-of "$a" >/dev/null; then
+      say "!!! DRYRUN: $a — make_v7_arms 임포트/구성 실패"
+      "$PY" tools/make_v7_arms.py --gpu-of "$a" 2>&1 | tail -5
+      exit 1
+    fi
+  done
+  say "DRYRUN: 변수/문구 + arm 구성 검사 통과. GPU 작업은 건너뛴다."
   exit 0
 fi
 
