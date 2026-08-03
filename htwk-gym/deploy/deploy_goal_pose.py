@@ -31,6 +31,7 @@ import yaml
 
 from booster_robotics_sdk_python import (
     ChannelFactory,
+    B1LocoApiId,
     B1LocoClient,
     B1LowCmdPublisher,
     B1LowStateSubscriber,
@@ -40,7 +41,7 @@ from booster_robotics_sdk_python import (
     RobotMode,
 )
 
-from utils.command import create_prepare_cmd, create_first_frame_rl_cmd
+from utils.command import create_prepare_cmd, create_first_frame_rl_cmd, init_Cmd_T1
 from utils.remote_control_service import RemoteControlService
 from utils.rotate import rotate_vector_inverse_rpy
 from utils.timer import TimerConfig, Timer
@@ -184,6 +185,108 @@ class RosGoalSource:
             self._spin.join(timeout=1.0)
 
 
+# LocoApiId values the Python binding does not expose by name. B1LocoApiId(int)
+# constructs fine, so these are reachable even though only kChangeMode/kMove/
+# kRotateHead appear in the enum.
+API_ID_GET_UP = 2008
+API_ID_GET_UP_WITH_MODE = 2025
+
+
+class FallState:
+    """Mirrors booster_interface FallDownStateType."""
+    IS_READY = 0
+    IS_FALLING = 1
+    HAS_FALLEN = 2
+    IS_GETTING_UP = 3
+
+    NAMES = {0: "IS_READY", 1: "IS_FALLING", 2: "HAS_FALLEN", 3: "IS_GETTING_UP"}
+
+
+class FallMonitor:
+    """Authoritative fall state from the SDK, over ROS.
+
+    /fall_down_recovery_state is booster_msgs/RawBytesMsg carrying a 3-byte
+    struct (see brain types.h RobotRecoveryStateData):
+        uint8 state, uint8 is_recovery_available, uint8 current_planner_index
+
+    Measured at ~1 Hz on hardware, which is far too slow to *trigger* a stop --
+    the IMU watchdog at 500 Hz does that. This exists for the part the IMU
+    cannot tell us: whether the robot has settled into HAS_FALLEN, and whether
+    the SDK is willing to run its get-up (is_recovery_available). Calling GetUp
+    when it is not available just fails.
+    """
+
+    def __init__(self, topic="/fall_down", raw_topic="/fall_down_recovery_state",
+                 node=None, logger=None):
+        self.logger = logger or logging.getLogger(__name__)
+        self.available = False
+        self.state = None
+        self.is_recovery_available = False
+        self.planner_index = None
+        self.last_update = 0.0
+        self._lock = threading.Lock()
+        self._own_node = None
+        self._spin = None
+
+        try:
+            import rclpy
+            from rclpy.node import Node
+            # Both live in booster_interface (not booster_msgs, which only has
+            # the RPC types). /fall_down is a typed FallDownState; the raw
+            # variant carries the same thing as 3 bytes and is subscribed too so
+            # a single dead publisher cannot blind the recovery path.
+            from booster_interface.msg import FallDownState, RawBytesMsg
+        except ImportError as exc:
+            self.logger.warning(
+                "FallMonitor disabled (%s). Recovery will rely on the IMU "
+                "watchdog alone and will not know when get-up is permitted.", exc)
+            return
+
+        if node is None:
+            if not rclpy.ok():
+                rclpy.init(args=None)
+            node = Node("e0_fall_monitor")
+            self._own_node = node
+        node.create_subscription(FallDownState, topic, self._cb_typed, 10)
+        node.create_subscription(RawBytesMsg, raw_topic, self._cb_raw, 10)
+        if self._own_node is not None:
+            self._spin = threading.Thread(
+                target=lambda: rclpy.spin(self._own_node), daemon=True)
+            self._spin.start()
+        self.available = True
+        self.logger.info("FallMonitor subscribed to %s (typed) and %s (raw)",
+                         topic, raw_topic)
+
+    def _store(self, state, recov, planner=None):
+        with self._lock:
+            self.state = int(state)
+            self.is_recovery_available = bool(recov)
+            if planner is not None:
+                self.planner_index = planner
+            self.last_update = time.monotonic()
+
+    def _cb_typed(self, msg):
+        self._store(msg.fall_down_state, msg.is_recovery_available)
+
+    def _cb_raw(self, msg):
+        raw = bytes(bytearray(msg.msg))
+        if len(raw) < 2:
+            return
+        self._store(raw[0], raw[1], raw[2] if len(raw) > 2 else None)
+
+    def snapshot(self):
+        with self._lock:
+            age = float("inf") if self.last_update <= 0 else time.monotonic() - self.last_update
+            return self.state, self.is_recovery_available, age
+
+    def close(self):
+        if self._own_node is not None:
+            try:
+                self._own_node.destroy_node()
+            except Exception:
+                pass
+
+
 class Controller:
     def __init__(self, cfg_file, goal_source_mode="ros", initial_goal=None,
                  goal_topic=None, debug_topic=None,
@@ -198,6 +301,16 @@ class Controller:
         self._prepare_q = None
         self._joint_layout_checked = False
 
+        # --- fall recovery ---------------------------------------------------
+        # RECOVER_NONE while the policy is driving; anything else means the
+        # policy is suspended and the recovery sequence owns the robot.
+        self._recovery_phase = "none"
+        self._recovery_reason = ""
+        self._recovery_t0 = 0.0
+        self._recovery_count = 0
+        self._fall_events = []
+        self._latest_rpy = np.zeros(3, dtype=np.float32)
+
         with open(cfg_file, "r", encoding="utf-8") as f:
             self.cfg = yaml.load(f.read(), Loader=yaml.FullLoader)
 
@@ -209,6 +322,13 @@ class Controller:
         # Load and contract-check the actor before creating SDK/remote-control
         # services. A missing or wrong model must fail without touching robot I/O.
         self.policy = GoalPosePolicy(cfg=self.cfg)
+
+        self.running_policy = True
+        rec_cfg = self.cfg.get("safety", {}).get("recovery", {})
+        self.fall_monitor = (FallMonitor(
+            topic=str(rec_cfg.get("fall_topic", "/fall_down")),
+            raw_topic=str(rec_cfg.get("fall_raw_topic", "/fall_down_recovery_state")),
+            logger=self.logger) if bool(rec_cfg.get("enable", True)) else None)
 
         self.goal_source_mode = goal_source_mode
         if goal_source_mode == "ros":
@@ -328,8 +448,15 @@ class Controller:
         rpy_limit = float(self.cfg.get("safety", {}).get("roll_pitch_limit_rad", 1.0))
         if (abs(low_state_msg.imu_state.rpy[0]) > rpy_limit or
                 abs(low_state_msg.imu_state.rpy[1]) > rpy_limit):
-            self.logger.warning("IMU base rpy too large: {}".format(low_state_msg.imu_state.rpy))
-            self.running = False
+            # This is the fast path: low_state runs at ~500 Hz, while the SDK's
+            # own fall topic publishes at 1 Hz. Waiting for that would mean up
+            # to a second of the policy still driving a robot that is going
+            # over. Previously this killed the process; now it hands off to the
+            # recovery sequence so the run can continue after a get-up.
+            self._request_recovery(
+                "imu_rpy roll=%.2f pitch=%.2f > %.2f rad"
+                % (low_state_msg.imu_state.rpy[0], low_state_msg.imu_state.rpy[1],
+                   rpy_limit))
         self.timer.tick_timer_if_sim()
         time_now = self.timer.get_time()
         for i, motor in enumerate(low_state_msg.motor_state_serial):
@@ -367,6 +494,8 @@ class Controller:
                 except Exception as exc:
                     self.logger.error("Failed to request DAMPING during cleanup: %s", exc)
 
+            if self.fall_monitor is not None:
+                self.fall_monitor.close()
             if hasattr(self.goal_source, "close"):
                 self.goal_source.close()
             self.remoteControlService.close()
@@ -451,6 +580,201 @@ class Controller:
             )
         return low_state_age
 
+    # ------------------------------------------------------------------ entry --
+    def _enter_custom_latched(self, ramp_s=None):
+        """Enter CUSTOM commanding the pose the robot is already in, then ramp.
+
+        Measured cost of the old path (prepare pose + prepare gains, snap):
+        0.53 rad of joint travel and 2.8 s to settle. Almost all of that is the
+        gap between what the robot happens to be holding and what we command at
+        the instant CUSTOM engages.
+
+        Latching the *measured* pose makes commanded == measured at t=0, so the
+        step is structurally zero no matter what pose we come from -- standing,
+        or straight out of a get-up. The move to the RL default pose and RL
+        gains then happens as a controlled ramp instead of a snap. Aligning the
+        static `prepare` block to the RL block would only help when the robot
+        happens to be in exactly that pose; this always helps.
+        """
+        rec = self.cfg.get("safety", {}).get("recovery", {})
+        ramp_s = float(rec.get("custom_entry_ramp_s", 0.6)) if ramp_s is None else ramp_s
+
+        self._require_fresh_low_state("before latched CUSTOM entry")
+        latched = np.array(self.dof_pos_latest[:self.joint_cnt], dtype=np.float32)
+
+        prep_stiff = np.asarray(self.cfg["prepare"]["stiffness"], dtype=np.float32)
+        prep_damp = np.asarray(self.cfg["prepare"]["damping"], dtype=np.float32)
+        rl_stiff = np.asarray(self.cfg["common"]["stiffness"], dtype=np.float32)
+        rl_damp = np.asarray(self.cfg["common"]["damping"], dtype=np.float32)
+        rl_q = np.asarray(self.cfg["common"]["default_qpos"], dtype=np.float32)
+
+        init_Cmd_T1(self.low_cmd)
+        for i in range(self.joint_cnt):
+            self.low_cmd.motor_cmd[i].q = float(latched[i])
+            self.low_cmd.motor_cmd[i].kp = float(prep_stiff[i])
+            self.low_cmd.motor_cmd[i].kd = float(prep_damp[i])
+        self.dof_target[:] = latched
+        self.filtered_dof_target[:] = latched
+        self._send_cmd(self.low_cmd)
+
+        self._custom_mode_started = True
+        t0 = time.monotonic()
+        # Do not block on the return value. Measured: 0.8 ms when the RPC
+        # round-trips, but exactly 1.000 s of dead timeout (rc=100) when it does
+        # not -- and the mode change still took effect every time. Completion is
+        # judged from joint behaviour below, not from this code.
+        try:
+            rc = self.client.ChangeMode(RobotMode.kCustom)
+        except Exception as exc:
+            rc = "exception: %s" % exc
+        self._custom_mode_entered_monotonic = time.monotonic()
+        self.logger.info("[mode-timing] ChangeMode(kCustom) rc=%s in %.3f s",
+                         rc, self._custom_mode_entered_monotonic - t0)
+
+        # Ramp pose and gains together. Keeping the command streaming through
+        # the transition is what makes it smooth; a single frame followed by
+        # silence leaves the robot on a stale target.
+        dt = float(self.cfg["common"]["dt"])
+        steps = max(1, int(ramp_s / dt))
+        for s in range(1, steps + 1):
+            a = s / steps
+            for i in range(self.joint_cnt):
+                self.low_cmd.motor_cmd[i].q = float((1 - a) * latched[i] + a * rl_q[i])
+                self.low_cmd.motor_cmd[i].kp = float((1 - a) * prep_stiff[i] + a * rl_stiff[i])
+                self.low_cmd.motor_cmd[i].kd = float((1 - a) * prep_damp[i] + a * rl_damp[i])
+            self._send_cmd(self.low_cmd)
+            time.sleep(dt)
+
+        self.dof_target[:] = rl_q
+        self.filtered_dof_target[:] = rl_q
+        self._prepare_q = latched
+        moved = float(np.max(np.abs(
+            np.asarray(self.dof_pos_latest[:self.joint_cnt]) - latched)))
+        self.logger.info(
+            "[mode-timing] latched CUSTOM entry done in %.2f s, joints moved %.4f rad",
+            time.monotonic() - t0, moved)
+
+    # --------------------------------------------------------------- recovery --
+    def _request_recovery(self, reason):
+        if self._recovery_phase != "none":
+            return
+        rec = self.cfg.get("safety", {}).get("recovery", {})
+        if not bool(rec.get("enable", True)):
+            self.logger.error("fall detected (%s) and recovery is disabled; stopping.",
+                              reason)
+            self.running = False
+            return
+        self._recovery_phase = "stopping"
+        self._recovery_reason = reason
+        self._recovery_t0 = time.monotonic()
+        self._recovery_count += 1
+        self._fall_events.append({"reason": reason, "t": time.time()})
+        self.logger.warning("FALL DETECTED (%s) -- suspending policy, recovery #%d",
+                            reason, self._recovery_count)
+
+    def in_recovery(self):
+        return self._recovery_phase != "none"
+
+    def _step_recovery(self):
+        """One tick of the fall-recovery sequence.
+
+        CUSTOM -> DAMPING -> GetUp -> (SDK leaves us in walking) -> CUSTOM.
+        GetUpWithMode is documented as landing in kWalking or kSoccer only, so
+        there is no way to get up straight back into CUSTOM; the re-entry is a
+        separate step.
+        """
+        rec = self.cfg.get("safety", {}).get("recovery", {})
+        phase = self._recovery_phase
+        elapsed = time.monotonic() - self._recovery_t0
+        state, recov_ok, fall_age = (
+            self.fall_monitor.snapshot() if self.fall_monitor else (None, False, float("inf")))
+
+        if phase == "stopping":
+            # Stop driving joints first, before anything else.
+            self.running_policy = False
+            self.logger.warning("[recovery] damping")
+            try:
+                self.client.ChangeMode(RobotMode.kDamping)
+            except Exception as exc:
+                self.logger.error("[recovery] ChangeMode(kDamping) failed: %s", exc)
+            self._custom_mode_started = False
+            self._recovery_phase = "damping"
+            self._recovery_t0 = time.monotonic()
+            return
+
+        if phase == "damping":
+            settle = float(rec.get("damping_settle_s", 1.5))
+            if elapsed < settle:
+                return
+            # Prefer the SDK's own judgement of whether a get-up will work.
+            # Without the monitor we can only wait out the settle time and try.
+            if self.fall_monitor and self.fall_monitor.available and fall_age < 5.0:
+                if not recov_ok:
+                    if elapsed > float(rec.get("recovery_wait_timeout_s", 10.0)):
+                        self.logger.error(
+                            "[recovery] get-up never became available (state=%s); stopping.",
+                            FallState.NAMES.get(state, state))
+                        self.running = False
+                        self._recovery_phase = "none"
+                    return
+            self.logger.warning("[recovery] calling GetUp (state=%s, available=%s)",
+                                FallState.NAMES.get(state, state), recov_ok)
+            try:
+                # The Python binding names only kChangeMode/kMove/kRotateHead,
+                # but B1LocoApiId accepts the raw id, so GetUp (2008) is
+                # reachable from here after all.
+                self.client.SendApiRequest(B1LocoApiId(API_ID_GET_UP), "")
+            except Exception as exc:
+                self.logger.error("[recovery] GetUp call failed: %s", exc)
+                self.running = False
+                self._recovery_phase = "none"
+                return
+            self._recovery_phase = "getup"
+            self._recovery_t0 = time.monotonic()
+            return
+
+        if phase == "getup":
+            timeout = float(rec.get("getup_timeout_s", 20.0))
+            standing = False
+            if self.fall_monitor and self.fall_monitor.available and fall_age < 5.0:
+                standing = state == FallState.IS_READY and elapsed > 2.0
+            else:
+                # No fall topic: fall back to the IMU. Upright and quiet is the
+                # best signal available.
+                upright = (abs(self._latest_rpy[0]) < 0.3 and abs(self._latest_rpy[1]) < 0.3)
+                standing = upright and elapsed > float(rec.get("getup_blind_wait_s", 8.0))
+            if standing:
+                self.logger.warning("[recovery] standing again after %.1f s; re-entering CUSTOM",
+                                    elapsed)
+                self._recovery_phase = "reenter"
+                self._recovery_t0 = time.monotonic()
+                return
+            if elapsed > timeout:
+                self.logger.error("[recovery] get-up did not complete in %.0f s; stopping.",
+                                  timeout)
+                self.running = False
+                self._recovery_phase = "none"
+            return
+
+        if phase == "reenter":
+            try:
+                self._enter_custom_latched()
+            except Exception as exc:
+                self.logger.error("[recovery] CUSTOM re-entry failed: %s", exc)
+                self.running = False
+                self._recovery_phase = "none"
+                return
+            self.next_inference_time = self.timer.get_time()
+            self.next_publish_time = self.timer.get_time()
+            self.policy.reset() if hasattr(self.policy, "reset") else None
+            self.running_policy = True
+            self._recovery_phase = "none"
+            self.logger.warning(
+                "[recovery] complete (#%d, %.1f s total). Mission continues; the "
+                "elapsed time for this run is no longer a clean measurement.",
+                self._recovery_count, time.monotonic() - self._recovery_t0)
+            return
+
     def start_rl_gait_conditionally(self):
         print(f"{self.remoteControlService.get_rl_gait_operation_hint()}")
         wait_t0 = time.monotonic()
@@ -488,11 +812,27 @@ class Controller:
         print(f"{self.remoteControlService.get_operation_hint()}")
 
     def run(self):
+        # While recovering, the policy does not drive. The publish thread keeps
+        # streaming the last dof_target so the joints are never left commandless.
+        if self.in_recovery():
+            self._step_recovery()
+            time.sleep(0.01)
+            return
+
         time_now = self.timer.get_time()
         if time_now < self.next_inference_time:
             time.sleep(0.001)
             return
         self.next_inference_time += self.policy.get_policy_interval()
+
+        # The SDK's own fall state is the slower, authoritative channel; the IMU
+        # watchdog in _low_state_handler is the fast one. Either can start
+        # recovery.
+        if self.fall_monitor is not None:
+            fstate, _avail, fage = self.fall_monitor.snapshot()
+            if fage < 5.0 and fstate in (FallState.HAS_FALLEN, FallState.IS_FALLING):
+                self._request_recovery("fall_down=%s" % FallState.NAMES.get(fstate, fstate))
+                return
 
         low_state_timeout = float(self.cfg.get("safety", {}).get("low_state_timeout_s", 0.2))
         low_state_age = time.monotonic() - self._last_low_state_monotonic
@@ -546,6 +886,11 @@ class Controller:
         self._last_debug_monotonic = now
         payload = {
             "schema": "locomotion_test.policy_debug.v1",
+            "recovery": {
+                "phase": self._recovery_phase,
+                "count": self._recovery_count,
+                "reason": self._recovery_reason or None,
+            },
             "goal_source": "ros",
             "goal_topic": self.goal_source.topic,
             "goal_rel": {

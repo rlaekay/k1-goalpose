@@ -126,4 +126,23 @@ deploy_goal:
 safety:
   # Stop LowCmd publication and request DAMPING if robot state stops arriving.
   low_state_timeout_s: 0.20
+  # Fast fall trigger, evaluated at low_state rate (~500 Hz). The SDK's own fall
+  # topic only publishes at 1 Hz, so waiting for it would let the policy keep
+  # driving a robot that is already going over.
   roll_pitch_limit_rad: 1.0
+
+  recovery:
+    enable: true
+    # Authoritative fall state + whether the SDK will run its get-up. Measured
+    # at ~1 Hz: too slow to trigger on, but it is the only source for
+    # is_recovery_available, and calling GetUp without it just fails.
+    fall_topic: "/fall_down"                       # typed FallDownState
+    fall_raw_topic: "/fall_down_recovery_state"    # 3-byte fallback
+    damping_settle_s: 1.5         # let the robot come to rest before asking to get up
+    recovery_wait_timeout_s: 10.0 # give up if get-up never becomes available
+    getup_timeout_s: 20.0
+    getup_blind_wait_s: 8.0       # only used when the fall topic is unavailable
+    # CUSTOM entry ramps from the *measured* pose to the RL pose over this long.
+    # Latching the measured pose makes the step zero regardless of where we come
+    # from; measured cost of the old snap entry was 0.53 rad / 2.8 s.
+    custom_entry_ramp_s: 0.6

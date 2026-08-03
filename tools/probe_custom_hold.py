@@ -43,7 +43,7 @@ class Probe:
     def __init__(self, cfg, net):
         self.cfg = cfg
         self.running = True
-        self.low_state = None
+        self.low_q = None
         self.low_stamps = []
         self.odom_stamps = []
         self._entered_custom = False
@@ -64,24 +64,32 @@ class Probe:
         self.publisher_thread = None
 
     def _on_low(self, msg):
-        self.low_state = msg
+        # Copy the joint values out here. The message object is only valid for
+        # the duration of the callback: holding the reference and indexing it
+        # later raced the SDK reusing the buffer and threw IndexError mid-run.
+        try:
+            q = [float(j.q) for j in msg.motor_state_serial]
+        except Exception:
+            return
+        if q:
+            self.low_q = q
         self.low_stamps.append(time.monotonic())
 
     def _on_odom(self, _msg):
         self.odom_stamps.append(time.monotonic())
 
     def legs(self):
-        if self.low_state is None:
+        q = self.low_q
+        if not q:
             return None
-        n = len(self.low_state.motor_state_serial)
+        n = len(q)
         # Leg slice comes from the config, not from a hardcoded 11..23: this K1
         # has 22 joints with legs at 10..21.
         start = int(self.cfg["policy"].get("leg_dof_start", 10))
         count = int(self.cfg["policy"].get("num_actions", 12))
         if start + count > n:
             return None
-        return [self.low_state.motor_state_serial[i].q
-                for i in range(start, start + count)]
+        return q[start:start + count]
 
     def rate(self, stamps, t0, t1):
         n = sum(1 for s in stamps if t0 <= s <= t1)
@@ -89,9 +97,10 @@ class Probe:
 
     def build_hold_cmd(self):
         """Hold exactly where the robot is now, at the config's prepare gains."""
-        if self.low_state is None:
+        q = self.low_q
+        if not q:
             raise RuntimeError("no low_state; robot stack not running")
-        n = len(self.low_state.motor_state_serial)
+        n = len(q)
         cfg_n = int(self.cfg["common"].get("joint_cnt",
                                            len(self.cfg["common"]["default_qpos"])))
         if n != cfg_n:
@@ -103,7 +112,7 @@ class Probe:
         stiff = self.cfg["prepare"]["stiffness"]
         damp = self.cfg["prepare"]["damping"]
         for i in range(n):
-            self.low_cmd.motor_cmd[i].q = self.low_state.motor_state_serial[i].q
+            self.low_cmd.motor_cmd[i].q = q[i]
             self.low_cmd.motor_cmd[i].dq = 0.0
             self.low_cmd.motor_cmd[i].tau = 0.0
             self.low_cmd.motor_cmd[i].kp = stiff[i]
@@ -276,9 +285,9 @@ def main():
         # Wait for the channel to actually attach rather than assuming a fixed
         # delay is enough; discovery has taken over a second here.
         deadline = time.monotonic() + 10.0
-        while probe.low_state is None and time.monotonic() < deadline:
+        while probe.low_q is None and time.monotonic() < deadline:
             time.sleep(0.1)
-        if probe.low_state is None:
+        if probe.low_q is None:
             print("!! no low_state after 10s -- robot stack is not running. aborting.")
             return 1
         print("low_state attached (%d samples buffered)" % len(probe.low_stamps))
