@@ -407,6 +407,32 @@ class Controller:
 
         self.running_policy = True
         rec_cfg = self.cfg.get("safety", {}).get("recovery", {})
+
+        # Initialize every field touched by an SDK callback before opening the
+        # channels: InitChannel may deliver LowState immediately.
+        self.publish_runner = None
+        self.running = True
+        self.publish_lock = threading.Lock()
+        self._cleanup_lock = threading.Lock()
+        self._cleaned_up = False
+        self._custom_mode_started = False
+        self._last_low_state_monotonic = 0.0
+        self._last_debug_monotonic = 0.0
+        self._last_goal = (0.0, 0.0, 0.0)
+        self._latest_rpy = np.zeros(3, dtype=np.float32)
+
+        # SDK channels FIRST, while this is still a single-threaded process.
+        #
+        # B1LowStateSubscriber.InitChannel() blocks in C++ while the SDK starts
+        # delivering into a Python callback, which needs the GIL. With rclpy
+        # executor threads already spinning, that deadlocked every thread in
+        # futex_wait and the run never reached the operator prompt. Adding the
+        # second monitor is what tipped it over; the ordering was luck before.
+        self._init_timer()
+        self._init_low_state_values()
+        self._init_communication()
+
+        # Only now bring up the ROS side.
         self.mode_monitor = ModeMonitor(logger=self.logger)
         self.fall_monitor = (FallMonitor(
             topic=str(rec_cfg.get("fall_topic", "/fall_down")),
@@ -422,23 +448,6 @@ class Controller:
             self.goal_source = GoalSource(self.cfg, initial=initial_goal)  # fixed/stdin
 
         self.remoteControlService = RemoteControlService()
-
-        # Initialize every field touched by an SDK callback before opening the
-        # channels: InitChannel may deliver LowState immediately.
-        self.publish_runner = None
-        self.running = True
-        self.publish_lock = threading.Lock()
-        self._cleanup_lock = threading.Lock()
-        self._cleaned_up = False
-        self._custom_mode_started = False
-        self._last_low_state_monotonic = 0.0
-        self._last_debug_monotonic = 0.0
-        self._last_goal = (0.0, 0.0, 0.0)
-        self._latest_rpy = np.zeros(3, dtype=np.float32)
-
-        self._init_timer()
-        self._init_low_state_values()
-        self._init_communication()
 
     def _init_timer(self):
         self.timer = Timer(TimerConfig(time_step=self.cfg["common"]["dt"]))

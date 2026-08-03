@@ -1,0 +1,17 @@
+import os, sys, time, faulthandler, logging, importlib.util
+sys.path.insert(0, os.getcwd())
+logging.basicConfig(level=logging.INFO)
+faulthandler.dump_traceback_later(25, exit=True)
+spec = importlib.util.spec_from_file_location("d", "deploy_goal_pose.py")
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+from booster_robotics_sdk_python import ChannelFactory
+print("STEP init channel factory", flush=True)
+ChannelFactory.Instance().Init(0, "127.0.0.1")
+print("STEP constructing Controller", flush=True)
+c = m.Controller("configs/Goal_Pose_E0.yaml", goal_source_mode="fixed", initial_goal=(0.0, 0.0, 0.0))
+print("STEP constructed OK", flush=True)
+time.sleep(3)
+print("mode:", c.mode_monitor.name(), " fall:", c.fall_monitor.snapshot()[0], flush=True)
+print("layout checked:", c._joint_layout_checked, flush=True)
+print("CONSTRUCTION OK", flush=True)
+os._exit(0)
