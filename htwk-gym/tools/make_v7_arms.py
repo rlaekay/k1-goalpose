@@ -222,9 +222,20 @@ I_ARMS = {
     # hard as the robot. It is the honest baseline every later round builds on.
     "I0b_foot": dict(**_OFF_PATH, **_OFF_ROBUST, **_OFF_PROTECT,
                      **{"asset.feet_edge_pos": FOOT_EDGE_REAL}),
+    # base_height_target sweep. This is NOT the posture reward the user ruled
+    # out as hardcoding -- the term already exists at scale -20, and the config
+    # contradicts itself: init_state.pos z spawns the robot at 0.58 while the
+    # reward drags it to 0.52. Six centimetres. On hardware the robot visibly
+    # sinks before toppling and stands at 0.58, so the constant is simply wrong
+    # and this measures which value is right. Correcting a wrong constant is the
+    # same class of change as feet_edge_pos, not a new shaping term.
+    "I0c_h055": dict(**_OFF_PATH, **_OFF_ROBUST, **_OFF_PROTECT,
+                     **{"rewards.base_height_target": 0.55}),
+    "I0d_h058": dict(**_OFF_PATH, **_OFF_ROBUST, **_OFF_PROTECT,
+                     **{"rewards.base_height_target": 0.58}),
 }
 
-ARMS_ON_E0 = {"I0a_repro", "I0b_foot", "G1_speed", "G2_robust", "G3_full"}
+ARMS_ON_E0 = {"I0a_repro", "I0b_foot", "I0c_h055", "I0d_h058", "G1_speed", "G2_robust", "G3_full"}
 
 
 def set_dotted(cfg, dotted, value):
@@ -250,7 +261,13 @@ GPU_OF = {
     "F1_timed": "cuda:0", "F2_grid": "cuda:0", "F3_stress": "cuda:1",
     # R0 runs ONE process per card: the H data showed damage is decided by
     # iteration 100, so round latency matters more than aggregate throughput.
-    "I0a_repro": "cuda:0", "I0b_foot": "cuda:1",
+    # 2 cards, 4 arms, 200 iterations: ~13 min each alone, ~26 min two-up. The
+    # "one process per card" rule was about round LATENCY, and at this length
+    # doubling up costs nothing that matters. Each pair shares a card so the two
+    # comparisons that matter most sit under identical thermal/clock conditions:
+    # control vs foot on one, and the two height values on the other.
+    "I0a_repro": "cuda:0", "I0b_foot": "cuda:0",
+    "I0c_h055": "cuda:1", "I0d_h058": "cuda:1",
 }
 
 
@@ -264,11 +281,17 @@ def main():
     ap.add_argument("--checkpoint", default=None,
                     help="override for every generated arm; if omitted each arm "
                          "picks E0's final checkpoint (F-batch) or armB (E-batch)")
+    ap.add_argument("--gpu-of", dest="gpu_of", default=None,
+                    help="print the GPU index assigned to this arm, then exit")
     ap.add_argument("--num_envs", type=int, default=4096)
     ap.add_argument("--max_iterations", type=int, default=12000)
     ap.add_argument("--out_dir", default="sweeps")
     ap.add_argument("--only", help="generate just this arm")
     args = ap.parse_args()
+    if args.gpu_of:
+        print(GPU_OF.get(args.gpu_of, 'cuda:0').split(':')[-1])
+        return 0
+
 
     arms = ALL_ARMS if not args.only else {args.only: ALL_ARMS[args.only]}
     with open(BASE, "r", encoding="utf-8") as f:

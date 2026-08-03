@@ -152,6 +152,28 @@ for arm in $ARMS; do
 done
 
 # ---- 5) 기동 확인 ----------------------------------------------------------
+# ---- checkpoint가 나오는 즉시 채점하고, 사전 확정한 판정에 걸리면 중단 --------
+# H는 12000까지 다 돌린 뒤에야 "4개 전부 나빠짐"을 알았다. 그 신호는 iteration
+# 100에 이미 있었다(7.25 -> 10.4~13.2 cm). 판정은 학습 전에 고정하고 코드가 집행한다.
+# REF/REF_FALLS는 비교 대상 정책의 실측값이다: E0@6200 = 2.72 cm / 낙상 2.
+REF="${REF:-0.0272}"
+REF_FALLS="${REF_FALLS:-2}"
+STOP_RATIO="${STOP_RATIO:-1.3}"
+if [ "${WATCH_EVAL:-1}" = "1" ]; then
+  for name in $ARMS; do
+    rd=$(ls -dt logs/*/*/*/*"$name" 2>/dev/null | head -1)
+    if [ -n "$rd" ]; then
+      gpu=$(python tools/make_v7_arms.py --gpu-of "$name" 2>/dev/null || echo 0)
+      nohup python -u tools/watch_eval.py --run "$rd" --device "cuda:$gpu" \
+          --ref "$REF" --ref-falls "$REF_FALLS" --stop-ratio "$STOP_RATIO" \
+          > "$rd/watch_eval.log" 2>&1 &
+      say "  watch_eval: $name (ref ${REF} m, ${STOP_RATIO}x 초과 시 STOP)"
+    else
+      say "  !! watch_eval: $name 의 run 디렉터리를 못 찾음 — 감시 없이 진행"
+    fi
+  done
+fi
+
 say "기동 확인 중 (120s)..."
 sleep 120
 DEAD=""
