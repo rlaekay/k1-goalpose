@@ -192,6 +192,74 @@ API_ID_GET_UP = 2008
 API_ID_GET_UP_WITH_MODE = 2025
 
 
+class RobotModeId:
+    """Mirrors booster::robot::RobotMode. kPrepare IS the standing mode:
+    "the robot keeps standing on both feet and can switch to walking mode"."""
+    UNKNOWN = -1
+    DAMPING = 0
+    PREPARE = 1
+    WALKING = 2
+    CUSTOM = 3
+    SOCCER = 4
+
+    NAMES = {-1: "UNKNOWN", 0: "DAMPING", 1: "PREPARE", 2: "WALKING",
+             3: "CUSTOM", 4: "SOCCER"}
+
+
+class ModeMonitor:
+    """The robot's actual mode, from /robot_states.
+
+    ChangeMode's return value cannot be trusted for this: measured rc=100 after
+    a full 1.000 s timeout on transitions that had in fact taken effect. This
+    topic reports what the robot really is, which is what the CUSTOM entry gate
+    needs.
+    """
+
+    def __init__(self, topic="/robot_states", logger=None):
+        self.logger = logger or logging.getLogger(__name__)
+        self.available = False
+        self.mode = RobotModeId.UNKNOWN
+        self.body_control = None
+        self.last_update = 0.0
+        self._lock = threading.Lock()
+        self._node = None
+        try:
+            import rclpy
+            from rclpy.node import Node
+            from booster_interface.msg import RobotStatesMsg
+        except ImportError as exc:
+            self.logger.warning("ModeMonitor disabled (%s); CUSTOM entry cannot "
+                                "verify the robot is standing first.", exc)
+            return
+        if not rclpy.ok():
+            rclpy.init(args=None)
+        self._node = Node("e0_mode_monitor")
+        self._node.create_subscription(RobotStatesMsg, topic, self._cb, 10)
+        threading.Thread(target=lambda: rclpy.spin(self._node), daemon=True).start()
+        self.available = True
+
+    def _cb(self, msg):
+        with self._lock:
+            self.mode = int(msg.current_mode)
+            self.body_control = int(msg.current_body_control)
+            self.last_update = time.monotonic()
+
+    def snapshot(self):
+        with self._lock:
+            age = float("inf") if self.last_update <= 0 else time.monotonic() - self.last_update
+            return self.mode, age
+
+    def name(self):
+        return RobotModeId.NAMES.get(self.snapshot()[0], "?")
+
+    def close(self):
+        if self._node is not None:
+            try:
+                self._node.destroy_node()
+            except Exception:
+                pass
+
+
 class FallState:
     """Mirrors booster_interface FallDownStateType."""
     IS_READY = 0
@@ -325,6 +393,7 @@ class Controller:
 
         self.running_policy = True
         rec_cfg = self.cfg.get("safety", {}).get("recovery", {})
+        self.mode_monitor = ModeMonitor(logger=self.logger)
         self.fall_monitor = (FallMonitor(
             topic=str(rec_cfg.get("fall_topic", "/fall_down")),
             raw_topic=str(rec_cfg.get("fall_raw_topic", "/fall_down_recovery_state")),
@@ -496,6 +565,8 @@ class Controller:
 
             if self.fall_monitor is not None:
                 self.fall_monitor.close()
+            if getattr(self, "mode_monitor", None) is not None:
+                self.mode_monitor.close()
             if hasattr(self.goal_source, "close"):
                 self.goal_source.close()
             self.remoteControlService.close()
@@ -529,46 +600,11 @@ class Controller:
                 break
             time.sleep(0.1)
 
-        # The operator may spend an arbitrary amount of time at the remote-control
-        # prompt.  Re-check immediately before the first LowCmd and mode change;
-        # the earlier check alone cannot make that transition safe.
-        self._require_fresh_low_state("immediately before CUSTOM mode")
-        create_prepare_cmd(self.low_cmd, self.cfg)
-        prepare_q = np.array([self.low_cmd.motor_cmd[i].q for i in range(self.joint_cnt)],
-                             dtype=np.float64)
-        for i in range(self.joint_cnt):
-            self.dof_target[i] = self.low_cmd.motor_cmd[i].q
-            self.filtered_dof_target[i] = self.low_cmd.motor_cmd[i].q
-
-        # The `prepare` pose and gains are NOT the RL ones: prepare holds hips at
-        # -0.1 / knees 0.2 with stiffness 350-450, while the policy runs at
-        # -0.2 / 0.4 with stiffness 100/50.  Entering CUSTOM therefore snaps the
-        # legs to a different, much stiffer posture before the policy ever runs,
-        # and that snap is the visible part of the "mode change delay".
-        self._log_joint_deviation("before prepare cmd", prepare_q)
-        self._send_cmd(self.low_cmd)
-
-        # Mark the transition as attempted before the SDK call: if ChangeMode
-        # raises after the robot accepted it, cleanup must still request DAMPING.
-        self._custom_mode_started = True
-        t0 = time.monotonic()
-        self.client.ChangeMode(RobotMode.kCustom)
-        self._custom_mode_entered_monotonic = time.monotonic()
-        self.logger.info("[mode-timing] ChangeMode(kCustom) returned in %.3f s",
-                         self._custom_mode_entered_monotonic - t0)
-
-        # Watch the legs settle onto the prepare pose. Nothing publishes LowCmd
-        # between here and the RL-gait prompt unless --hold-prepare is given, so
-        # without this the entire transition is invisible.
-        settle_deadline = time.monotonic() + max(0.0, self.prepare_settle_log_s)
-        while time.monotonic() < settle_deadline:
-            if self.hold_prepare:
-                self._send_cmd(self.low_cmd)
-            time.sleep(0.1)
-            self._log_joint_deviation(
-                "settling +%.1fs" % (time.monotonic() - self._custom_mode_entered_monotonic),
-                prepare_q)
-        self._prepare_q = prepare_q
+        # Same path the recovery re-entry uses: verify the robot is standing,
+        # latch the measured pose, then ramp to the RL pose. Startup and
+        # recovery must not diverge -- a difference between them is a difference
+        # nobody would notice until the robot behaves oddly after a fall.
+        self._enter_custom_latched()
 
     def _require_fresh_low_state(self, context):
         low_state_timeout = float(self.cfg.get("safety", {}).get("low_state_timeout_s", 0.2))
@@ -599,6 +635,7 @@ class Controller:
         rec = self.cfg.get("safety", {}).get("recovery", {})
         ramp_s = float(rec.get("custom_entry_ramp_s", 0.6)) if ramp_s is None else ramp_s
 
+        self._ensure_standing_before_custom()
         self._require_fresh_low_state("before latched CUSTOM entry")
         latched = np.array(self.dof_pos_latest[:self.joint_cnt], dtype=np.float32)
 
@@ -653,6 +690,61 @@ class Controller:
         self.logger.info(
             "[mode-timing] latched CUSTOM entry done in %.2f s, joints moved %.4f rad",
             time.monotonic() - t0, moved)
+
+    def _ensure_standing_before_custom(self):
+        """Refuse to take the joints unless the robot is standing (kPrepare).
+
+        kPrepare is the standing mode -- the SDK describes it as "the robot keeps
+        standing on both feet and can switch to walking mode". The working order
+        has always been damping -> stand -> walk, and taking over from a
+        collapsed robot means the policy starts from a heap on the floor.
+
+        Nothing enforced this before: ChangeMode(kCustom) was issued from
+        whatever mode happened to be active, including DAMPING. ChangeMode's
+        return code cannot be used to check either -- measured rc=100 after a
+        full 1.000 s timeout on transitions that had actually taken effect -- so
+        the current mode is read from /robot_states instead.
+        """
+        rec = self.cfg.get("safety", {}).get("recovery", {})
+        if not bool(rec.get("require_standing_before_custom", True)):
+            return
+        if self.mode_monitor is None or not self.mode_monitor.available:
+            self.logger.warning(
+                "cannot read /robot_states; entering CUSTOM without confirming the "
+                "robot is standing")
+            return
+
+        mode, age = self.mode_monitor.snapshot()
+        if age > 5.0:
+            raise RuntimeError("/robot_states is stale (%.1fs); refusing to enter "
+                               "CUSTOM without knowing the current mode" % age)
+        if mode == RobotModeId.PREPARE:
+            return
+        if mode == RobotModeId.CUSTOM:
+            self.logger.info("[mode-gate] already in CUSTOM")
+            return
+
+        self.logger.warning("[mode-gate] robot is %s, not PREPARE -- requesting "
+                            "PREPARE before taking the joints",
+                            RobotModeId.NAMES.get(mode, mode))
+        try:
+            self.client.ChangeMode(RobotMode.kPrepare)
+        except Exception as exc:
+            raise RuntimeError("ChangeMode(kPrepare) failed: %s" % exc)
+
+        timeout = float(rec.get("prepare_timeout_s", 15.0))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            time.sleep(0.2)
+            mode, age = self.mode_monitor.snapshot()
+            if age < 5.0 and mode == RobotModeId.PREPARE:
+                self.logger.info("[mode-gate] PREPARE reached; robot is standing")
+                time.sleep(float(rec.get("prepare_settle_s", 1.0)))
+                return
+        raise RuntimeError(
+            "robot did not reach PREPARE within %.0fs (still %s). Refusing to "
+            "enter CUSTOM from a non-standing state." % (
+                timeout, RobotModeId.NAMES.get(self.mode_monitor.snapshot()[0], "?")))
 
     # --------------------------------------------------------------- recovery --
     def _request_recovery(self, reason):

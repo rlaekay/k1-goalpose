@@ -146,6 +146,13 @@ safety:
     # with margin, or we would declare the robot standing while it is still
     # getting up.
     getup_blind_wait_s: 12.0
+    # kPrepare IS the standing mode. Taking the joints from a collapsed robot
+    # means the policy starts from a heap on the floor, so CUSTOM entry first
+    # confirms (or requests) PREPARE. Read from /robot_states, because
+    # ChangeMode's return code is not reliable.
+    require_standing_before_custom: true
+    prepare_timeout_s: 15.0
+    prepare_settle_s: 1.0
     # CUSTOM entry ramps from the *measured* pose to the RL pose over this long.
     # Latching the measured pose makes the step zero regardless of where we come
     # from; measured cost of the old snap entry was 0.53 rad / 2.8 s.
