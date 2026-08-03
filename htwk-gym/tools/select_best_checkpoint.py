@@ -37,6 +37,7 @@ Usage:
 
 import os
 import re
+import math
 import sys
 import glob
 import json
@@ -104,24 +105,63 @@ def env_signature(cfg):
     )
 
 
+# Falls are reported but do not decide selection. A 60 s screening stage
+# completes ~2300 segments, so ONE fall is a rate of 0.43/1000 whose 95% Poisson
+# interval is [0.01, 2.4] per 1000 -- it contains zero. Ranking on it ranks on
+# noise, and it decided a real round: I2a_dr's iterations 150, 175 and 200 each
+# recorded exactly one fall, failed `max_falls: 0`, and were demoted below
+# iteration 25 by the lexicographic key, handing the run to a checkpoint 25 steps
+# from its warm start. The same count is non-reproducible besides -- one
+# checkpoint returned 3 falls and 18 under an identical protocol.
+_SELECTION_IGNORED_GATES = ("falls",)
+
+
+def task_error_m(results, cfg):
+    """What training actually minimises, in metres. Lower is better.
+
+    constellation is d^2 + 2 r^2 (1 - cos th), which for small th is d^2 + r^2 th^2,
+    so with constellation_radius r = 1.0 m ONE DEGREE of heading is worth 1.75 cm
+    of position. The selector ranked on the worst gate ratio instead, and since
+    every candidate's worst gate was pos_median (limit 5 cm, while heading's limit
+    is 10 deg), that made it a pure position ranking. It therefore preferred
+    2.2 cm / 3.7 deg over 2.6 cm / 1.8 deg -- and by the objective the policy was
+    trained on, the second is 2.8x better.
+
+    The gates and the reward disagree about the exchange rate by 3.5x (gates:
+    10 deg ~ 5 cm, so 1 deg = 0.5 cm; reward: 1 deg = 1.75 cm). Selection follows
+    the reward, because that is the quantity the weights were moved to minimise.
+    """
+    d = results["pos_err_m"]["median"]
+    th = math.radians(results["heading_err_deg"]["median"])
+    r = float(((cfg or {}).get("rewards") or {}).get("constellation_radius", 1.0))
+    return float(math.hypot(d, r * th))
+
+
 def score(results):
     """(worst gate ratio, mean gate ratio, per-gate ratios). Lower is better; <=1
     on every gate means passing."""
     ratios = ev.gate_ratios(results)
-    values = list(ratios.values())
+    values = [v for k, v in ratios.items() if k not in _SELECTION_IGNORED_GATES]
     # HBatch has a separate G1-preservation + robustness gate set.  Conjoining
     # it with the legacy 5 cm / max_falls=0 flag makes documented H candidates
     # structurally unable to pass even when every H ratio is <= 1.
     legacy_gate_required = not bool(results.get("hbatch_gates"))
+    # results["all_gates_pass"] includes max_falls, so reading it here would put
+    # the retired gate straight back into the decision through the side door.
+    legacy_pass = all(v.get("pass") for k, v in (results.get("gates") or {}).items()
+                      if k not in _SELECTION_IGNORED_GATES)
     return (float(max(values)), float(np.mean(values)), ratios,
-            (not legacy_gate_required
-             or bool(results.get("all_gates_pass", False)))
+            (not legacy_gate_required or legacy_pass)
             and bool(values)
             and all(np.isfinite(v) and v <= 1.0 for v in values))
 
 
 def rank_key(entry):
+    # task_error first: it is the trained objective, and it weighs heading against
+    # position the way the reward does. worst_ratio stays as the tie-break and
+    # still enforces "no gate is blown out" through selection_gates_pass.
     return (not entry["selection_gates_pass"],
+            entry.get("task_error", entry["worst_ratio"]),
             entry["worst_ratio"], entry["mean_ratio"])
 
 
@@ -261,9 +301,10 @@ def render_selection(sel):
     md.append(best["checkpoint"])
     md.append("```")
     md.append("")
-    md.append("- iteration {} / 위치 median {:.1f} cm / p90 {:.1f} cm / heading {:.1f}° / 낙상 {}회".format(
-        best["iteration"], best["pos_median"] * 100, best["pos_p90"] * 100,
-        best["heading_median"], best["falls"]))
+    md.append("- iteration {} / 위치 median {:.1f} cm / p90 {:.1f} cm / heading {:.1f}° / 낙상 {}회 "
+              "/ **과제오차 {:.1f} cm**".format(
+                  best["iteration"], best["pos_median"] * 100, best["pos_p90"] * 100,
+                  best["heading_median"], best["falls"], best.get("task_error", float("nan")) * 100))
     md.append("- 체크포인트 선택 screen: {} (direction/force-recovery/video/cross-arm은 "
               "후속 full suite에서 별도 판정)".format(
                   "✅ 통과" if best["selection_gates_pass"] else "❌ 미통과 있음"))
@@ -271,7 +312,9 @@ def render_selection(sel):
         md.append("- ⚠️ {}".format(sel["tie_note"]))
     if best["iteration"] != sel["final_iteration"]:
         md.append("- 마지막 체크포인트(iteration {})가 아니라 iteration {}가 선택되었다. "
-                  "학습 후반에 과제 성능이 나빠진 구간이 있다는 뜻이므로 학습곡선을 확인할 것.".format(
+                  "순위는 **과제오차**(= 학습 목적함수 sqrt(d² + r²θ²), 1° ≈ 1.75 cm)로 매긴다. "
+                  "위치 median만 보면 학습이 나빠진 것처럼 보이지만 heading을 함께 보면 "
+                  "반대일 수 있으므로, 두 열을 같이 읽을 것.".format(
                       sel["final_iteration"], best["iteration"]))
     md.append("")
 
@@ -285,13 +328,15 @@ def render_selection(sel):
                 "{:.1f}".format(e["pos_median"] * 100),
                 "{:.1f}".format(e["pos_p90"] * 100),
                 "{:.1f}".format(e["heading_median"]),
+                "{:.1f}".format(e.get("task_error", float("nan")) * 100),
                 e["falls"],
                 "{:.2f}".format(e["worst_ratio"]),
                 "✅" if e["selection_gates_pass"] else "—",
                 "진출" if e["advanced"] else "",
             ])
         md += ev._table(
-            ["#", "iter", "구간수", "위치med(cm)", "위치p90(cm)", "heading(°)", "낙상", "worst비", "게이트", ""],
+            ["#", "iter", "구간수", "위치med(cm)", "위치p90(cm)", "heading(°)", "과제오차(cm)",
+             "낙상(순위제외)", "worst비", "게이트", ""],
             rows)
         md.append("")
 
@@ -494,6 +539,7 @@ def main():
                 "falls": results["falls"],
                 "success_rate_strict": results["success_rate_strict"],
                 "selection_gates_pass": selection_gates_pass,
+                "task_error": task_error_m(results, cfg),
                 "worst_ratio": worst,
                 "mean_ratio": mean,
                 "gate_ratios": ratios,
@@ -504,9 +550,10 @@ def main():
                 "_roll": roll,
             })
             entries.append(entry)
-            print("    -> 위치 median {:.1f} cm, p90 {:.1f} cm, heading {:.1f}°, 낙상 {}, worst비 {:.2f}".format(
-                entry["pos_median"] * 100, entry["pos_p90"] * 100, entry["heading_median"],
-                entry["falls"], worst))
+            print("    -> 위치 median {:.1f} cm, p90 {:.1f} cm, heading {:.1f}°, 낙상 {}, "
+                  "과제오차 {:.1f} cm, worst비 {:.2f}".format(
+                      entry["pos_median"] * 100, entry["pos_p90"] * 100, entry["heading_median"],
+                      entry["falls"], entry["task_error"] * 100, worst))
             if robust_screen is not None:
                 print("       combined screen: falls {:.3f}/env-min, |omega| p90 {:.2f}, "
                       "force events {}, 5s survival {:.1%}".format(
