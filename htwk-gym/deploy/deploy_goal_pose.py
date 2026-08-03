@@ -21,7 +21,9 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -46,6 +48,27 @@ from utils.remote_control_service import RemoteControlService
 from utils.rotate import rotate_vector_inverse_rpy
 from utils.timer import TimerConfig, Timer
 from utils.policy_goal_pose import GoalPosePolicy
+
+
+def _restore_terminal():
+    """Put the tty back into a sane state.
+
+    RemoteControlService starts an sshkeyboard listener that switches the
+    terminal to raw mode. If the process exits without unwinding that, the
+    shell keeps eating and reordering characters -- typed commands come out as
+    "fpython3", and paths land in the wrong argument. Cheap to do, and it makes
+    the difference between a usable terminal and one that has to be reset by
+    hand.
+    """
+    if not sys.stdin.isatty():
+        return
+    stty = shutil.which("stty")
+    if not stty:
+        return
+    try:
+        subprocess.run([stty, "sane"], stdin=sys.stdin, timeout=2, check=False)
+    except Exception:
+        pass
 
 
 def _spin_node_isolated(node):
@@ -616,6 +639,7 @@ class Controller:
                 self.low_cmd_publisher.CloseChannel()
             if hasattr(self, "low_state_subscriber"):
                 self.low_state_subscriber.CloseChannel()
+            _restore_terminal()
 
     def _log_joint_deviation(self, tag, target_q):
         """Report how far the measured legs are from a commanded pose.
