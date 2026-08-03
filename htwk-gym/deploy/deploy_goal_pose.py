@@ -421,6 +421,7 @@ class Controller:
         self._last_goal = (0.0, 0.0, 0.0)
         self._latest_rpy = np.zeros(3, dtype=np.float32)
         self._last_pre_custom_log = -1e9
+        self._latest_tilt = 0.0
 
         # SDK channels FIRST, while this is still a single-threaded process.
         #
@@ -538,18 +539,31 @@ class Controller:
         self._verify_joint_layout(low_state_msg)
         self._last_low_state_monotonic = time.monotonic()
         self._latest_rpy[:] = low_state_msg.imu_state.rpy
-        rpy_limit = float(self.cfg.get("safety", {}).get("roll_pitch_limit_rad", 1.0))
-        if (abs(low_state_msg.imu_state.rpy[0]) > rpy_limit or
-                abs(low_state_msg.imu_state.rpy[1]) > rpy_limit):
+        # Tilt of the robot's up-axis from world up, not raw roll/pitch.
+        #
+        # rpy is ZYX Euler, so roll is degenerate near pitch = +-90 deg: a robot
+        # lying face down at pitch 78.8 deg reported roll 172.7 deg, which reads
+        # as "flipped onto its back" and is not. cos(pitch) scales the roll term
+        # to 0.19 there, so it swings freely. The angle between the body up-axis
+        # and world up has no such singularity and is what "fallen" actually
+        # means: 0 upright, 90 horizontal.
+        roll, pitch = low_state_msg.imu_state.rpy[0], low_state_msg.imu_state.rpy[1]
+        cos_tilt = float(np.clip(np.cos(pitch) * np.cos(roll), -1.0, 1.0))
+        tilt = float(np.arccos(cos_tilt))
+        self._latest_tilt = tilt
+        safety = self.cfg.get("safety", {})
+        rpy_limit = float(safety.get("fall_tilt_limit_rad",
+                                     safety.get("roll_pitch_limit_rad", 1.0)))
+        if tilt > rpy_limit:
             # This is the fast path: low_state runs at ~500 Hz, while the SDK's
             # own fall topic publishes at 1 Hz. Waiting for that would mean up
             # to a second of the policy still driving a robot that is going
             # over. Previously this killed the process; now it hands off to the
             # recovery sequence so the run can continue after a get-up.
             self._request_recovery(
-                "imu_rpy roll=%.2f pitch=%.2f > %.2f rad"
-                % (low_state_msg.imu_state.rpy[0], low_state_msg.imu_state.rpy[1],
-                   rpy_limit))
+                "tilt=%.0fdeg > %.0fdeg (roll=%.0f pitch=%.0f)"
+                % (np.degrees(tilt), np.degrees(rpy_limit),
+                   np.degrees(roll), np.degrees(pitch)))
         self.timer.tick_timer_if_sim()
         time_now = self.timer.get_time()
         for i, motor in enumerate(low_state_msg.motor_state_serial):
@@ -1098,6 +1112,7 @@ class Controller:
             **goal_status,
             "low_state_age_sec": low_state_age,
             "rpy_rad": [float(v) for v in self._latest_rpy],
+            "tilt_deg": float(np.degrees(self._latest_tilt)),
             "action_min": float(np.min(self.policy.actions)),
             "action_max": float(np.max(self.policy.actions)),
             "running": self.running,

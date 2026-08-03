@@ -129,7 +129,12 @@ safety:
   # Fast fall trigger, evaluated at low_state rate (~500 Hz). The SDK's own fall
   # topic only publishes at 1 Hz, so waiting for it would let the policy keep
   # driving a robot that is already going over.
-  roll_pitch_limit_rad: 1.0
+  #
+  # Measured as the angle between the robot's up-axis and world up: 0 upright,
+  # 90 deg horizontal. NOT raw roll/pitch -- rpy is ZYX Euler and roll is
+  # degenerate near pitch +-90 deg, where a prone robot reported roll 172 deg.
+  fall_tilt_limit_rad: 1.0        # 57 deg
+  roll_pitch_limit_rad: 1.0       # legacy name, used only if the above is absent
 
   recovery:
     enable: true
