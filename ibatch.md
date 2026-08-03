@@ -824,21 +824,42 @@ stdlib로 간주하고 건너뛴다. 별도 검사로 local import 53개가 전�
 
 ### 서버 접속 메모 (매번 찾지 않도록)
 
+**전부 절대경로다.** 상대경로로 적었다가 `cd` 누락으로 두 번 실패했다
+(`fatal: not a git repository`, `cd: htwk-gym: No such file`). 어디서 실행하든 동작해야 한다.
+
+**서버에서 실행:**
+
+```bash
+# 중단 — 세션명은 SESSION= 로 준 값. GPU가 실제로 비었는지 확인까지 한 줄에.
+tmux kill-session -t i 2>/dev/null; pkill -f "tools/watch_eval.py"; pkill -f train_v7.py; sleep 2; nvidia-smi --query-compute-apps=pid,used_memory --format=csv
+```
+
 ```bash
 # 실행
-git pull && ARMS="I0a_repro I0b_foot I0c_h055 I0d_h058" ITERS=200 SESSION=i bash tools/tonight.sh
+cd /mnt/DATA/workspace/ws_eungkyu/k1-goalpose && git pull && cd htwk-gym && ARMS="I0a_repro I0b_foot I0c_h055 I0d_h058" ITERS=200 SESSION=i bash tools/tonight.sh
+```
 
-# 중단
-tmux kill-session -t i; pkill -f "tools/watch_eval.py"; pkill -f train_v7.py
+```bash
+# 터미널 모니터
+cd /mnt/DATA/workspace/ws_eungkyu/k1-goalpose/htwk-gym && python tools/monitor.py --tui          # 진행 중인 run만
+cd /mnt/DATA/workspace/ws_eungkyu/k1-goalpose/htwk-gym && python tools/monitor.py --tui --all    # 끝난 것까지
+```
 
-# 웹 — 맥에서 터널을 열고 localhost로 접속하는 쪽이 방화벽과 무관해 확실하다
-ssh -L 8420:localhost:8420 <user>@<host> -p <port>     # 맥에서
-#   -> http://localhost:8420/
-# 같은 LAN이면 서버에서 `hostname -I | awk '{print $1}'` 한 값으로 직접 접속도 된다
+**맥에서 (서버 아님):**
 
-# 터미널
-python tools/monitor.py --tui        # 진행 중인 run만
-python tools/monitor.py --tui --all  # 끝난 것까지
+서버 IP `165.246.193.194`는 공인 주소라 터널 없이 바로 열린다:
+
+```
+http://165.246.193.194:8420/
+```
+
+포트가 막혀 있으면 그때만 터널 — **이 명령은 맥 터미널에서 실행한다.**
+서버에서 실행하면 자기 자신에게 접속하는 꼴이고, 서버 conda의 OpenSSL 충돌로
+`OpenSSL version mismatch`가 난다.
+
+```bash
+ssh -L 8420:localhost:8420 user@165.246.193.194 -p 6666
+#   -> 맥 브라우저에서 http://localhost:8420/
 ```
 
 > 기록 규칙: 라운드가 끝나면 이 표에 **한 줄**만 추가하고, 상세는 §7 결정 트리의
