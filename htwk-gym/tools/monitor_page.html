@@ -50,6 +50,9 @@ th{color:var(--dim);font-weight:400}
 .pass{color:var(--ok)}.fail{color:var(--bad)}
 #empty{color:var(--dim);padding:24px 16px}
 select{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:5px;padding:1px 4px;font:inherit}
+.vid{display:inline-block;margin:6px 6px 0 0;padding:2px 9px;border:1px solid var(--acc);border-radius:99px;
+     color:var(--acc);cursor:pointer;font-size:11px}
+video{width:100%;max-height:60vh;background:#000;border-radius:6px;margin-top:6px}
 </style>
 <header>
   <h1>K1 학습 모니터</h1>
@@ -108,6 +111,22 @@ async function fetchRun(slug,ver){
   r._v=ver; cache[slug]=r; return r;
 }
 
+// Videos were recorded all along and could not be watched: they land outside
+// logs/ and fetch.sh pulls no mp4s. The server streams them with Range support,
+// so they play in place instead of needing an rsync of tens of MB.
+function vidBar(vids){
+  if(!vids||!vids.length)return '';
+  return `<div>${vids.map(v=>`<span class="vid" data-v="${encodeURIComponent(v.path)}"
+    title="${v.path}">▶ ${v.label} · ${v.mb} MB</span>`).join('')}<div class="player"></div></div>`;
+}
+function wireVideos(host){
+  host.querySelectorAll('.vid').forEach(b=>b.onclick=ev=>{
+    ev.stopPropagation();                       // the whole card is a click target
+    const p=b.parentElement.querySelector('.player');
+    p.innerHTML=`<video controls autoplay playsinline src="/video?p=${b.dataset.v}"></video>`;
+  });
+}
+
 async function detail(slug,card,ver){
   const r=await fetchRun(slug,ver), tags=Object.keys(r.scalars||{}).sort();
   const host=$('.detail',card); if(!host)return;
@@ -116,13 +135,14 @@ async function detail(slug,card,ver){
     tagSel[slug]=cur;
     host.innerHTML=`<div class="row"><span class="meta">그래프</span>
       <select>${tags.map(t=>`<option${t===cur?' selected':''}>${t}</option>`).join('')}</select></div>
-      <canvas></canvas>${evalTable(r.evals)}`;
+      <canvas></canvas>${evalTable(r.evals)}${vidBar(r.videos)}`;
     const sel=host.querySelector('select');
     sel.onchange=()=>{tagSel[slug]=sel.value;draw(host.querySelector('canvas'),r.scalars[sel.value])};
     draw(host.querySelector('canvas'),r.scalars[cur]);
   }else{
-    host.innerHTML=`<div class="meta">scalars.jsonl 없음 — 이 run은 기록 추가 이전이다. 진행/평가만 표시된다.</div>${evalTable(r.evals)}`;
+    host.innerHTML=`<div class="meta">scalars.jsonl 없음 — 이 run은 기록 추가 이전이다. 진행/평가만 표시된다.</div>${evalTable(r.evals)}${vidBar(r.videos)}`;
   }
+  wireVideos(host);
 }
 
 function kpi(v,unit,label,good){
@@ -146,7 +166,7 @@ async function open_detail(slug,ver){
       ${kpi(e&&e.pos_median!=null?e.pos_median*100:null,'cm','위치 median (기준 2.72)',e&&e.pos_median!=null?e.pos_median<=0.05:undefined)}
       ${kpi(e&&e.pos_p90!=null?e.pos_p90*100:null,'cm','위치 p90 (기준 10)',e&&e.pos_p90!=null?e.pos_p90<=0.10:undefined)}
       ${kpi(e?e.heading_median:null,'°','heading median (기준 10)',e&&e.heading_median!=null?e.heading_median<=10:undefined)}
-      ${kpi(e?e.falls:null,'','낙상 (기준 0)',e&&e.falls!=null?e.falls===0:undefined)}
+      ${kpi(e?e.falls:null,'','낙상 (참고·판정 불가)',undefined)}
       ${kpi(e&&e.strict!=null?e.strict*100:null,'%','strict 성공률',undefined)}
       ${kpi(r.iter,'','iteration')}
       ${kpi(r.s_per_iter,'s','s/iter')}
@@ -156,8 +176,11 @@ async function open_detail(slug,ver){
     <div class="row"><span class="meta">${tags.length?'':'scalars 없음'}</span>
       <select id="ovsel">${tags.map(t=>`<option${t===cur?' selected':''}>${t}</option>`).join('')}</select></div>
     <canvas class="big" id="ovcv"></canvas>
+    <h3>영상 ${(r.videos||[]).length}건</h3>
+    ${vidBar(r.videos)||'<div class="meta">이 run에는 mp4가 없다 (VIDEO_S 미설정이거나 녹화 실패 — train_and_eval 로그 확인).</div>'}
     <h3>평가 이력 (전체 ${(r.evals||[]).length}건)</h3>
     ${evalTable(r.evals,999)||'<div class="meta">아직 평가 결과가 없다. watch_eval 로그를 확인할 것: logs/watch_eval/'+r.desc+'.log</div>'}`;
+  wireVideos($('#ovb'));
   const sel=$('#ovsel');
   if(sel){sel.onchange=()=>{tagSel['ov'+slug]=sel.value;draw($('#ovcv'),r.scalars[sel.value])};
           draw($('#ovcv'),r.scalars[cur]);}
@@ -197,7 +220,8 @@ async function tick(){
   $('#grid').querySelectorAll('.card').forEach(c=>{
     const v=c.dataset.ver;
     detail(c.dataset.slug,c,v);
-    c.onclick=ev=>{if(ev.target.tagName!=='SELECT')open_detail(c.dataset.slug,v)};
+    c.onclick=ev=>{if(ev.target.tagName!=='SELECT'&&!ev.target.closest('.vid,.player'))
+                     open_detail(c.dataset.slug,v)};
   });
 }
 tick(); setInterval(tick,15000);

@@ -250,6 +250,49 @@ def batch_of(desc, run):
     return m.group(1).upper() if m else "other"
 
 
+def _video_label(p, run):
+    d = os.path.dirname(p)
+    tail, base = os.path.basename(d), os.path.basename(run)
+    if tail == "winner_video":
+        return "winner · " + os.path.basename(os.path.dirname(d))[:28]
+    if tail.startswith(base + "_"):              # shared_eval_videos/<run>_<ts>/
+        return "공유본 · " + tail[len(base) + 1:]
+    return tail[:38]
+
+
+def videos(run):
+    """Every mp4 belonging to this run, newest first.
+
+    They land in two places and neither was reachable: train_and_eval.sh copies
+    the winner to shared_eval_videos/<run>_<ts>/, and the original stays at
+    <run>/eval/select_*/winner_video/. shared_eval_videos/ is not under logs/ and
+    fetch.sh pulls no mp4s, so a recorded video could not be watched from the Mac
+    at all -- the whole point of recording it was lost. The dashboard is already
+    open in the browser; serving them from there is one click instead of an rsync.
+    """
+    out, seen = [], set()
+    pats = [os.path.join(run, "eval", "**", "*.mp4"),
+            os.path.join(ROOT, "shared_eval_videos",
+                         os.path.basename(run) + "_*", "*.mp4")]
+    for pat in pats:
+        for p in glob.glob(pat, recursive=True):
+            if not os.path.isfile(p):
+                continue
+            # The shared copy is byte-identical to the eval original (cp, not a
+            # symlink, so realpath does not collapse them). Listing both would
+            # offer the same 60 seconds of footage twice.
+            key = (os.path.basename(p), os.path.getsize(p))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"path": os.path.relpath(p, ROOT).replace(os.sep, "/"),
+                        "label": _video_label(p, run),
+                        "mb": round(os.path.getsize(p) / 1e6, 1),
+                        "t": os.path.getmtime(p)})
+    out.sort(key=lambda v: -v["t"])
+    return out
+
+
 def collect():
     runs = []
     for run in run_dirs():
@@ -284,6 +327,7 @@ def collect():
             "checkpoints": [c[0] for c in cks],
             "best": _best(run),
             "evals": ev + w.get("rows", []),
+            "videos": videos(run),
             "scalars": sc,
             "last_reward": (sc.get("reward") or [[None, None]])[-1][1],
             "last_pos": (sc.get("watch/pos_median") or [[None, None]])[-1][1],
@@ -334,9 +378,11 @@ def write(runs):
         slug = re.sub(r"[^A-Za-z0-9_.-]", "_", r["name"])
         with open(os.path.join(DATA, slug + ".json"), "w") as f:
             json.dump(r, f)
-        light = {k: v for k, v in r.items() if k not in ("scalars", "evals", "checkpoints")}
+        light = {k: v for k, v in r.items()
+                 if k not in ("scalars", "evals", "checkpoints", "videos")}
         light["slug"] = slug
         light["n_evals"] = len(r["evals"])
+        light["n_videos"] = len(r["videos"])
         index.append(light)
     with open(os.path.join(DATA, "index.json"), "w") as f:
         # collector_mtime lets the page tell you it is serving stale code, which
@@ -419,19 +465,81 @@ def serve(port, interval):
 
     os.makedirs(DATA, exist_ok=True)
 
+    from urllib.parse import urlparse, parse_qs, unquote
+
     class H(SimpleHTTPRequestHandler):
         def __init__(self, *a, **k):
+            self._nocache = True
             super().__init__(*a, directory=OUT, **k)
 
         def end_headers(self):
             # The page polls the same filenames forever; without this a browser
             # will happily serve a five-minute-old index.json from cache and the
-            # dashboard silently stops updating.
-            self.send_header("Cache-Control", "no-store")
+            # dashboard silently stops updating. Video is the exception: seeking
+            # re-requests ranges constantly and no-store makes every seek a
+            # re-download over the LAN.
+            if self._nocache:
+                self.send_header("Cache-Control", "no-store")
             super().end_headers()
 
         def log_message(self, *a):
             pass
+
+        def do_GET(self):
+            if urlparse(self.path).path == "/video":
+                self._nocache = False
+                try:
+                    self._video()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass      # seeking in a <video> aborts the in-flight request
+                finally:
+                    self._nocache = True
+                return
+            super().do_GET()
+
+        def _video(self):
+            rel = unquote((parse_qs(urlparse(self.path).query).get("p") or [""])[0])
+            base = os.path.realpath(ROOT)
+            full = os.path.realpath(os.path.join(base, rel))
+            if (not full.startswith(base + os.sep) or not full.endswith(".mp4")
+                    or not os.path.isfile(full)):
+                self.send_error(404, "no such video")
+                return
+            size = os.path.getsize(full)
+            start, end, status = 0, size - 1, 200
+            # Safari will not play an mp4 at all unless the server honours Range:
+            # its very first request is a probe for a couple of bytes, and a 200
+            # with the whole file in reply makes it give up silently.
+            m = re.match(r"bytes=(\d*)-(\d*)\s*$", (self.headers.get("Range") or "").strip())
+            if m:
+                lo, hi = m.group(1), m.group(2)
+                if lo:
+                    start, end = int(lo), (int(hi) if hi else size - 1)
+                elif hi:
+                    start = max(0, size - int(hi))
+                end = min(end, size - 1)
+                if start > end or start >= size:
+                    self.send_response(416)
+                    self.send_header("Content-Range", "bytes */%d" % size)
+                    self.end_headers()
+                    return
+                status = 206
+            self.send_response(status)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(end - start + 1))
+            if status == 206:
+                self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+            self.end_headers()
+            with open(full, "rb") as f:
+                f.seek(start)
+                left = end - start + 1
+                while left > 0:
+                    chunk = f.read(min(262144, left))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
 
     def loop():
         while True:
