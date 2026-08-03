@@ -95,7 +95,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arms", nargs="*", default=None)
     ap.add_argument("--ref", type=float, default=0.0272, help="reference position median [m]")
-    ap.add_argument("--ref-falls", dest="ref_falls", type=int, default=2)
+    # Accepted and ignored. A reference fall COUNT is not a bar anything can be
+    # held to: 2 falls in 4632 segments has a 95% Poisson interval of 0.05-1.56
+    # per 1000, which contains I1b's 4, and the same checkpoint has returned 3
+    # and 18 under an identical protocol. Robustness is judged under held-out
+    # force (tools/force_ab.py), where the event rate is high enough to separate.
+    ap.add_argument("--ref-falls", dest="ref_falls", type=int, default=None,
+                    help="(무시됨) 낙상 판정은 force_ab.py에서 한다")
     a = ap.parse_args()
 
     runs = newest_runs(set(a.arms) if a.arms else None)
@@ -104,12 +110,14 @@ def main():
         return 1
 
     print("=== 라운드 요약  %s ===" % time.strftime("%Y-%m-%d %H:%M:%S"))
-    print("기준: 위치 median %.2f cm / 낙상 %d  (E0@6200)\n" % (a.ref * 100, a.ref_falls))
-    hdr = "%-32s %-13s %8s %9s %8s %7s %7s %8s"
-    print(hdr % ("arm", "시작", "iter", "pos med cm", "p90 cm", "hd °", "falls", "strict %"))
-    print("-" * 100)
+    print("기준: 위치 median %.2f cm  (E0@6200)\n" % (a.ref * 100))
+    hdr = "%-30s %-13s %6s %9s %7s %6s %6s %7s %8s %s"
+    print(hdr % ("arm", "시작", "iter", "pos med cm", "p90 cm", "hd °",
+                 "falls", "/1000", "strict %", "구간"))
+    print("-" * 116)
 
     trouble = []
+    segs_seen = []
     for arm in sorted(runs):
         run = runs[arm]
         started = os.path.basename(run)[:16].replace("_", " ")
@@ -128,12 +136,15 @@ def main():
                        p90=(d.get("pos_err_m") or {}).get("p90"),
                        hd=(d.get("heading_err_deg") or {}).get("median"),
                        falls=d.get("falls"), strict=d.get("success_rate_strict"),
+                       segs=d.get("segments_completed"),
+                       rate=d.get("fall_rate_per_attempt"),
                        it=os.path.basename(d.get("checkpoint", "")))
         elif w:
             r = w[-1]
             src = dict(pos=r.get("pos_median"), p90=r.get("pos_p90"),
                        hd=r.get("heading_median"), falls=r.get("falls"),
-                       strict=r.get("strict"), it=str(r.get("it")))
+                       strict=r.get("strict"), segs=None, rate=None,
+                       it=str(r.get("it")))
         n_ck = len(glob.glob(os.path.join(run, "nn", "model_*.pth")))
         if src is None:
             print(hdr % (arm[:32], started, "ck %d" % n_ck, "-", "-", "-", "-", "-") + "  << 결과 없음")
@@ -143,14 +154,34 @@ def main():
         mode = ""
         if reps and reps[-1].get("force_profile") and not clean:
             mode = "  << 외력 리포트만 있음 (clean과 비교 불가)"
-        print(hdr % (arm[:32], started, it[:8], cm(src["pos"]), cm(src["p90"]),
+        # falls is a COUNT, and rows do not share a denominator: a watch_eval
+        # screening report is 20 s (~740 segments) while a full-protocol report is
+        # 120 s (~4630). Printing 1 next to 4 without the denominator made I2a_dr
+        # look better than I1b_force when by rate it was worse. The count stays
+        # (it is what the Poisson interval is computed from) but the exposure is
+        # now always beside it.
+        rate = src["rate"]
+        if rate is None and src["falls"] is not None and src["segs"]:
+            rate = float(src["falls"]) / (src["segs"] + src["falls"])
+        print(hdr % (arm[:30], started, it[:6], cm(src["pos"]), cm(src["p90"]),
                      "-" if src["hd"] is None else "%.1f" % src["hd"],
                      "-" if src["falls"] is None else str(src["falls"]),
-                     "-" if src["strict"] is None else "%.1f" % (src["strict"] * 100))
+                     "-" if rate is None else "%.2f" % (1000 * rate),
+                     "-" if src["strict"] is None else "%.1f" % (src["strict"] * 100),
+                     "?" if not src["segs"] else "%d" % src["segs"])
               + mode)
+        if src["segs"]:
+            segs_seen.append((arm, src["segs"]))
         stops = [r for r in w if r.get("stop")]
         if stops:
             print("%14s   STOP: %s" % ("", stops[-1]["why"]))
+
+    if segs_seen and max(s for _, s in segs_seen) > 1.5 * min(s for _, s in segs_seen):
+        print("\n  !!! 노출량이 arm마다 다르다 — falls 열을 그대로 비교하면 안 된다:")
+        for arm, s in sorted(segs_seen, key=lambda x: -x[1]):
+            print("      %-30s %6d 구간 (%s)" % (arm, s,
+                  "전체 프로토콜" if s > 2000 else "스크리닝 20s"))
+        print("      선택(select_best_checkpoint)이 끝나면 전체 리포트로 다시 볼 것.")
 
     if trouble:
         print("\n=== 결과가 없는 arm의 원인 ===")
