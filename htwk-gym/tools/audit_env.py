@@ -162,13 +162,33 @@ def main():
         else:
             zero = "  (전부 0 = 이 arm에서 꺼짐)" if float(t.abs().max()) == 0 else ""
             row(key, rng, "[%+.4f, %+.4f]" % (float(t.min()), float(t.max())), zero)
+    # apply_randomization(..., return_noise=True) returns the RAW sample -- u in
+    # [0,1] for uniform, a standard normal for gaussian -- NOT the applied value
+    # (utils/utils.py:27). Reporting it directly made base_mass look like it
+    # ranged 0.001-0.991 against a configured [0.8, 1.2]. This is the same trap
+    # that made the mirrored critic's COM-y flip wrong (u -> -u instead of
+    # u -> 1-u), so the conversion is done here explicitly.
+    def applied(u, params):
+        if not params:
+            return None
+        lo, hi = params["range"]
+        if params.get("distribution") == "uniform":
+            return lo + (hi - lo) * u
+        return lo + hi * u          # gaussian: range is [mu, sigma]
+
     bm = getattr(env, "base_mass_scaled", None)
     if bm is not None and bm.numel():
-        print("  %-30s cfg %-16s 실측 mass배율 %.3f~%.3f, CoM %+.3f~%+.3f m"
-              % ("base_mass / base_com",
-                 (cfg["randomization"].get("base_mass") or {}).get("range"),
-                 float(bm[:, 3].min()), float(bm[:, 3].max()),
-                 float(bm[:, :3].min()), float(bm[:, :3].max())))
+        mp = cfg["randomization"].get("base_mass")
+        cp = cfg["randomization"].get("base_com")
+        mv = applied(bm[:, 3], mp)
+        cv = applied(bm[:, :3], cp)
+        print("  %-30s cfg %-16s 적용 배율 %.3f~%.3f  (원표본 u %.3f~%.3f)"
+              % ("base_mass", (mp or {}).get("range"),
+                 float(mv.min()), float(mv.max()), float(bm[:, 3].min()), float(bm[:, 3].max()))
+              if mv is not None else "  base_mass: 설정 없음")
+        if cv is not None:
+            print("  %-30s cfg %-16s 적용 오프셋 %+.4f~%+.4f m"
+                  % ("base_com", (cp or {}).get("range"), float(cv.min()), float(cv.max())))
     fr = getattr(env, "friction_coeffs", None)
     print("  %-30s cfg %-16s 실측 %s"
           % ("friction", (cfg["randomization"].get("friction") or {}).get("range"),
