@@ -592,9 +592,29 @@ def _apply_joint_dr_probe(cfg, joint_encoder_bias_rad=None,
     return values
 
 
+# A single held-out disturbance profile, identical for every arm and harder
+# than what any of them trained on. --keep_perturbations retains the ARM'S OWN
+# disturbance config, which means an arm trained without disturbance is scored
+# with none -- each policy graded on its own homework, which is exactly why
+# E2, G2 and I1b all trained for robustness and produced no evidence of it.
+# I1b trained on interval 8-14 s and 40-100 N; this is 4-8 s and 50-120 N, so
+# passing it is generalisation rather than recall.
+HELD_OUT_FORCE = {
+    "enabled": True,
+    "interval_s": [4.0, 8.0],
+    "collision_share": 0.5,
+    "ramp_steps": 1,
+    "collision": {"force_n": [50.0, 120.0], "torque_nm": [3.0, 20.0],
+                  "duration_s": [0.06, 0.12]},
+    "support": {"force_n": [4.0, 10.0], "torque_nm": [0.2, 2.0],
+                "duration_s": [0.5, 1.5]},
+}
+
+
 def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
                 record_video=False, keep_perturbations=False, no_noise=False,
                 stress=None, goal_pattern=None, force_visualization_probe=False,
+                force_profile=None,
                 joint_encoder_bias_rad=None, joint_target_offset_rad=None,
                 init_dof_std_rad=None):
     """Apply the standard evaluation conditions to a task config, in place."""
@@ -612,6 +632,17 @@ def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
         cfg, joint_encoder_bias_rad=joint_encoder_bias_rad,
         joint_target_offset_rad=joint_target_offset_rad,
         init_dof_std_rad=init_dof_std_rad)
+    if force_profile:
+        os.environ["EVAL_FORCE_PROFILE"] = force_profile
+    if force_profile == "heldout":
+        # Overrides whatever the arm configured, in BOTH directions: an arm that
+        # trained with disturbance gets this one instead of its own, and an arm
+        # that trained without it gets it switched on. That is what makes the
+        # comparison across arms mean anything.
+        cfg["randomization"]["disturbance"] = json.loads(json.dumps(HELD_OUT_FORCE))
+        cfg["randomization"]["kick_interval_s"] = 1.0e9
+        cfg["randomization"]["push_interval_s"] = 1.0e9
+        keep_perturbations = True
     if not keep_perturbations:
         cfg["randomization"]["kick_interval_s"] = 1.0e9
         cfg["randomization"]["push_interval_s"] = 1.0e9
@@ -2007,6 +2038,10 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
         "duration_s": duration_s,
         "deterministic": deterministic,
         "perturbations": perturbations,
+        # Which force test this was scored under. Without it a force-ON report is
+        # indistinguishable from a clean one six months later, and comparing two
+        # arms scored under different profiles is silently wrong.
+        "force_profile": os.environ.get("EVAL_FORCE_PROFILE") or None,
         "obs_noise": obs_noise,
         "authoritative_gate_evaluation": not exploratory,
         "task_state_protocol": task_state_protocol,
@@ -3630,6 +3665,11 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--stochastic", action="store_true", help="sample actions instead of the deterministic mean")
     parser.add_argument("--keep_perturbations", action="store_true", help="keep random kicks/pushes on during eval")
+    parser.add_argument("--force_profile", choices=["heldout"], default=None,
+                        help="replace the arm's disturbance with ONE held-out profile "
+                             "(interval 4-8 s, collision 50-120 N, support 4-10 N), the "
+                             "same for every arm, so robustness is compared on a common "
+                             "test rather than on each policy's own training distribution")
     parser.add_argument(
         "--no_noise", action="store_true",
         help="disable observation noise only; joint encoder/target/init DR, "
@@ -3682,6 +3722,7 @@ def main():
 
     prepare_cfg(cfg, args.task, num_envs, args.sim_device, args.rl_device,
                 record_video=args.record_video, keep_perturbations=args.keep_perturbations,
+                force_profile=args.force_profile,
                 no_noise=args.no_noise, stress=args.stress, goal_pattern=args.goal_pattern,
                 force_visualization_probe=args.force_visualization_probe,
                 joint_encoder_bias_rad=args.joint_encoder_bias_rad,
