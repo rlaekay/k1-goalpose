@@ -12,6 +12,9 @@ body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.5 ui-monospace,SF
 header{padding:12px 16px;border-bottom:1px solid var(--line);display:flex;gap:16px;align-items:baseline;flex-wrap:wrap;position:sticky;top:0;background:var(--bg);z-index:2}
 h1{font-size:15px;margin:0;font-weight:600}
 #stamp{color:var(--dim)}
+#hist{color:var(--dim);cursor:pointer;user-select:none}
+.old{opacity:.55}
+#stale{color:var(--bad)}
 #tabs{display:flex;gap:6px;margin-left:auto;flex-wrap:wrap}
 .tab{padding:3px 10px;border:1px solid var(--line);border-radius:99px;cursor:pointer;color:var(--dim)}
 .tab.on{color:var(--fg);border-color:var(--acc);background:var(--card)}
@@ -38,6 +41,7 @@ select{background:var(--card);color:var(--fg);border:1px solid var(--line);borde
 <header>
   <h1>K1 학습 모니터</h1>
   <span id="stamp">…</span>
+  <label id="hist"><input type="checkbox" id="showold"> 이전 실행도</label>
   <div id="tabs"></div>
 </header>
 <main id="grid"></main>
@@ -104,13 +108,18 @@ async function tick(){
   $('#tabs').innerHTML=['전체',...batches].map(b=>{
     const k=b==='전체'?null:b;
     return `<span class="tab${filter===k?' on':''}" data-b="${b}">${b==='전체'?b:b+' 배치'}</span>`}).join('');
+  $('#showold').onchange=tick;
   $('#tabs').querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
     filter=t.dataset.b==='전체'?null:t.dataset.b;tick()});
-  const rows=ix.runs.filter(r=>!filter||r.batch===filter);
+  const showOld=$('#showold').checked;
+  const rows=ix.runs.filter(r=>(!filter||r.batch===filter)&&(showOld||r.latest!==false));
+  const n_old=ix.runs.length-ix.runs.filter(r=>r.latest!==false).length;
+  $('#hist').style.display=n_old?'':'none';
+  $('#hist').lastChild.textContent=` 이전 실행 ${n_old}개도 보기`;
   $('#empty').hidden=ix.runs.length>0;
   $('#grid').innerHTML=rows.map(r=>{
     const pct=r.max_iter?Math.min(100,100*r.iter/r.max_iter):0;
-    return `<div class="card" data-slug="${r.slug}">
+    return `<div class="card${r.latest===false?' old':''}" data-slug="${r.slug}">
       <div class="row"><span class="name" title="${r.run}">${r.desc}</span>
         <span class="ph ${r.phase}">${r.phase}</span></div>
       <div class="meta">${r.started_str||''} 시작 · ${r.task} · warm start ${r.warm_start||'없음'}${r.best?' · best '+r.best.split('/').pop():''}</div>

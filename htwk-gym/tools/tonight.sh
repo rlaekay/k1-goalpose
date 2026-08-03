@@ -70,14 +70,16 @@ MON_PORT="${MON_PORT:-8420}"
 SRV_IP=$(hostname -I 2>/dev/null | awk '{print $1}'); SRV_IP="${SRV_IP:-localhost}"
 if [ "$DRYRUN" = "1" ]; then
   say "DRYRUN: 모니터 기동 생략 (실제 실행 시 http://$SRV_IP:$MON_PORT/)"
-elif ! pgrep -f "tools/monitor.py --serve" >/dev/null 2>&1; then
+else
+  # ALWAYS restart. Skipping when one is already up meant a collector started
+  # before a `git pull` kept serving the old code forever -- start times and new
+  # fields simply never appeared, and it looked like a dashboard bug.
+  pkill -f "tools/monitor.py --serve" >/dev/null 2>&1 && sleep 1
   mkdir -p logs
   nohup python -u tools/monitor.py --serve --port "$MON_PORT" > logs/monitor.log 2>&1 &
   sleep 1
-  say "모니터 기동: http://$SRV_IP:$MON_PORT/"
+  say "모니터 (재)기동: http://$SRV_IP:$MON_PORT/"
   say "  안 열리면 맥에서 터널:  ssh -L $MON_PORT:localhost:$MON_PORT <user>@$SRV_IP -p <sshport>"
-else
-  say "모니터 이미 실행 중 (포트 $MON_PORT)"
 fi
 say "터미널만 쓸 경우:  python tools/monitor.py --tui"
 

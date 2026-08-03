@@ -278,7 +278,12 @@ def collect():
     # in place, so the dashboard showed I0a_repro twice with no way to tell which
     # was live; started_str disambiguates and this ordering puts the current one
     # on top.
-    runs.sort(key=lambda r: (r["batch"], r["desc"], -(r["started"] or 0)))
+    runs.sort(key=lambda r: -(r["started"] or 0))
+    seen = set()
+    for r in runs:
+        key = (r["batch"], r["desc"])
+        r["latest"] = key not in seen        # 같은 arm 중 가장 최근 실행인가
+        seen.add(key)
     return runs
 
 
@@ -318,7 +323,10 @@ def write(runs):
         light["n_evals"] = len(r["evals"])
         index.append(light)
     with open(os.path.join(DATA, "index.json"), "w") as f:
-        json.dump({"generated": time.time(), "runs": index}, f)
+        # collector_mtime lets the page tell you it is serving stale code, which
+        # is otherwise invisible and reads as a dashboard bug.
+        json.dump({"generated": time.time(), "runs": index,
+                   "collector_mtime": os.path.getmtime(os.path.abspath(__file__))}, f)
     page = os.path.join(os.path.dirname(os.path.abspath(__file__)), "monitor_page.html")
     if os.path.exists(page):
         shutil.copyfile(page, os.path.join(OUT, "index.html"))
@@ -345,7 +353,7 @@ def live_only(runs):
 
 
 def tui(runs, show_all=False):
-    shown = runs if show_all else live_only(runs)
+    shown = runs if show_all else [r for r in live_only(runs) if r.get("latest", True)]
     icon = {"training": "\033[32m▶\033[0m", "stalled": "\033[31m■\033[0m",
             "done": "\033[36m✓\033[0m", "evaluating": "\033[33m◐\033[0m",
             "evaluated": "\033[35m★\033[0m", "empty": "\033[90m·\033[0m",
