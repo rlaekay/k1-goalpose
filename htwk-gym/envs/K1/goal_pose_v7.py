@@ -941,9 +941,15 @@ class GoalPoseV7(GoalPoseV3):
         if not d.get("enabled", False):
             return
         lo, hi = d.get("interval_s", [3.0, 8.0])
+        # Draw the FIRST event from a uniform PHASE within the interval, not from
+        # the interval itself. Drawing randint(lo/dt, hi/dt) means no env can be
+        # disturbed before `lo` seconds have passed, so with interval [8, 14] the
+        # opening 8 s of training -- 27% of a 30 s episode -- was guaranteed
+        # disturbance-free for every env at once. Smoke caught it as "active on
+        # 0/300 steps"; the training-distribution defect is the bigger half.
+        # Same fix, same reason, as the dwell stagger in _reroll_paths.
         self.dist_next = torch.randint(
-            int(lo / self.dt), max(int(lo / self.dt) + 1, int(hi / self.dt)),
-            (self.num_envs,), device=self.device)
+            1, max(2, int(hi / self.dt)), (self.num_envs,), device=self.device)
 
     def _push_robots(self):
         d = self.cfg["randomization"].get("disturbance") or {}
