@@ -57,6 +57,20 @@ say "현재 GPU 점유:"
 nvidia-smi --query-compute-apps=pid,used_memory --format=csv 2>/dev/null | sed 's/^/    /'
 
 # ---- 2) 정적 검사 (즉시, GPU 불필요) ---------------------------------------
+# ---- 모니터: 서버가 headless라 이게 없으면 진행 상황을 볼 방법이 없다 --------
+# 이미 떠 있으면 다시 띄우지 않는다. 폴링 전용이라 죽어도 학습에는 영향이 없다.
+MON_PORT="${MON_PORT:-8420}"
+if ! pgrep -f "tools/monitor.py --serve" >/dev/null 2>&1; then
+  mkdir -p logs
+  nohup python -u tools/monitor.py --serve --port "$MON_PORT" > logs/monitor.log 2>&1 &
+  sleep 1
+  say "모니터 기동: http://<서버IP>:$MON_PORT/"
+  say "  터널:  ssh -L $MON_PORT:localhost:$MON_PORT <user>@<host> -p <port>  ->  http://localhost:$MON_PORT/"
+else
+  say "모니터 이미 실행 중 (포트 $MON_PORT)"
+fi
+say "터미널만 쓸 경우:  python tools/monitor.py --tui"
+
 say "=== 이름 해석 검사 ==="
 if ! python tools/check_names.py > /tmp/tonight_names.txt 2>&1; then
   if grep -v "import \*" /tmp/tonight_names.txt | grep -q UNDEFINED; then
