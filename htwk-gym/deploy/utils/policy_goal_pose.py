@@ -88,7 +88,7 @@ class GoalPosePolicy:
         # 23 here rejected the layout that actually matches the robot. The count
         # comes from the config; deploy_goal_pose verifies it against low_state
         # before publishing anything.
-        expected = int(cfg["common"].get("joint_cnt", self.default_dof_pos.size))
+        expected = int(self.cfg["common"].get("joint_cnt", self.default_dof_pos.size))
         if self.default_dof_pos.shape != (expected,):
             raise ValueError(
                 f"common.default_qpos has {self.default_dof_pos.shape[0]} entries but "

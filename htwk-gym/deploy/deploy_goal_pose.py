@@ -750,6 +750,16 @@ class Controller:
     def _request_recovery(self, reason):
         if self._recovery_phase != "none":
             return
+        # Do not arm recovery before we own the joints. low_state arrives as soon
+        # as the subscriber attaches, so a robot that is already lying down would
+        # otherwise trip the IMU watchdog during construction -- queuing a
+        # damping/get-up sequence that fires the instant the operator starts the
+        # run. Until CUSTOM is entered the SDK is in charge and it is not our
+        # place to intervene.
+        if not self._custom_mode_started:
+            self.logger.info("ignoring fall trigger before CUSTOM entry (%s); "
+                             "the robot is not under our control yet", reason)
+            return
         rec = self.cfg.get("safety", {}).get("recovery", {})
         if not bool(rec.get("enable", True)):
             self.logger.error("fall detected (%s) and recovery is disabled; stopping.",
