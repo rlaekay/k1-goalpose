@@ -924,11 +924,28 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     # ever looked.  Terrain arms exist precisely to raise this, and without it
     # they get adopted or rejected on strict success, which is accuracy, not the
     # thing being bought.  Recorded at touchdown so each swing contributes once.
+    # Support state and load sharing.  These exist because the FALL COUNT is not
+    # measurable at the exposure this project can afford -- 8-12a retired a gate
+    # for exactly that, and 4 falls in 13,922 segments cannot rank anything.  The
+    # answer to a rare event is not more of it; it is a continuous quantity that
+    # moves before the event does.  Single-support duration is balance margin
+    # spent, and load asymmetry is that margin being spent unevenly.
+    support_steps = np.zeros(3, dtype=np.int64)       # [비행, 단일지지, 양발]
+    ss_run = None                                     # 진행 중인 단일지지 길이(스텝)
+    ss_hist = np.zeros(150, dtype=np.int64)           # 0..3 s, 20 ms bins
+    ss_hist_max_s = 3.0
+    load_asym_hist = np.zeros(100, dtype=np.int64)    # 0..1
     swing_apex = None
     swing_apex_hist = np.zeros(200, dtype=np.int64)   # 0..20 cm, 1 mm bins
     swing_apex_max_m = 0.20
     if hasattr(env, "feet_clearance"):
         swing_apex = torch.zeros_like(env.feet_clearance)
+    prev_single = None
+    has_contact_forces = (hasattr(env, "contact_forces")
+                          and hasattr(env, "feet_indices"))
+    if hasattr(env, "feet_contact"):
+        ss_run = torch.zeros(env.num_envs, device=env.device)
+        prev_single = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     # peak and accumulated body speed within the segment currently in progress
     peak_speed = torch.zeros(env.num_envs, device=env.device)
     sum_speed = torch.zeros(env.num_envs, device=env.device)
@@ -1317,6 +1334,33 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
         stability_counts["valid"] += int(valid_phase.sum().item())
         stability_counts["accel"] += int(accel_phase.sum().item())
         stability_counts["cruise"] += int(cruise_phase.sum().item())
+
+        # ---- support state / load share -----------------------------------
+        if ss_run is not None:
+            n_contact = env.feet_contact.sum(dim=1)
+            alive = ~done
+            for k in (0, 1, 2):
+                support_steps[k] += int(((n_contact == k) & alive).sum().item())
+            single = (n_contact == 1) & alive
+            # 끝난 단일지지 구간만 기록한다. ss_run을 갱신하기 전에 읽어야
+            # 그 구간의 길이가 남아 있다.
+            ended = prev_single & ~single
+            if bool(ended.any()):
+                secs = (ss_run[ended] * env.dt).detach().cpu().numpy()
+                np.add.at(ss_hist, np.clip(
+                    (secs / ss_hist_max_s * len(ss_hist)).astype(int),
+                    0, len(ss_hist) - 1), 1)
+            ss_run = torch.where(single, ss_run + 1.0, torch.zeros_like(ss_run))
+            prev_single = single
+            if has_contact_forces:
+                ff = torch.norm(env.contact_forces[:, env.feet_indices, :], dim=-1)
+                both = (n_contact == 2) & alive
+                if bool(both.any()):
+                    lf, rf = ff[both, 0], ff[both, 1]
+                    asym = ((lf - rf).abs() / (lf + rf).clamp(min=1e-6))
+                    np.add.at(load_asym_hist, np.clip(
+                        (asym.detach().cpu().numpy() * len(load_asym_hist)).astype(int),
+                        0, len(load_asym_hist) - 1), 1)
 
         # ---- swing apex ---------------------------------------------------
         if swing_apex is not None and prev_feet_contact is not None:
@@ -1807,6 +1851,10 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     out["total_steps"] = total_steps
     out["instrumented"] = instrumented
     out["overlay_states"] = overlay_states
+    out["support_steps"] = support_steps
+    out["ss_hist"] = ss_hist
+    out["ss_hist_max_s"] = ss_hist_max_s
+    out["load_asym_hist"] = load_asym_hist
     out["swing_apex_hist"] = swing_apex_hist
     out["swing_apex_max_m"] = swing_apex_max_m
     out["speed_hist"] = speed_hist
@@ -2336,6 +2384,44 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
         }
     else:
         results["swing_apex_m"] = None
+
+    # ---- support / load share --------------------------------------------
+    sup = roll.get("support_steps")
+    if sup is not None and int(np.sum(sup)) > 0:
+        tot = float(np.sum(sup))
+        ssh = roll.get("ss_hist")
+        ss_max = float(roll.get("ss_hist_max_s", 3.0))
+        ss_edges = np.arange(len(ssh)) * (ss_max / len(ssh))
+        ss_cdf = np.cumsum(ssh) / max(float(np.sum(ssh)), 1.0)
+        la = roll.get("load_asym_hist")
+        la_edges = np.arange(len(la)) / float(len(la))
+        la_cdf = np.cumsum(la) / max(float(np.sum(la)), 1.0)
+
+        def _p(edges, cdf, p):
+            i = int(np.searchsorted(cdf, p / 100.0))
+            return float(edges[min(i, len(edges) - 1)])
+
+        # NOTE: disturbance_eval["support"] is a DISTURBANCE CLASS (support-force
+        # events), nothing to do with feet.  Different name on purpose.
+        results["foot_support"] = {
+            "flight_share": float(sup[0] / tot),
+            "single_support_share": float(sup[1] / tot),
+            "double_support_share": float(sup[2] / tot),
+            "single_support_s": {
+                "n": int(np.sum(ssh)),
+                "median": _p(ss_edges, ss_cdf, 50),
+                "p90": _p(ss_edges, ss_cdf, 90),
+                "p99": _p(ss_edges, ss_cdf, 99),
+            } if float(np.sum(ssh)) > 0 else None,
+            # |L-R| / (L+R) during double support.  0 = even, 1 = one foot only.
+            "load_asymmetry": {
+                "n": int(np.sum(la)),
+                "median": _p(la_edges, la_cdf, 50),
+                "p90": _p(la_edges, la_cdf, 90),
+            } if float(np.sum(la)) > 0 else None,
+        }
+    else:
+        results["foot_support"] = None
 
     # ---- path floor/leash telemetry at control-step resolution ------------
     # This is intentionally separate from segment-end path_tracking.  A carrot
