@@ -196,9 +196,15 @@ class Controller:
         self.prepare_settle_log_s = float(prepare_settle_log_s)
         self._custom_mode_entered_monotonic = 0.0
         self._prepare_q = None
+        self._joint_layout_checked = False
 
         with open(cfg_file, "r", encoding="utf-8") as f:
             self.cfg = yaml.load(f.read(), Loader=yaml.FullLoader)
+
+        # Joint vector length for THIS robot, from the config rather than the
+        # SDK's B1JointCnt. See _init_low_state_values / _verify_joint_layout.
+        self.joint_cnt = int(self.cfg["common"].get(
+            "joint_cnt", len(self.cfg["common"]["default_qpos"])))
 
         # Load and contract-check the actor before creating SDK/remote-control
         # services. A missing or wrong model must fail without touching robot I/O.
@@ -237,14 +243,24 @@ class Controller:
         self.next_inference_time = self.timer.get_time()
 
     def _init_low_state_values(self):
+        # Joint count comes from the config, NOT from B1JointCnt.
+        #
+        # B1JointCnt is 23 and the SDK's B1JointIndex map has a waist at index
+        # 10 with legs at 11..22. This K1 has no waist: low_state carries 22
+        # entries and the legs start at index 10. Sizing these arrays from the
+        # SDK constant silently shifts every leg command by one joint -- knee
+        # targets land on the ankle -- with no error anywhere. Verified on
+        # hardware: the parallel-mechanism joints (serial != parallel) sit at
+        # 14,15,20,21, not the 15,16,21,22 a 23-joint layout implies.
+        n = self.joint_cnt
         self.base_ang_vel = np.zeros(3, dtype=np.float32)
         self.projected_gravity = np.zeros(3, dtype=np.float32)
-        self.dof_pos = np.zeros(B1JointCnt, dtype=np.float32)
-        self.dof_vel = np.zeros(B1JointCnt, dtype=np.float32)
+        self.dof_pos = np.zeros(n, dtype=np.float32)
+        self.dof_vel = np.zeros(n, dtype=np.float32)
 
-        self.dof_target = np.zeros(B1JointCnt, dtype=np.float32)
-        self.filtered_dof_target = np.zeros(B1JointCnt, dtype=np.float32)
-        self.dof_pos_latest = np.zeros(B1JointCnt, dtype=np.float32)
+        self.dof_target = np.zeros(n, dtype=np.float32)
+        self.filtered_dof_target = np.zeros(n, dtype=np.float32)
+        self.dof_pos_latest = np.zeros(n, dtype=np.float32)
 
     def _init_communication(self) -> None:
         try:
@@ -260,8 +276,53 @@ class Controller:
             self.logger.error(f"Failed to initialize communication: {e}")
             raise
 
+    def _verify_joint_layout(self, low_state_msg):
+        """Fail loudly if the robot's joint vector is not the one we configured.
+
+        A mismatch here is silent and dangerous: numpy would simply write fewer
+        joints than we think, or leave the last one at zero, and every leg
+        command shifts. Checked once, on the first low_state, before any LowCmd
+        is published.
+        """
+        if self._joint_layout_checked:
+            return
+        self._joint_layout_checked = True
+        actual = len(low_state_msg.motor_state_serial)
+        if actual != self.joint_cnt:
+            raise RuntimeError(
+                "Joint count mismatch: robot reports %d joints, config says %d "
+                "(common.joint_cnt, or len(common.default_qpos)). "
+                "This K1 has no waist joint, so the correct layout is 22 joints "
+                "with policy.leg_dof_start=10. Running with the wrong layout "
+                "shifts every leg command by one joint."
+                % (actual, self.joint_cnt)
+            )
+        # The parallel-mechanism indices are a second, independent fingerprint of
+        # the layout: those are the only joints where serial and parallel differ.
+        try:
+            observed = {
+                i for i in range(actual)
+                if abs(low_state_msg.motor_state_serial[i].q
+                       - low_state_msg.motor_state_parallel[i].q) > 1e-4
+            }
+        except Exception:
+            return
+        configured = set(self.cfg.get("mech", {}).get("parallel_mech_indexes", []))
+        if observed and configured and observed != configured:
+            raise RuntimeError(
+                "Parallel-mechanism indices disagree with the robot: observed %s, "
+                "config mech.parallel_mech_indexes=%s. The configured joint layout "
+                "does not match this hardware."
+                % (sorted(observed), sorted(configured))
+            )
+        self.logger.info(
+            "[joint-layout] %d joints, legs %d..%d, parallel %s -- matches hardware",
+            actual, self.policy.leg_start,
+            self.policy.leg_start + self.policy.num_act - 1, sorted(configured))
+
     def _low_state_handler(self, low_state_msg: LowState):
         # Safety watchdog: a large base roll/pitch means the robot is going over.
+        self._verify_joint_layout(low_state_msg)
         self._last_low_state_monotonic = time.monotonic()
         self._latest_rpy[:] = low_state_msg.imu_state.rpy
         rpy_limit = float(self.cfg.get("safety", {}).get("roll_pitch_limit_rad", 1.0))
@@ -344,9 +405,9 @@ class Controller:
         # the earlier check alone cannot make that transition safe.
         self._require_fresh_low_state("immediately before CUSTOM mode")
         create_prepare_cmd(self.low_cmd, self.cfg)
-        prepare_q = np.array([self.low_cmd.motor_cmd[i].q for i in range(B1JointCnt)],
+        prepare_q = np.array([self.low_cmd.motor_cmd[i].q for i in range(self.joint_cnt)],
                              dtype=np.float64)
-        for i in range(B1JointCnt):
+        for i in range(self.joint_cnt):
             self.dof_target[i] = self.low_cmd.motor_cmd[i].q
             self.filtered_dof_target[i] = self.low_cmd.motor_cmd[i].q
 
@@ -411,7 +472,7 @@ class Controller:
         if getattr(self, "_prepare_q", None) is not None:
             self._log_joint_deviation("at RL-gait start (vs prepare)", self._prepare_q)
         create_first_frame_rl_cmd(self.low_cmd, self.cfg)
-        rl_q = np.array([self.low_cmd.motor_cmd[i].q for i in range(B1JointCnt)],
+        rl_q = np.array([self.low_cmd.motor_cmd[i].q for i in range(self.joint_cnt)],
                         dtype=np.float64)
         # This is the second posture change of the sequence: prepare pose/gains
         # -> RL pose/gains. Its size is the jump the policy has to start from.
@@ -514,7 +575,7 @@ class Controller:
 
             self.filtered_dof_target = self.filtered_dof_target * 0.8 + self.dof_target * 0.2
 
-            for i in range(B1JointCnt):
+            for i in range(self.joint_cnt):
                 self.low_cmd.motor_cmd[i].q = self.filtered_dof_target[i]
 
             # Series-parallel conversion for the parallel-mechanism joints.

@@ -140,18 +140,51 @@ PY
 "
 
 # ------------------------------------- 3. cross-check frozen config vs deploy --
-info "3/5 cross-checking frozen run config against ${DEPLOY_CONFIG}"
+# Two comparisons, and the second one matters more. sim<->deploy catches a
+# mistyped gain. deploy<->hardware catches a config written for the wrong robot,
+# which is how a 23-joint config (SDK B1JointCnt says 23, with a waist) came to
+# be shipped for a robot that reports 22 joints with the legs starting one index
+# earlier. Both configs agreed with each other and both were wrong.
+info "3/5 cross-checking frozen run config and real robot layout"
+
+LAYOUT_LOCAL=""
+if [ "${EXPORT_ONLY}" -eq 0 ] && [ "${DRY_RUN}" -eq 0 ]; then
+  if run_robot "test -f '${ROBOT_WS}/dump_robot_layout.py'" 2>/dev/null; then
+    :
+  else
+    scp -q -P "${ROBOT_PORT}" "${SCRIPT_DIR}/dump_robot_layout.py" \
+        "${ROBOT}:${ROBOT_WS}/" 2>/dev/null || true
+  fi
+  LAYOUT_LOCAL="$(mktemp -t robot_layout).json"
+  if run_robot "cd '${ROBOT_WS}' && python3 dump_robot_layout.py --out /tmp/robot_layout.json >/dev/null 2>&1" \
+     && scp -q -P "${ROBOT_PORT}" "${ROBOT}:/tmp/robot_layout.json" "${LAYOUT_LOCAL}" 2>/dev/null; then
+    info "      robot layout: $(python3 -c "
+import json;d=json.load(open('${LAYOUT_LOCAL}'))
+print('joint_cnt=%s leg_dof_start=%s parallel=%s' % (d['joint_cnt'], d['inferred_leg_dof_start'], d['parallel_mech_indexes']))" 2>/dev/null || echo '?')"
+  else
+    warn "could not read the robot's joint layout (is it powered and its motion stack running?)"
+    warn "the deploy config will NOT be checked against hardware"
+    LAYOUT_LOCAL=""
+  fi
+fi
+
 SERVER_FROZEN="$( { run_server "cat '${FROZEN_CONFIG}'" 2>/dev/null || true; } )"
-if [ "${DRY_RUN}" -eq 0 ] && [ -z "${SERVER_FROZEN}" ]; then
-  warn "could not read frozen config at ${FROZEN_CONFIG}; skipping cross-check"
-elif [ "${DRY_RUN}" -eq 0 ]; then
+if [ "${DRY_RUN}" -eq 0 ]; then
+  if [ -z "${SERVER_FROZEN}" ]; then
+    warn "could not read frozen config at ${FROZEN_CONFIG}; comparing against hardware only"
+    SERVER_FROZEN="{}"
+  fi
+  CHECK_ARGS=(--deploy-config "${REPO_ROOT}/htwk-gym/deploy/configs/${DEPLOY_CONFIG}"
+              --frozen-config -)
+  [ -n "${LAYOUT_LOCAL}" ] && CHECK_ARGS+=(--robot-layout "${LAYOUT_LOCAL}")
   CHECK_RC=0
   printf '%s' "${SERVER_FROZEN}" | python3 "${SCRIPT_DIR}/check_policy_contract.py" \
-      --deploy-config "${REPO_ROOT}/htwk-gym/deploy/configs/${DEPLOY_CONFIG}" \
-      --frozen-config - || CHECK_RC=$?
+      "${CHECK_ARGS[@]}" || CHECK_RC=$?
+  [ -n "${LAYOUT_LOCAL}" ] && rm -f "${LAYOUT_LOCAL}"
   if [ "${CHECK_RC}" -ne 0 ]; then
     if [ "${FORCE}" -eq 1 ]; then
       warn "contract mismatch, continuing because --force was given"
+      warn "a joint-layout mismatch means every leg command lands on the wrong joint"
     else
       die "contract mismatch (see above). Fix ${DEPLOY_CONFIG}, or pass --force if you are sure."
     fi

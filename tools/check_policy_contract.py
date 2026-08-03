@@ -20,6 +20,7 @@ Exit status is 0 when everything matches, 1 on any mismatch.
 """
 
 import argparse
+import json
 import sys
 
 try:
@@ -102,6 +103,10 @@ def main():
                     help="training run config.yaml ('-' for stdin)")
     ap.add_argument("--deploy-config", required=True,
                     help="deploy/configs/<Policy>.yaml")
+    ap.add_argument("--robot-layout", default=None,
+                    help="robot_layout.json from tools/dump_robot_layout.py. "
+                         "Without it the deploy config is only checked against "
+                         "the training run, never against the actual hardware.")
     args = ap.parse_args()
 
     if args.frozen_config == "-":
@@ -213,6 +218,30 @@ def main():
         check("gait_frequency in trained range",
               "[%g, %g]" % (lo, hi), dep_gait, lo - 1e-9 <= float(dep_gait) <= hi + 1e-9)
 
+    # --- hardware ------------------------------------------------------------
+    # The training config and the deploy config can agree perfectly and still
+    # both be wrong for the robot: that is exactly what happened here, where
+    # both assumed 23 joints with a waist and the robot has 22 without one.
+    # Comparing only sim<->deploy cannot catch it.
+    hw_checked = False
+    if args.robot_layout:
+        with open(args.robot_layout) as fh:
+            hw = json.load(fh)
+        hw_checked = True
+        dep_cnt = int(get(deploy, "common.joint_cnt", len(dep_qpos)))
+        check("robot joint_cnt", hw.get("joint_cnt"), dep_cnt,
+              hw.get("joint_cnt") == dep_cnt)
+        check("robot default_qpos length", hw.get("joint_cnt"), len(dep_qpos),
+              hw.get("joint_cnt") == len(dep_qpos))
+        hw_par = hw.get("parallel_mech_indexes")
+        dep_par = get(deploy, "mech.parallel_mech_indexes")
+        if hw_par is not None and dep_par is not None:
+            check("robot parallel_mech_indexes", hw_par, list(dep_par),
+                  sorted(hw_par) == sorted(dep_par))
+        inferred = hw.get("inferred_leg_dof_start")
+        if inferred is not None:
+            check("robot leg_dof_start", inferred, leg_start, inferred == leg_start)
+
     # --- report -------------------------------------------------------------
     compared = [c for c in checks if c[1] is not None and c[2] is not None]
     failed = [c for c in compared if not c[3]]
@@ -238,6 +267,11 @@ def main():
         return 1
 
     print("\n%sall %d comparable fields match%s" % (GREEN, len(compared), RESET))
+    if not hw_checked:
+        print("%sNo --robot-layout given: this compared the deploy config against "
+              "the training run only.%s\nBoth can agree and still be wrong for the "
+              "robot. Run tools/dump_robot_layout.py on the robot and pass the "
+              "result." % (YELLOW, RESET))
     return 0
 
 

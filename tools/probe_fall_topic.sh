@@ -14,7 +14,8 @@
 # and once in CUSTOM. If /fall_down_recovery_state goes silent in CUSTOM, the
 # deploy has to detect falls from IMU itself.
 
-set -uo pipefail
+# ROS setup scripts reference unset vars; -u would abort on sourcing them.
+set -o pipefail
 SECS="${1:-10}"
 
 source /opt/ros/humble/setup.bash

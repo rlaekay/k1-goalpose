@@ -4,16 +4,19 @@
 # goal_rel_y, heading_error) in the robot-local frame and outputs 12 leg joint
 # targets. See ROBOT_DEPLOY_E0_GUIDE.md and envs/K1/Goal_Pose_V7.yaml.
 #
-# 23-joint order: indices 0..10 = arms/head/waist (NOT policy-controlled),
-#                 indices 11..22 = legs (the 12 policy DOFs).
+# 22-joint order: indices 0..9  = head/arms (NOT policy-controlled),
+#                 indices 10..21 = legs (the 12 policy DOFs).
+# There is NO waist joint on this robot, despite SDK B1JointCnt==23 and
+# B1JointIndex placing one at index 10. Verified against low_state.
 
 common:
   dt: 0.002
+  # This K1 has no waist joint: low_state carries 22 entries, legs at 10..21.
+  joint_cnt: 22
   stiffness: [
     20, 20,
     20, 20, 20, 20,
     20, 20, 20, 20,
-    200,
     # Frozen E0@6200 config: Hip/Knee 100, Ankle 50 N*m/rad.
     100, 100, 100, 100, 50, 50,
     100, 100, 100, 100, 50, 50
@@ -22,14 +25,13 @@ common:
     0.2, 0.2,
     0.5, 0.5, 0.5, 0.5,
     0.5, 0.5, 0.5, 0.5,
-    5,
     # Frozen E0@6200 config: Hip/Knee 2, Ankle 1 N*m*s/rad.
     2, 2, 2, 2, 1, 1,
     2, 2, 2, 2, 1, 1
   ]
-  # legs [11:23] MUST match E0 training default_joint_angles
+  # legs [10:22] MUST match E0 training default_joint_angles
   # (Hip_Pitch -0.2, Knee_Pitch 0.4, Ankle_Pitch -0.25, rest 0).
-  # arms/head/waist [0:11] = K1_locomotion.urdf arms-down pose, identical to
+  # head/arms [0:10] = K1_locomotion.urdf arms-down pose, identical to
   # Base_Walk.yaml and Parameter_Walk.yaml (shoulder_roll +/-1.35 rad ~= 77 deg
   # splay), which is close to E0's ~80 deg armsdown training geometry. E0 does
   # not observe/control the arms; the deploy layer just holds this posture.
@@ -37,7 +39,6 @@ common:
     0, 0,
     0.2, -1.35, 0, -0.5,
     0.2, 1.35, 0, 0.5,
-    0,
     -0.2, 0, 0, 0.4, -0.25, 0,
     -0.2, 0, 0, 0.4, -0.25, 0
   ]
@@ -45,7 +46,6 @@ common:
     7, 7,
     10, 10, 10, 10,
     10, 10, 10, 10,
-    30,
     60, 25, 30, 60, 24, 15,
     60, 25, 30, 60, 24, 15
   ]
@@ -54,7 +54,7 @@ policy:
   policy_path: "./models/goal_pose_e0.pt"   # actor-only TorchScript from export_model.py
   num_actions: 12
   num_observations: 54
-  leg_dof_start: 11          # first leg index in the 23-joint vector
+  leg_dof_start: 10          # first leg index in the 22-joint vector
 
   # E0 deploy cadence. Trained range was [1.8, 2.4] Hz; 2.0 is the guide default.
   gait_frequency: 2.0
@@ -85,14 +85,15 @@ policy:
     decimation: 10            # 10 * dt(0.002) = 20 ms policy tick (50 Hz)
 
 mech:
-  parallel_mech_indexes: [15, 16, 21, 22]
+  # Verified on hardware: these are the only indices where
+  # motor_state_serial and motor_state_parallel differ.
+  parallel_mech_indexes: [14, 15, 20, 21]
 
 prepare:
   stiffness: [
     5., 5.,
     40., 50., 20., 10.,
     40., 50., 20., 10.,
-    100.,
     350., 350., 180., 350., 450., 450.,
     350., 350., 180., 350., 450., 450.,
   ]
@@ -100,7 +101,6 @@ prepare:
     0.1, 0.1,
     0.5, 1.5, 0.2, 0.2,
     0.5, 1.5, 0.2, 0.2,
-    5.0,
     7.5, 7.5, 3., 5.5, 0.5, 0.5,
     7.5, 7.5, 3., 5.5, 0.5, 0.5,
   ]
@@ -108,7 +108,6 @@ prepare:
     0.0,  0.0,
     0.25, -1.4, 0.0, -0.5,
     0.25, 1.4, 0.0, 0.5,
-    0.0,
     -0.1, 0.0, 0.0, 0.2, -0.1, 0.0,
     -0.1, 0.0, 0.0, 0.2, -0.1, 0.0,
   ]

@@ -82,15 +82,24 @@ class GoalPosePolicy:
         self.actions = np.zeros(self.num_act, dtype=np.float32)
         self.dof_targets = np.copy(self.default_dof_pos)
 
-        if self.default_dof_pos.shape != (23,):
+        # Do not pin the joint count to 23. The SDK constant B1JointCnt is 23 and
+        # its B1JointIndex map places a waist at index 10, but this K1 has no
+        # waist: low_state carries 22 joints with the legs at 10..21. Hardcoding
+        # 23 here rejected the layout that actually matches the robot. The count
+        # comes from the config; deploy_goal_pose verifies it against low_state
+        # before publishing anything.
+        expected = int(cfg["common"].get("joint_cnt", self.default_dof_pos.size))
+        if self.default_dof_pos.shape != (expected,):
             raise ValueError(
-                f"common.default_qpos must contain 23 K1 joints, got {self.default_dof_pos.shape}"
+                f"common.default_qpos has {self.default_dof_pos.shape[0]} entries but "
+                f"common.joint_cnt is {expected}"
             )
         if self.leg_start + self.num_act != self.default_dof_pos.size:
             raise ValueError(
-                "policy leg slice does not cover exactly the final 12 K1 joints: "
+                "policy leg slice must cover exactly the final joints of the vector: "
                 f"leg_start={self.leg_start}, num_actions={self.num_act}, "
-                f"joints={self.default_dof_pos.size}"
+                f"joints={self.default_dof_pos.size}. For this K1 that means "
+                "leg_dof_start=10 with 22 joints."
             )
 
     def _validate_policy_contract(self):
