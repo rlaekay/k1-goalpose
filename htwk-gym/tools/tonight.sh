@@ -27,11 +27,18 @@ CKPT="${CKPT:-logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_E0_armB_armsdown/nn/mo
 MAX_WAIT_MIN="${MAX_WAIT_MIN:-90}"
 
 say() { echo "[$(date +%H:%M:%S)] $*"; }
+# 통과한 arm만 먼저 띄우고 싶을 때:  ARMS="G1_speed G2_robust" bash tools/tonight.sh
+ARMS="${ARMS:-G1_speed G2_robust G3_full G4_smoothturn}"
+NARMS=$(echo $ARMS | wc -w | tr -d " ")
 
-say "=== ${NARMS}종: 스모크 -> 학습 (${ITERS} iter, 카드당 1개) ==="
+
+say "=== ${NARMS}종: 스모크 -> 학습 (${ITERS} iter) ==="
 
 # ---- 0) warm-start 체크포인트가 실제로 있는지 ------------------------------
-if [ ! -f "$CKPT" ]; then
+DRYRUN="${DRYRUN:-0}"    # 1 = GPU 없이 변수/문구/순서만 검사하고 빠져나온다.
+                         # `bash -n`은 문법만 보고 `set -u`의 미정의 변수는 못 잡는다.
+                         # NARMS가 정의보다 먼저 쓰여 launch가 죽은 사고에서 나왔다.
+if [ "$DRYRUN" != "1" ] && [ ! -f "$CKPT" ]; then
   say "!!! warm-start 체크포인트 없음: $CKPT"
   say "    확인:  ls logs/K1/K1/Goal_Pose_V7/*E0*/nn/model_*.pth | tail"
   exit 1
@@ -60,12 +67,15 @@ nvidia-smi --query-compute-apps=pid,used_memory --format=csv 2>/dev/null | sed '
 # ---- 모니터: 서버가 headless라 이게 없으면 진행 상황을 볼 방법이 없다 --------
 # 이미 떠 있으면 다시 띄우지 않는다. 폴링 전용이라 죽어도 학습에는 영향이 없다.
 MON_PORT="${MON_PORT:-8420}"
-if ! pgrep -f "tools/monitor.py --serve" >/dev/null 2>&1; then
+SRV_IP=$(hostname -I 2>/dev/null | awk '{print $1}'); SRV_IP="${SRV_IP:-localhost}"
+if [ "$DRYRUN" = "1" ]; then
+  say "DRYRUN: 모니터 기동 생략 (실제 실행 시 http://$SRV_IP:$MON_PORT/)"
+elif ! pgrep -f "tools/monitor.py --serve" >/dev/null 2>&1; then
   mkdir -p logs
   nohup python -u tools/monitor.py --serve --port "$MON_PORT" > logs/monitor.log 2>&1 &
   sleep 1
-  say "모니터 기동: http://<서버IP>:$MON_PORT/"
-  say "  터널:  ssh -L $MON_PORT:localhost:$MON_PORT <user>@<host> -p <port>  ->  http://localhost:$MON_PORT/"
+  say "모니터 기동: http://$SRV_IP:$MON_PORT/"
+  say "  안 열리면 맥에서 터널:  ssh -L $MON_PORT:localhost:$MON_PORT <user>@$SRV_IP -p <sshport>"
 else
   say "모니터 이미 실행 중 (포트 $MON_PORT)"
 fi
@@ -82,9 +92,11 @@ fi
 say "이름 검사 통과"
 
 # ---- 3) arm별 config 생성 + 스모크 -----------------------------------------
-# 통과한 arm만 먼저 띄우고 싶을 때:  ARMS="G1_speed G2_robust" bash tools/tonight.sh
-ARMS="${ARMS:-G1_speed G2_robust G3_full G4_smoothturn}"
-NARMS=$(echo $ARMS | wc -w)
+if [ "$DRYRUN" = "1" ]; then
+  say "DRYRUN: 여기까지 변수/문구 검사 통과. GPU 작업은 건너뛴다."
+  exit 0
+fi
+
 say "=== config 생성 + 스모크 (${NARMS}종: $ARMS) ==="
 for arm in $ARMS; do
   task="K1/Goal_Pose_V7"
@@ -199,7 +211,7 @@ fi
 say ""
 say "=== ${NARMS}종 실행 중 ==="
 say "진행 상황:"
-say "  http://<서버IP>:$MON_PORT/          웹 (배치별 분류 + reward 그래프)"
+say "  http://$SRV_IP:$MON_PORT/          웹 (배치별 분류 + reward/정확도 그래프)"
 say "  python tools/monitor.py --tui      터미널"
 say "  tmux attach -t $SESSION"
 say ""
