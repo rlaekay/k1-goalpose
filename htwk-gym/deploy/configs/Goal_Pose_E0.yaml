@@ -1,44 +1,55 @@
-# E0 GoalPose position-policy deploy config.
+# GoalPose position-policy deploy config for this K1.
+#
+# Derived from Goal_Pose_E1.yaml, the configuration verified on this robot.
+# codex's earlier E0 config was wrong in ways that showed up on hardware: a
+# 23-joint layout for a 22-joint robot, and prepare ankle gains of kp=450 with
+# kd=0.5 -- a damping ratio near zero, which is what made the whole robot ring
+# on CUSTOM entry. E1 uses kp=250 with kd=5 there.
+#
+# Two values are NOT E1's, because our contract check tied them to the
+# checkpoint actually installed here (I2a_dr model_150, task Goal_Pose_V7):
+#   policy.policy_path  - the model we installed
+#   policy.goal_clamp   - frozen commands.goal_dx/dy for this run: 2.0 / 1.5.
+#                         E1's 3.0/3.0 belongs to a different checkpoint, and
+#                         clamping wider than training would feed the policy
+#                         goals it never saw.
 #
 # E0 is NOT a velocity walk. It consumes a goal-pose error (goal_rel_x,
 # goal_rel_y, heading_error) in the robot-local frame and outputs 12 leg joint
 # targets. See ROBOT_DEPLOY_E0_GUIDE.md and envs/K1/Goal_Pose_V7.yaml.
 #
-# 22-joint order: indices 0..9  = head/arms (NOT policy-controlled),
-#                 indices 10..21 = legs (the 12 policy DOFs).
-# There is NO waist joint on this robot, despite SDK B1JointCnt==23 and
-# B1JointIndex placing one at index 10. Verified against low_state.
+# 23-joint order: indices 0..10 = arms/head/waist (NOT policy-controlled),
+#                 indices 11..22 = legs (the 12 policy DOFs).
 
 common:
   dt: 0.002
-  # This K1 has no waist joint: low_state carries 22 entries, legs at 10..21.
   joint_cnt: 22
   stiffness: [
-    20, 20,
-    20, 20, 20, 20,
-    20, 20, 20, 20,
+    4, 4,
+    4, 4, 4, 4,
+    4, 4, 4, 4,
     # Frozen E0@6200 config: Hip/Knee 100, Ankle 50 N*m/rad.
     100, 100, 100, 100, 50, 50,
     100, 100, 100, 100, 50, 50
   ]
   damping: [
-    0.2, 0.2,
-    0.5, 0.5, 0.5, 0.5,
-    0.5, 0.5, 0.5, 0.5,
+    1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0,
     # Frozen E0@6200 config: Hip/Knee 2, Ankle 1 N*m*s/rad.
     2, 2, 2, 2, 1, 1,
     2, 2, 2, 2, 1, 1
   ]
-  # legs [10:22] MUST match E0 training default_joint_angles
+  # legs [11:23] MUST match E0 training default_joint_angles
   # (Hip_Pitch -0.2, Knee_Pitch 0.4, Ankle_Pitch -0.25, rest 0).
-  # head/arms [0:10] = K1_locomotion.urdf arms-down pose, identical to
+  # arms/head/waist [0:11] = K1_locomotion.urdf arms-down pose, identical to
   # Base_Walk.yaml and Parameter_Walk.yaml (shoulder_roll +/-1.35 rad ~= 77 deg
   # splay), which is close to E0's ~80 deg armsdown training geometry. E0 does
   # not observe/control the arms; the deploy layer just holds this posture.
   default_qpos: [
     0, 0,
-    0.2, -1.35, 0, -0.5,
-    0.2, 1.35, 0, 0.5,
+    0.0, -1.3, 0, 0.0,
+    0.0, 1.3, 0, 0.0,
     -0.2, 0, 0, 0.4, -0.25, 0,
     -0.2, 0, 0, 0.4, -0.25, 0
   ]
@@ -46,12 +57,12 @@ common:
     7, 7,
     10, 10, 10, 10,
     10, 10, 10, 10,
-    60, 25, 30, 60, 24, 15,
-    60, 25, 30, 60, 24, 15
+    45, 30, 30, 45, 20, 20,
+    45, 30, 30, 45, 20, 20
   ]
 
 policy:
-  policy_path: "./models/goal_pose_i2a.pt"   # actor-only TorchScript from export_model.py
+  policy_path: "./models/goal_pose_i2a.pt"   # installed by tools/install_policy.sh
   num_actions: 12
   num_observations: 54
   leg_dof_start: 10          # first leg index in the 22-joint vector
@@ -61,6 +72,7 @@ policy:
 
   # Goal command clamp = E0 trained goal range (Goal_Pose_V7.yaml commands.goal_dx/dy).
   goal_clamp:
+    # Frozen commands.goal_dx / goal_dy of the installed run.
     x_m: 2.0
     y_m: 1.5
 
@@ -85,31 +97,30 @@ policy:
     decimation: 10            # 10 * dt(0.002) = 20 ms policy tick (50 Hz)
 
 mech:
-  # Verified on hardware: these are the only indices where
-  # motor_state_serial and motor_state_parallel differ.
   parallel_mech_indexes: [14, 15, 20, 21]
 
 prepare:
   stiffness: [
-    5., 5.,
-    40., 50., 20., 10.,
-    40., 50., 20., 10.,
-    350., 350., 180., 350., 450., 450.,
-    350., 350., 180., 350., 450., 450.,
+    40, 40, 
+    40, 50, 20, 20, 
+    40, 50, 20, 20,
+    350, 350, 180, 350, 250, 250,
+    350, 350, 180, 350, 250, 250
   ]
+
   damping: [
-    0.1, 0.1,
+    1.5, 1.5,
     0.5, 1.5, 0.2, 0.2,
     0.5, 1.5, 0.2, 0.2,
-    7.5, 7.5, 3., 5.5, 0.5, 0.5,
-    7.5, 7.5, 3., 5.5, 0.5, 0.5,
+    7.5, 7.5, 3, 5.5, 5, 5, 
+    7.5, 7.5, 3, 5.5, 5, 5
   ]
   default_qpos: [
-    0.0,  0.0,
-    0.25, -1.4, 0.0, -0.5,
-    0.25, 1.4, 0.0, 0.5,
-    -0.1, 0.0, 0.0, 0.2, -0.1, 0.0,
-    -0.1, 0.0, 0.0, 0.2, -0.1, 0.0,
+    0, 0,
+    0.0, -1.3, 0, 0.0,
+    0.0,  1.3, 0, 0.0,
+    -0.2, 0, 0, 0.4, -0.25, 0,
+    -0.2, 0, 0, 0.4, -0.25, 0
   ]
 
 # Bring-up goal source (used only by deploy_goal_pose.py in --goal-source fixed).
@@ -124,47 +135,33 @@ deploy_goal:
   debug_period_s: 0.10        # 10 Hz end-to-end policy bridge diagnostics
 
 safety:
-  # Stop LowCmd publication and request DAMPING if robot state stops arriving.
   low_state_timeout_s: 0.20
-  # Fast fall trigger, evaluated at low_state rate (~500 Hz). The SDK's own fall
-  # topic only publishes at 1 Hz, so waiting for it would let the policy keep
-  # driving a robot that is already going over.
-  #
   # Angle between gravity-in-body-frame and its upright value [0,0,-1]:
   # 0 upright, 90 deg horizontal. NOT raw roll/pitch -- rpy is ZYX Euler and
-  # roll is degenerate near pitch +-90 deg, where a prone robot reported
+  # roll is degenerate near pitch +-90 deg, where a prone robot here reported
   # roll 172 deg. Same vector the policy reads as obs[0:3].
-  #
-  # 45 deg is well past any lean a walking humanoid should hold and well short
-  # of horizontal, so it catches a fall in progress without firing on normal
-  # motion. TUNE IT FROM DATA: policy_debug carries tilt_deg every cycle, so
-  # after a few clean runs set this above the observed walking maximum.
+  # Tune from data: policy_debug carries tilt_deg every cycle.
   fall_tilt_limit_rad: 0.785      # 45 deg
   roll_pitch_limit_rad: 1.0       # legacy name, used only if the above is absent
 
   recovery:
     enable: true
     # Authoritative fall state + whether the SDK will run its get-up. Measured
-    # at ~1 Hz: too slow to trigger on, but it is the only source for
+    # at ~1 Hz: too slow to trigger on, but the only source for
     # is_recovery_available, and calling GetUp without it just fails.
     fall_topic: "/fall_down"                       # typed FallDownState
     fall_raw_topic: "/fall_down_recovery_state"    # 3-byte fallback
-    damping_settle_s: 1.5         # let the robot come to rest before asking to get up
-    recovery_wait_timeout_s: 10.0 # give up if get-up never becomes available
+    damping_settle_s: 1.5
+    recovery_wait_timeout_s: 10.0
     # Measured on hardware: HAS_FALLEN -> IS_READY took 8.0 s.
     getup_timeout_s: 20.0
-    # Only used when the fall topic is unavailable. Must clear the measured 8.0 s
-    # with margin, or we would declare the robot standing while it is still
-    # getting up.
     getup_blind_wait_s: 12.0
-    # kPrepare IS the standing mode. Taking the joints from a collapsed robot
-    # means the policy starts from a heap on the floor, so CUSTOM entry first
-    # confirms (or requests) PREPARE. Read from /robot_states, because
-    # ChangeMode's return code is not reliable.
+    # kPrepare IS the standing mode. Read the real mode from /robot_states;
+    # ChangeMode's return code is not reliable (rc=100 after a 1.000 s timeout
+    # on transitions that had taken effect).
     require_standing_before_custom: true
     prepare_timeout_s: 15.0
     prepare_settle_s: 1.0
-    # CUSTOM entry ramps from the *measured* pose to the RL pose over this long.
-    # Latching the measured pose makes the step zero regardless of where we come
-    # from; measured cost of the old snap entry was 0.53 rad / 2.8 s.
-    custom_entry_ramp_s: 0.6
+    # Measured pose -> prepare pose blend at CUSTOM entry, smoothstep.
+    # 2.0 s matches the verified E1 wrapper.
+    custom_entry_ramp_s: 2.0

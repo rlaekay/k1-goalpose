@@ -660,34 +660,45 @@ class Controller:
 
     # ------------------------------------------------------------------ entry --
     def _fill_low_cmd(self, q_target, kp, kd):
-        """Write one LowCmd frame, treating the parallel-mechanism joints correctly.
+        """Write one LowCmd frame: plain position control on every joint.
 
-        Those joints (measured at indices 14, 15, 20, 21) drive a linkage, not a
-        free axis. Commanding them by position fights the linkage: the first
-        hardware start shook the whole robot because this entry path set them to
-        a position target at prepare stiffness (450). The steady-state publish
-        loop has always done the right thing -- hold the measured angle, zero the
-        position gain, and drive with a torque feedforward -- so do the same here
-        rather than having two different behaviours on the same joints.
+        No parallel-mechanism torque conversion. The verified E1 wrapper
+        (deploy_choon.py) commands all 22 joints by position and uses
+        mech.parallel_mech_indexes only to range-check the config.
+
+        What made the robot ring on the first attempt was the gain, not the
+        control mode: codex's prepare block had ankle kp=450 with kd=0.5, a
+        damping ratio near zero. E1 uses kp=250 with kd=5. Replacing position
+        control with a torque feedforward instead just traded ringing for an
+        ankle that folded slowly under load.
         """
-        parallel = set(self.cfg.get("mech", {}).get("parallel_mech_indexes", []))
-        stiffness = self.cfg["common"]["stiffness"]
-        torque_limit = self.cfg["common"]["torque_limit"]
         for i in range(self.joint_cnt):
+            self.low_cmd.motor_cmd[i].q = float(q_target[i])
             self.low_cmd.motor_cmd[i].dq = 0.0
-            if i in parallel:
-                measured = float(self.dof_pos_latest[i])
-                self.low_cmd.motor_cmd[i].q = measured
-                self.low_cmd.motor_cmd[i].kp = 0.0
-                self.low_cmd.motor_cmd[i].kd = float(kd[i])
-                self.low_cmd.motor_cmd[i].tau = float(np.clip(
-                    (float(q_target[i]) - measured) * stiffness[i],
-                    -torque_limit[i], torque_limit[i]))
-            else:
-                self.low_cmd.motor_cmd[i].q = float(q_target[i])
-                self.low_cmd.motor_cmd[i].kp = float(kp[i])
-                self.low_cmd.motor_cmd[i].kd = float(kd[i])
-                self.low_cmd.motor_cmd[i].tau = 0.0
+            self.low_cmd.motor_cmd[i].tau = 0.0
+            self.low_cmd.motor_cmd[i].kp = float(kp[i])
+            self.low_cmd.motor_cmd[i].kd = float(kd[i])
+
+    def _wait_for_low_state_after_custom(self, hold_target, kp, kd):
+        """Hold the entry pose until LowState resumes after the mode change.
+
+        ChangeMode can interrupt LowState. Ramping across that gap would compute
+        targets from a stale measurement, so hold still until fresh state is
+        back and refuse to continue if it never is. From the E1 wrapper.
+        """
+        timeout_s = 3.0
+        deadline = time.monotonic() + timeout_s
+        low_state_timeout = float(self.cfg.get("safety", {}).get("low_state_timeout_s", 0.2))
+        while time.monotonic() < deadline:
+            age = time.monotonic() - self._last_low_state_monotonic
+            if self._last_low_state_monotonic > 0.0 and age <= low_state_timeout:
+                return
+            self._fill_low_cmd(hold_target, kp, kd)
+            self._send_cmd(self.low_cmd)
+            time.sleep(0.02)
+        raise RuntimeError(
+            "LowState did not resume within %.1fs after entering CUSTOM; "
+            "stopped while holding the measured entry pose" % timeout_s)
 
 
     def _enter_custom_latched(self, ramp_s=None):
@@ -737,25 +748,31 @@ class Controller:
         self._custom_mode_entered_monotonic = time.monotonic()
         self.logger.info("[mode-timing] ChangeMode(kCustom) rc=%s in %.3f s",
                          rc, self._custom_mode_entered_monotonic - t0)
+        self._wait_for_low_state_after_custom(latched, prep_stiff, prep_damp)
 
         # Ramp pose and gains together. Keeping the command streaming through
         # the transition is what makes it smooth; a single frame followed by
         # silence leaves the robot on a stale target.
-        # Drive the ramp off wall-clock, not a sleep count. time.sleep(0.002)
-        # actually takes ~20 ms here, so counting 300 steps of dt turned a 0.6 s
-        # ramp into 7 s -- the measured "entry done in 8.04 s" was almost all
-        # this.
-        dt = float(self.cfg["common"]["dt"])
+        # Blend measured pose -> policy default. Duration, shape and 20 ms
+        # cadence follow the E1 wrapper. Smoothstep has zero slope at both ends,
+        # so there is no velocity step on entry or exit; the linear ramp applied
+        # its full rate instantly, which is what threw the ankles once the ramp
+        # was shortened from 7 s to 0.6 s.
+        step_dt = 0.02
         ramp_start = time.monotonic()
+        next_send = ramp_start
         while True:
-            a = min(1.0, (time.monotonic() - ramp_start) / max(1e-6, ramp_s))
-            self._fill_low_cmd((1 - a) * latched + a * rl_q,
-                               (1 - a) * prep_stiff + a * rl_stiff,
-                               (1 - a) * prep_damp + a * rl_damp)
+            self._require_fresh_low_state("during CUSTOM entry ramp")
+            alpha = min(1.0, (time.monotonic() - ramp_start) / max(1e-6, ramp_s))
+            blend = alpha * alpha * (3.0 - 2.0 * alpha)
+            self._fill_low_cmd((1 - blend) * latched + blend * rl_q,
+                               (1 - blend) * prep_stiff + blend * rl_stiff,
+                               (1 - blend) * prep_damp + blend * rl_damp)
             self._send_cmd(self.low_cmd)
-            if a >= 1.0:
+            if alpha >= 1.0:
                 break
-            time.sleep(dt)
+            next_send += step_dt
+            time.sleep(max(0.0, next_send - time.monotonic()))
 
         self.dof_target[:] = rl_q
         self.filtered_dof_target[:] = rl_q
@@ -765,8 +782,7 @@ class Controller:
         # for minutes -- it sat for 124 s on the first hardware start -- and
         # until now nothing published during that window, so the robot held one
         # stale frame the whole time. The publish loop is also the only place
-        # that keeps the parallel-mechanism torque feedforward tracking the
-        # measured angle.
+        # that keeps joint targets streaming while the prompt waits.
         if self.publish_runner is None or not self.publish_runner.is_alive():
             self.publish_runner = threading.Thread(target=self._publish_cmd, daemon=True)
             self.publish_runner.start()
@@ -1182,15 +1198,9 @@ class Controller:
             for i in range(self.joint_cnt):
                 self.low_cmd.motor_cmd[i].q = self.filtered_dof_target[i]
 
-            # Series-parallel conversion for the parallel-mechanism joints.
-            for i in self.cfg["mech"]["parallel_mech_indexes"]:
-                self.low_cmd.motor_cmd[i].q = self.dof_pos_latest[i]
-                self.low_cmd.motor_cmd[i].tau = np.clip(
-                    (self.filtered_dof_target[i] - self.dof_pos_latest[i]) * self.cfg["common"]["stiffness"][i],
-                    -self.cfg["common"]["torque_limit"][i],
-                    self.cfg["common"]["torque_limit"][i],
-                )
-                self.low_cmd.motor_cmd[i].kp = 0.0
+            # No series-parallel conversion: the verified E1 wrapper commands
+            # every joint by position. codex's torque-feedforward variant gave a
+            # soft ankle that folded under load on this robot.
 
             self._send_cmd(self.low_cmd)
             time.sleep(0.001)
