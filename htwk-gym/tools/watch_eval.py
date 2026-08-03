@@ -129,6 +129,11 @@ def main():
                          "is transiently worse and killing it discards the recovery")
     ap.add_argument("--strikes", type=int, default=2,
                     help="consecutive over-the-line checkpoints required to stop")
+    ap.add_argument("--max-iter", dest="max_iter", type=int, default=None,
+                    help="exit once this iteration has been scored (default: read "
+                         "basic.max_iterations from the run config)")
+    ap.add_argument("--idle-exit-s", dest="idle_exit_s", type=float, default=1800.0,
+                    help="exit if no new checkpoint appears for this long")
     a = ap.parse_args()
 
     # The launcher cannot pass a run dir because the trainer has not created it
@@ -157,16 +162,34 @@ def main():
         print("need --run or --run-glob", flush=True)
         return 2
     cfg = a.config or os.path.join(run, "config.yaml")
+    # Without an exit condition this polls forever. An arm that finishes 200/200
+    # never writes STOP, so four watch_eval loops from the 20:39 round were still
+    # holding GPU memory 45 minutes later and the card looked oversubscribed.
+    max_iter = a.max_iter
+    if max_iter is None:
+        try:
+            m = re.search(r"^\s*max_iterations:\s*(\d+)",
+                          open(cfg, encoding="utf-8", errors="replace").read(), re.M)
+            max_iter = int(m.group(1)) if m else None
+        except OSError:
+            max_iter = None
     hist = os.path.join(run, "watch_eval.jsonl")
     done, seen_any, strikes = set(), 0, 0
     print("watch_eval: %s  (ref %s, stop at %.2fx)" % (run, a.ref, a.stop_ratio), flush=True)
 
+    last_new = time.time()
     while True:
         if os.path.exists(os.path.join(run, "STOP")):
             print("STOP file present; exiting.", flush=True)
             return 0
+        if time.time() - last_new > a.idle_exit_s:
+            print("no new checkpoint for %.0fs; training is over, exiting."
+                  % a.idle_exit_s, flush=True)
+            return 0
         cks = iters(run)
         todo = sorted(k for k in cks if k not in done)
+        if todo:
+            last_new = time.time()
         for it in todo:
             done.add(it)
             seen_any += 1
@@ -198,6 +221,9 @@ def main():
                 with open(os.path.join(run, "STOP"), "w") as f:
                     f.write("watch_eval iter %d: %s\n" % (it, why))
                 print("wrote STOP; the trainer saves a checkpoint and exits.", flush=True)
+                return 0
+            if max_iter is not None and it >= max_iter:
+                print("scored the final checkpoint (%d); exiting." % it, flush=True)
                 return 0
         time.sleep(a.poll)
 
