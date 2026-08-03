@@ -212,11 +212,15 @@ def phase(run, cks, cfg, evals):
     age = time.time() - last_t
     total = cfg.get("max_iterations")
     finished = bool(total) and last_it >= int(total)
+    # Staleness is decided BEFORE evaluations are considered. Checking evals
+    # first labelled a run that died at iteration 109 as "evaluated" simply
+    # because watch_eval had scored two of its checkpoints -- the one state you
+    # must never hide is "this stopped and nobody noticed".
+    if not finished and age > STALE_S:
+        return "stalled"
     if evals:
-        return "evaluated" if finished or age > STALE_S else "evaluating"
-    if finished:
-        return "done"
-    return "stalled" if age > STALE_S else "training"
+        return "evaluated" if finished else "evaluating"
+    return "done" if finished else "training"
 
 
 def pace(cks, window=8):
