@@ -158,7 +158,8 @@ def watch_series(run):
                          "checkpoint": "model_%s.pth" % d.get("it"),
                          "pos_median": d.get("pos_median"), "pos_p90": d.get("pos_p90"),
                          "heading_median": d.get("heading_median"), "falls": d.get("falls"),
-                         "strict": d.get("strict"), "gates_pass": None})
+                         "strict": d.get("strict"), "gates_pass": None,
+                         "mode": "watch"})
             if d.get("stop"):
                 stop = d.get("why")
     except OSError:
@@ -188,6 +189,10 @@ def eval_results(run, shared="shared_eval_videos"):
                 "falls": d.get("falls"),
                 "strict": d.get("success_rate_strict"),
                 "gates_pass": d.get("all_gates_pass"),
+                # stress / video reports have no position error but DO have a fall
+                # count, so an unlabelled table showed "- - - 248" next to real
+                # rows and looked like corruption.
+                "mode": d.get("mode", "clean"),
             })
     found.sort(key=lambda r: r["date"])
     return found
@@ -278,6 +283,7 @@ def collect():
             "scalars": sc,
             "last_reward": (sc.get("reward") or [[None, None]])[-1][1],
             "last_pos": (sc.get("watch/pos_median") or [[None, None]])[-1][1],
+            "n_clean_evals": sum(1 for e in ev if e.get("mode") == "clean"),
             "stopped": w.get("stop"),
         })
     # Newest first within an arm. Re-running an arm leaves the previous run dir

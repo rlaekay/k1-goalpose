@@ -91,15 +91,25 @@ function evalTable(evals,n){
     const g=e.gates_pass===true?'<span class="pass">PASS</span>'
           :e.gates_pass===false?'<span class="fail">FAIL</span>':'-';
     const cm=v=>v==null?'-':(v*100).toFixed(2);
-    return `<tr><td>${e.checkpoint||'-'}</td><td>${cm(e.pos_median)}</td><td>${cm(e.pos_p90)}</td>
+    const md=e.mode&&e.mode!=='clean'?`<span class="meta"> ${e.mode}</span>`:'';
+    return `<tr><td>${(e.checkpoint||'-')}${md}</td><td>${cm(e.pos_median)}</td><td>${cm(e.pos_p90)}</td>
             <td>${e.heading_median==null?'-':e.heading_median.toFixed(1)}</td>
             <td>${e.falls??'-'}</td><td>${e.strict==null?'-':(e.strict*100).toFixed(1)}</td><td>${g}</td></tr>`}).join('');
   return `<table><tr><th>ckpt</th><th>pos med<br>cm</th><th>p90<br>cm</th><th>hd °</th><th>falls</th><th>strict %</th><th>게이트</th></tr>${rows}</table>`;
 }
 
-async function detail(slug,card){
-  if(!cache[slug]) cache[slug]=await (await fetch(`data/${slug}.json`,{cache:'no-store'})).json();
-  const r=cache[slug], tags=Object.keys(r.scalars||{}).sort();
+async function fetchRun(slug,ver){
+  // Cache keyed by the run's progress, not by slug alone. Keying on slug meant a
+  // card that first rendered before scalars.jsonl existed kept saying "없음"
+  // forever, because detail() never re-fetched -- which read as "the GUI shows
+  // nothing".
+  if(cache[slug] && cache[slug]._v===ver) return cache[slug];
+  const r=await (await fetch(`data/${slug}.json`,{cache:'no-store'})).json();
+  r._v=ver; cache[slug]=r; return r;
+}
+
+async function detail(slug,card,ver){
+  const r=await fetchRun(slug,ver), tags=Object.keys(r.scalars||{}).sort();
   const host=$('.detail',card); if(!host)return;
   if(tags.length){
     const cur=tagSel[slug]||(tags.includes('reward')?'reward':tags[0]);
@@ -121,9 +131,8 @@ function kpi(v,unit,label,good){
   return `<div><b class="${cls}">${t}<span style="font-size:11px">${v==null?'':unit}</span></b><span>${label}</span></div>`;
 }
 
-async function open_detail(slug){
-  const r=cache[slug]||await (await fetch(`data/${slug}.json`,{cache:'no-store'})).json();
-  cache[slug]=r;
+async function open_detail(slug,ver){
+  const r=await fetchRun(slug,ver);
   const e=(r.evals&&r.evals.length)?r.evals[r.evals.length-1]:null;
   const tags=Object.keys(r.scalars||{}).sort();
   const cur=tagSel['ov'+slug]||(tags.includes('watch/pos_median')?'watch/pos_median':
@@ -176,7 +185,7 @@ async function tick(){
   $('#empty').hidden=ix.runs.length>0;
   $('#grid').innerHTML=rows.map(r=>{
     const pct=r.max_iter?Math.min(100,100*r.iter/r.max_iter):0;
-    return `<div class="card${r.latest===false?' old':''}" data-slug="${r.slug}">
+    return `<div class="card${r.latest===false?' old':''}" data-slug="${r.slug}" data-ver="${r.iter}_${r.n_ckpt}_${r.n_evals}">
       <div class="row"><span class="name" title="${r.run}">${r.desc}</span>
         <span class="ph ${r.phase}">${r.phase}</span></div>
       <div class="meta">${r.started_str||''} 시작 · ${r.task} · warm start ${r.warm_start||'없음'}${r.best?' · best '+r.best.split('/').pop():''}</div>
@@ -186,10 +195,11 @@ async function tick(){
       <div class="meta">마지막 checkpoint ${ago(r.last_ckpt_age_s)} · 평가 ${r.n_evals}건</div>
       <div class="detail"></div></div>`}).join('');
   $('#grid').querySelectorAll('.card').forEach(c=>{
-    detail(c.dataset.slug,c);
-    c.onclick=ev=>{if(ev.target.tagName!=='SELECT')open_detail(c.dataset.slug)};
+    const v=c.dataset.ver;
+    detail(c.dataset.slug,c,v);
+    c.onclick=ev=>{if(ev.target.tagName!=='SELECT')open_detail(c.dataset.slug,v)};
   });
 }
 tick(); setInterval(tick,15000);
-addEventListener('resize',()=>$('#grid').querySelectorAll('.card').forEach(c=>detail(c.dataset.slug,c)));
+addEventListener('resize',()=>$('#grid').querySelectorAll('.card').forEach(c=>detail(c.dataset.slug,c,c.dataset.ver)));
 </script>
