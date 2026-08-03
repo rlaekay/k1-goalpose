@@ -45,12 +45,32 @@ def one(name, ckpt, cfg, task, seed, envs, secs, device, out_root, force):
            "--sim_device", device, "--rl_device", device, "--out", out]
     if force:
         cmd += ["--force_profile", "heldout"]
+    # capture_output swallows everything until the child exits, and one eval is
+    # about 14 minutes -- so the tool looked hung. Stream to a log and print a
+    # heartbeat instead: silence for a quarter of an hour is indistinguishable
+    # from a crash, which is the same mistake as piping a slow run through tail.
     t0 = time.time()
-    r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+    log = os.path.join(out, "eval.log")
+    print("    %-12s %-5s seed %d  시작 … (~14분, 로그 %s)"
+          % (name, "force" if force else "clean", seed, log), flush=True)
+    with open(log, "w") as lf:
+        p = subprocess.Popen(cmd, cwd=ROOT, stdout=lf, stderr=subprocess.STDOUT, text=True)
+        beat = 0
+        while p.poll() is None:
+            time.sleep(30)
+            beat += 30
+            if beat % 180 == 0:
+                print("      … %d분 경과" % (beat // 60), flush=True)
+    r = subprocess.CompletedProcess(cmd, p.returncode)
     reps = glob.glob(os.path.join(out, "**", "report.json"), recursive=True)
     if not reps:
         with open(os.path.join(out, "eval_failed.log"), "w") as f:
-            f.write("rc=%s\n%s" % (r.returncode, (r.stderr or "")[-4000:]))
+            tail = ""
+            try:
+                tail = open(log, encoding="utf-8", errors="replace").read()[-4000:]
+            except OSError:
+                pass
+            f.write("rc=%s\n--- eval.log tail ---\n%s" % (r.returncode, tail))
         print("    %-12s %-5s seed %d  실패" % (name, "force" if force else "clean", seed),
               flush=True)
         return None
@@ -92,8 +112,10 @@ def main():
 
     out_root = os.path.join(a.out, time.strftime("%Y-%m-%d-%H-%M-%S"))
     os.makedirs(out_root, exist_ok=True)
+    n_cells = len(a.arm) * len(a.seeds) * (1 if a.skip_clean else 2)
     print("held-out force: interval 4-8 s, collision 50-120 N, support 4-10 N")
-    print("seeds %s, %d envs x %.0f s\n" % (a.seeds, a.num_envs, a.duration_s))
+    print("seeds %s, %d envs x %.0f s" % (a.seeds, a.num_envs, a.duration_s))
+    print("총 %d회 평가, 회당 약 14분 -> 예상 %.1f시간\n" % (n_cells, n_cells * 14 / 60.0))
 
     res = {}
     for name, ckpt, cfg in a.arm:
