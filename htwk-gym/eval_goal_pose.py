@@ -614,7 +614,7 @@ HELD_OUT_FORCE = {
 def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
                 record_video=False, keep_perturbations=False, no_noise=False,
                 stress=None, goal_pattern=None, force_visualization_probe=False,
-                force_profile=None,
+                force_profile=None, terrain=None,
                 joint_encoder_bias_rad=None, joint_target_offset_rad=None,
                 init_dof_std_rad=None):
     """Apply the standard evaluation conditions to a task config, in place."""
@@ -632,6 +632,15 @@ def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
         cfg, joint_encoder_bias_rad=joint_encoder_bias_rad,
         joint_target_offset_rad=joint_target_offset_rad,
         init_dof_std_rad=init_dof_std_rad)
+    # The ground is part of the exam, not part of the policy. Every eval so far
+    # took terrain from the ARM'S OWN config, so I2b_terrain was scored on 10 cm
+    # trimesh rubble while I1b and I2a were scored on a flat plane -- and the
+    # resulting 6.2 %p strict gap was read as "terrain costs accuracy" when it may
+    # be nothing but a harder exam. Same mistake as scoring each policy under its
+    # own disturbance config, which is what --force_profile exists to stop.
+    if terrain:
+        os.environ["EVAL_TERRAIN"] = terrain
+        cfg["terrain"]["type"] = "plane" if terrain == "plane" else cfg["terrain"]["type"]
     if force_profile:
         os.environ["EVAL_FORCE_PROFILE"] = force_profile
     if force_profile == "heldout":
@@ -2042,6 +2051,7 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
         # indistinguishable from a clean one six months later, and comparing two
         # arms scored under different profiles is silently wrong.
         "force_profile": os.environ.get("EVAL_FORCE_PROFILE") or None,
+        "eval_terrain": os.environ.get("EVAL_TERRAIN") or None,
         "obs_noise": obs_noise,
         "authoritative_gate_evaluation": not exploratory,
         "task_state_protocol": task_state_protocol,
@@ -3670,6 +3680,12 @@ def main():
                              "(interval 4-8 s, collision 50-120 N, support 4-10 N), the "
                              "same for every arm, so robustness is compared on a common "
                              "test rather than on each policy's own training distribution")
+    parser.add_argument("--terrain", choices=["as_trained", "plane"], default=None,
+                        help="ground the eval runs on. Default: whatever the arm "
+                             "trained with -- which means a terrain arm is scored on "
+                             "rough ground and a flat arm on a plane, and their "
+                             "numbers are NOT comparable. Use plane to put every arm "
+                             "on the same ground.")
     parser.add_argument(
         "--no_noise", action="store_true",
         help="disable observation noise only; joint encoder/target/init DR, "
@@ -3722,7 +3738,7 @@ def main():
 
     prepare_cfg(cfg, args.task, num_envs, args.sim_device, args.rl_device,
                 record_video=args.record_video, keep_perturbations=args.keep_perturbations,
-                force_profile=args.force_profile,
+                force_profile=args.force_profile, terrain=args.terrain,
                 no_noise=args.no_noise, stress=args.stress, goal_pattern=args.goal_pattern,
                 force_visualization_probe=args.force_visualization_probe,
                 joint_encoder_bias_rad=args.joint_encoder_bias_rad,

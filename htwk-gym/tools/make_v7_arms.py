@@ -324,6 +324,42 @@ I2_ARMS = {
     }),
 }
 
+# R2 accepted the calibration DR: it cost nothing measurable and buys sim2real
+# margin, so everything after this carries it.
+_I2_DR = {
+    "randomization.base_com.range": [-0.025, 0.025],
+    "randomization.base_mass.range": [0.92, 1.08],
+    "randomization.dof_stiffness.range": [0.85, 1.15],
+    "randomization.dof_damping.range": [0.85, 1.15],
+}
+_I3_BASE = merge(_I2_BASE, _I2_DR)
+
+I3_ARMS = {
+    # I2b_terrain switched terrain on and inherited the base config's numbers
+    # without reading them: random_height 0.1 over a horizontal_scale of 0.1 is
+    # +/-10 cm of relief on a 10 cm grid -- local slopes near 45 deg, for a robot
+    # with a 0.52 m leg and a 2.4 cm thick foot. That is rubble, not a floor. A
+    # RoboCup artificial-turf pitch is +/-1-2 cm, and the discrete/slope classes
+    # are a different skill (climbing) that nothing in this project asks for.
+    #
+    # 2 cm is not a clearance target dressed up as terrain. Nothing rewards
+    # lifting to any height; the ground simply stops paying for 1.1 cm, which is
+    # all the flat plane ever required (feet_contact = any corner within 1 cm, so
+    # 1.1 cm already scores full marks on feet_swing). The policy picks the height.
+    #
+    # REJECT IF strict drops more than 2 %p against I2a_dr ON THE SAME GROUND.
+    # I2b lost 6.2 %p, but it was scored on its own rubble while I2a was scored on
+    # a plane, so that number never meant what it was read as. Both arms must be
+    # evaluated with --terrain plane.
+    "I3_rough": merge(_I3_BASE, {
+        "terrain.type": "trimesh",
+        "terrain.terrain_proportions": [0.0, 0.0, 1.0, 0.0],   # random only
+        "terrain.random_height": 0.02,                          # +/-2 cm, turf-like
+        "terrain.discrete_height": 0.0,
+        "terrain.slope": 0.0,
+    }),
+}
+
 ARMS_ON_E0 = {"I0a_repro", "I0b_foot", "I0c_h055", "I0d_h058",
               "I1a_base", "I1b_force", "I1c_cadence", "I1d_both",
               "I2a_dr", "I2b_terrain", "G1_speed", "G2_robust", "G3_full"}
@@ -342,7 +378,7 @@ def set_dotted(cfg, dotted, value):
 # V8_ARMS (G4_smoothturn) was missing from this merge, so --only G4_smoothturn
 # raised KeyError before it ever reached the per-arm is_v8 branch below --
 # G4 has never successfully generated a config, let alone run its smoke test.
-ALL_ARMS = dict(**ARMS, **F_ARMS, **I_ARMS, **I1_ARMS, **I2_ARMS, **V8_ARMS)
+ALL_ARMS = dict(**ARMS, **F_ARMS, **I_ARMS, **I1_ARMS, **I2_ARMS, **I3_ARMS, **V8_ARMS)
 
 # GPU 0 / GPU 1 split. F-batch: F1+F2 share GPU 0 (lighter, no disturbance),
 # F3 gets GPU 1 to itself (disturbance + higher flicker rate is the heavier one).
@@ -364,6 +400,7 @@ GPU_OF = {
     "I1a_base": "cuda:0", "I1b_force": "cuda:0",
     "I1c_cadence": "cuda:1", "I1d_both": "cuda:1",
     "I2a_dr": "cuda:0", "I2b_terrain": "cuda:1",
+    "I3_rough": "cuda:0",
 }
 
 
