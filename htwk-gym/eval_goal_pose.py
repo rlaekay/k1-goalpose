@@ -3387,6 +3387,59 @@ def render_report(r):
                       "과제의 한계다.".format(bs["share_above_1p0"] * 100))
             md.append("")
 
+    sa = r.get("swing_apex_m")
+    fs = r.get("foot_support")
+    if sa or fs:
+        md.append("## 발 — 스윙 높이와 지지 상태")
+        md.append("")
+        md.append("이 절이 있는 이유는 **판정 지표가 목적과 어긋나 있었기 때문**이다. "
+                  "지형 arm은 발을 더 들게 하려고 켜는데 판정은 strict(정확도)로 했고, "
+                  "낙상은 노출이 모자라 순위를 만들 수 없었다(§8-12a). 여기 있는 값은 "
+                  "**목적을 직접 재고, 매 걸음마다 표본이 생기는 연속량**이다.")
+        md.append("")
+    if sa:
+        md.append("**스윙 정점** — 스윙 발의 가장 낮은 모서리가 지면 위로 올라간 최대 높이. "
+                  "걸리는 것은 그 모서리다. `feet_contact`는 1 cm 이내면 접촉으로 보므로 "
+                  "`feet_swing`은 **1.1 cm에서 이미 만점**이고, 그 위로는 보상이 요구하지 않는다.")
+        md.append("")
+        md += _table(
+            ["지표", "값"],
+            [["p10 (걸림 위험은 낮은 스윙이 만든다)", "{:.1f} cm".format(sa["p10"] * 100)],
+             ["median", "{:.1f} cm".format(sa["median"] * 100)],
+             ["p90", "{:.1f} cm".format(sa["p90"] * 100)],
+             ["2 cm 미만 비율", "{:.1f}%".format(sa["share_below_0p02"] * 100)],
+             ["3 cm 미만 비율", "{:.1f}%".format(sa["share_below_0p03"] * 100)],
+             ["스윙 표본", "{}".format(sa["n_swings"])]])
+        md.append("")
+        md.append("> RoboCup 인조잔디는 ±1–2 cm다. **p10과 '2 cm 미만 비율'**이 실기 걸림 "
+                  "위험에 대응하고, median은 대응하지 않는다 — 걸림은 최악값 사건이다.")
+        md.append("")
+    if fs:
+        md.append("**지지 상태** — 낙상은 희귀해서 순위를 만들 수 없다. 그 전에 움직이는 "
+                  "연속량으로 대신 본다.")
+        md.append("")
+        rows = [["비행 (양발 모두 비접촉)", "{:.1f}%".format(fs["flight_share"] * 100)],
+                ["단일지지", "{:.1f}%".format(fs["single_support_share"] * 100)],
+                ["양발 접지", "{:.1f}%".format(fs["double_support_share"] * 100)]]
+        ss = fs.get("single_support_s")
+        if ss:
+            rows += [["단일지지 구간 median", "{:.2f} s".format(ss["median"])],
+                     ["단일지지 구간 p90", "{:.2f} s".format(ss["p90"])],
+                     ["단일지지 구간 p99", "{:.2f} s".format(ss["p99"])]]
+        la = fs.get("load_asymmetry")
+        if la:
+            # 라벨에 파이프를 쓰면 마크다운 표가 쪼개진다. |L-R|/(L+R)를 말로 쓴다.
+            rows += [["하중 비대칭 median (좌우 차 / 합)", "{:.2f}".format(la["median"])],
+                     ["하중 비대칭 p90", "{:.2f}".format(la["p90"])]]
+        md += _table(["지표", "값"], rows)
+        md.append("")
+        if la and la["median"] > 0.9:
+            md.append("> ⚠️ 양발 접지 중에도 하중의 {:.0f}%가 한 발에 실린다. `feet_contact`는 "
+                      "**근접(1 cm 이내) 판정이지 하중 판정이 아니므로**, 닿았지만 안 실린 발이 "
+                      "접촉으로 세어진다. 즉 실질 양발 구간이 거의 없고, 실기에서 지연·바닥 "
+                      "편차를 흡수할 여유가 그만큼 없다.".format(la["median"] * 100))
+            md.append("")
+
     st = r.get("speed_tracking")
     if st and st["bins"]:
         md.append("## 명령속도 vs 실제속도 (path mode)")

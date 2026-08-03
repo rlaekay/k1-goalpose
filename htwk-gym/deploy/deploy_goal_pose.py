@@ -420,6 +420,7 @@ class Controller:
         self._last_debug_monotonic = 0.0
         self._last_goal = (0.0, 0.0, 0.0)
         self._latest_rpy = np.zeros(3, dtype=np.float32)
+        self._last_pre_custom_log = -1e9
 
         # SDK channels FIRST, while this is still a single-threaded process.
         #
@@ -848,8 +849,13 @@ class Controller:
         # run. Until CUSTOM is entered the SDK is in charge and it is not our
         # place to intervene.
         if not self._custom_mode_started:
-            self.logger.info("ignoring fall trigger before CUSTOM entry (%s); "
-                             "the robot is not under our control yet", reason)
+            # Throttled: this is evaluated on every low_state message (~500 Hz),
+            # so logging per call floods the console and starves the process.
+            now = time.monotonic()
+            if now - self._last_pre_custom_log > 5.0:
+                self._last_pre_custom_log = now
+                self.logger.info("ignoring fall trigger before CUSTOM entry (%s); "
+                                 "the robot is not under our control yet", reason)
             return
         rec = self.cfg.get("safety", {}).get("recovery", {})
         if not bool(rec.get("enable", True)):
