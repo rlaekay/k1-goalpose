@@ -90,7 +90,12 @@ def verdict(rep, ref, stop_ratio, ref_falls, fall_ratio):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--run", required=True, help="training run directory (contains nn/)")
+    ap.add_argument("--run", help="training run directory (contains nn/)")
+    ap.add_argument("--run-glob", dest="run_glob",
+                    help="glob to resolve instead of --run; waits until it matches")
+    ap.add_argument("--newer-than", dest="newer_than", type=float, default=0.0,
+                    help="only accept a run dir created at or after this epoch time")
+    ap.add_argument("--wait-run-s", dest="wait_run_s", type=float, default=600.0)
     ap.add_argument("--task", default="K1/Goal_Pose_V7")
     ap.add_argument("--config", default=None, help="default: <run>/config.yaml")
     ap.add_argument("--device", default="cuda:0")
@@ -106,7 +111,31 @@ def main():
     ap.add_argument("--poll", type=float, default=60.0)
     a = ap.parse_args()
 
-    run = os.path.abspath(a.run)
+    # The launcher cannot pass a run dir because the trainer has not created it
+    # yet -- Isaac Gym takes ~40 s to come up. Resolving it here, and REQUIRING
+    # it to be newer than the launch, is what stops this from latching onto a
+    # previous run of the same arm: the first attempt attached watch_eval to
+    # 18:03's finished run while 18:43's actual training went unwatched.
+    if a.run:
+        run = os.path.abspath(a.run)
+    elif a.run_glob:
+        run, waited = None, 0.0
+        while waited < a.wait_run_s:
+            cands = [d for d in glob.glob(a.run_glob)
+                     if os.path.isdir(d) and os.path.getmtime(d) >= a.newer_than]
+            if cands:
+                run = os.path.abspath(max(cands, key=os.path.getmtime))
+                break
+            time.sleep(5.0)
+            waited += 5.0
+        if run is None:
+            print("run dir matching %r newer than %.0f never appeared in %.0fs"
+                  % (a.run_glob, a.newer_than, a.wait_run_s), flush=True)
+            return 1
+        print("resolved run: %s" % run, flush=True)
+    else:
+        print("need --run or --run-glob", flush=True)
+        return 2
     cfg = a.config or os.path.join(run, "config.yaml")
     hist = os.path.join(run, "watch_eval.jsonl")
     done, seen_any = set(), 0

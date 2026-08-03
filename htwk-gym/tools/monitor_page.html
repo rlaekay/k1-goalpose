@@ -22,6 +22,7 @@ main{padding:12px 16px;display:grid;gap:12px;grid-template-columns:repeat(auto-f
 .ph{font-size:11px;padding:1px 8px;border-radius:99px;border:1px solid currentColor;white-space:nowrap}
 .training{color:var(--ok)}.stalled{color:var(--bad)}.done{color:var(--info)}
 .evaluating{color:var(--warn)}.evaluated{color:var(--acc)}.empty{color:var(--dim)}
+.starting{color:var(--warn)}
 .meta{color:var(--dim);font-size:12px;margin:4px 0 8px}
 .bar{height:5px;background:var(--line);border-radius:3px;overflow:hidden;margin:6px 0}
 .bar>i{display:block;height:100%;background:var(--ok)}
@@ -112,7 +113,7 @@ async function tick(){
     return `<div class="card" data-slug="${r.slug}">
       <div class="row"><span class="name" title="${r.run}">${r.desc}</span>
         <span class="ph ${r.phase}">${r.phase}</span></div>
-      <div class="meta">${r.task} · warm start ${r.warm_start||'없음'}${r.best?' · best '+r.best.split('/').pop():''}</div>
+      <div class="meta">${r.started_str||''} 시작 · ${r.task} · warm start ${r.warm_start||'없음'}${r.best?' · best '+r.best.split('/').pop():''}</div>
       <div class="row"><span>${r.iter} / ${r.max_iter||'?'} iter · ckpt ${r.n_ckpt}</span>
         <span>${r.s_per_iter?r.s_per_iter.toFixed(2)+' s/it':''} ${r.eta_s?'· ETA '+hms(r.eta_s):''}</span></div>
       <div class="bar"><i style="width:${pct}%"></i></div>

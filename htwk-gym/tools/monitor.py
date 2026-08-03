@@ -194,7 +194,9 @@ def phase(run, cks, cfg, evals):
     output is buffered and nvidia-smi cannot say which iteration a run is on.
     """
     if not cks:
-        return "empty"
+        # "empty" read as broken; a run that launched 2 minutes ago simply has
+        # not reached its first save_interval yet.
+        return "starting" if (time.time() - _dir_time(run)) < STALE_S else "empty"
     last_it, last_t = cks[-1][0], cks[-1][1]
     age = time.time() - last_t
     total = cfg.get("max_iterations")
@@ -261,7 +263,9 @@ def collect():
             "s_per_iter": spi,
             "eta_s": eta,
             "last_ckpt_age_s": (time.time() - cks[-1][1]) if cks else None,
-            "started": cks[0][1] if cks else None,
+            "started": cks[0][1] if cks else _dir_time(run),
+            "started_str": time.strftime("%m-%d %H:%M", time.localtime(
+                cks[0][1] if cks else _dir_time(run))),
             "checkpoints": [c[0] for c in cks],
             "best": _best(run),
             "evals": ev,
@@ -270,8 +274,26 @@ def collect():
             "last_pos": (sc.get("watch/pos_median") or [[None, None]])[-1][1],
             "stopped": w.get("stop"),
         })
-    runs.sort(key=lambda r: (r["batch"], r["desc"]))
+    # Newest first within an arm. Re-running an arm leaves the previous run dir
+    # in place, so the dashboard showed I0a_repro twice with no way to tell which
+    # was live; started_str disambiguates and this ordering puts the current one
+    # on top.
+    runs.sort(key=lambda r: (r["batch"], r["desc"], -(r["started"] or 0)))
     return runs
+
+
+def _dir_time(run):
+    """Run start from the directory name (Recorder names it by timestamp)."""
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})-(\d{2})-(\d{2})-(\d{2})", os.path.basename(run))
+    if m:
+        try:
+            return time.mktime(time.strptime("-".join(m.groups()), "%Y-%m-%d-%H-%M-%S"))
+        except ValueError:
+            pass
+    try:
+        return os.path.getmtime(run)
+    except OSError:
+        return 0.0
 
 
 def _best(run):
@@ -319,14 +341,15 @@ def live_only(runs):
     historical run buries the two lines that matter. History belongs in the web
     UI, where you can click into a batch. --all overrides.
     """
-    return [r for r in runs if r["phase"] in ("training", "evaluating", "stalled")]
+    return [r for r in runs if r["phase"] in ("training", "evaluating", "stalled", "starting")]
 
 
 def tui(runs, show_all=False):
     shown = runs if show_all else live_only(runs)
     icon = {"training": "\033[32m▶\033[0m", "stalled": "\033[31m■\033[0m",
             "done": "\033[36m✓\033[0m", "evaluating": "\033[33m◐\033[0m",
-            "evaluated": "\033[35m★\033[0m", "empty": "\033[90m·\033[0m"}
+            "evaluated": "\033[35m★\033[0m", "empty": "\033[90m·\033[0m",
+            "starting": "\033[33m◔\033[0m"}
     print("\033[2J\033[H", end="")
     print("K1 학습 모니터  %s   (%s)\n" % (
         time.strftime("%Y-%m-%d %H:%M:%S"),
