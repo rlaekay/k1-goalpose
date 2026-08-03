@@ -928,8 +928,14 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     # threshold answers "how long", and the longest CONTINUOUS stretch answers
     # "in one piece or in scraps" -- the same total is a cruise or a dozen
     # unrelated bursts, and only the second is what P2 asks for.
-    time_above_1p0 = torch.zeros(env.num_envs, device=env.device)
-    time_above_1p3 = torch.zeros(env.num_envs, device=env.device)
+    # Counted in STEPS, not seconds.  Accumulating env.dt in float32 lands 50
+    # steps at 0.99999958 s, which is below 1.0 as a raw float but rounds to
+    # "1.0000" in segments.csv -- so the same segment counted as a 1 s cruise
+    # from the CSV and not from report.json.  Step counts are exact in float32
+    # (a 120 s run is 6000 of them), and the single multiply by dt happens once,
+    # in float64, at extraction.
+    n_above_1p0 = torch.zeros(env.num_envs, device=env.device)
+    n_above_1p3 = torch.zeros(env.num_envs, device=env.device)
     run_above_1p3 = torch.zeros(env.num_envs, device=env.device)
     cruise_1p3 = torch.zeros(env.num_envs, device=env.device)
 
@@ -1114,9 +1120,9 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
         # are not counted at all, the same rule the mean below already follows.
         hot10 = (cur_speed >= 1.0) & speed_valid
         hot13 = (cur_speed >= 1.3) & speed_valid
-        time_above_1p0 += hot10.float() * env.dt
-        time_above_1p3 += hot13.float() * env.dt
-        run_above_1p3 = torch.where(hot13, run_above_1p3 + env.dt,
+        n_above_1p0 += hot10.float()
+        n_above_1p3 += hot13.float()
+        run_above_1p3 = torch.where(hot13, run_above_1p3 + 1.0,
                                     torch.zeros_like(run_above_1p3))
         torch.maximum(cruise_1p3, run_above_1p3, out=cruise_1p3)
         # Excluded from the mean as well, not just zeroed: a zeroed sample still
@@ -1638,9 +1644,12 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
             seg["min_dist"].extend(torch.minimum(min_dist[ids], d).cpu().tolist())
             seg["peak_speed"].extend(peak_speed[ids].cpu().tolist())
             seg["mean_speed"].extend((sum_speed[ids] / n_speed[ids].clamp(min=1.0)).cpu().tolist())
-            seg["time_above_1p0"].extend(time_above_1p0[ids].cpu().tolist())
-            seg["time_above_1p3"].extend(time_above_1p3[ids].cpu().tolist())
-            seg["cruise_1p3"].extend(cruise_1p3[ids].cpu().tolist())
+            seg["time_above_1p0"].extend(
+                [n * env.dt for n in n_above_1p0[ids].cpu().tolist()])
+            seg["time_above_1p3"].extend(
+                [n * env.dt for n in n_above_1p3[ids].cpu().tolist()])
+            seg["cruise_1p3"].extend(
+                [n * env.dt for n in cruise_1p3[ids].cpu().tolist()])
             if has_path_speed:
                 seg["cmd_speed"].extend(prev_cmd_speed[ids].cpu().tolist())
             else:
@@ -1694,8 +1703,8 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
             peak_speed[stale] = 0.0
             sum_speed[stale] = 0.0
             n_speed[stale] = 0.0
-            time_above_1p0[stale] = 0.0
-            time_above_1p3[stale] = 0.0
+            n_above_1p0[stale] = 0.0
+            n_above_1p3[stale] = 0.0
             run_above_1p3[stale] = 0.0
             cruise_1p3[stale] = 0.0
             response_elapsed[stale] = 0.0
