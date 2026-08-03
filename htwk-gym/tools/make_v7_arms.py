@@ -200,7 +200,31 @@ F_ARMS = {
 }
 
 
-ARMS_ON_E0 = {"G1_speed", "G2_robust", "G3_full"}
+
+# ---- I batch R0 (2026-08-03): reproduce E0, then correct the foot ------------
+# Everything before this rolled forward from a worse starting point three
+# generations running (E0 2.72 cm -> G1 5.52 -> H 6.90). R0 does not try to
+# improve anything: it establishes that the current harness can still reproduce
+# E0 from E0's own weights. If I0a cannot, no later result means anything.
+FOOT_EDGE_REAL = [[0.094, 0.035, -0.024], [0.094, -0.035, -0.024],
+                  [-0.066, 0.035, -0.024], [-0.066, -0.035, -0.024]]
+
+I_ARMS = {
+    # Byte-identical task to E0, continued from E0's own checkpoint. Zero levers.
+    "I0a_repro": dict(**_OFF_PATH, **_OFF_ROBUST, **_OFF_PROTECT),
+    # + the foot the robot actually has. asset.feet_edge_pos ships T1's foot:
+    # the configured corners span 0.223 x 0.100 m while left_foot_link's
+    # collision box is 0.16 x 0.07 at origin (0.014, 0, -0.008), i.e. 39% too
+    # long and 43% too wide. Every balance policy this project has trained
+    # learned on a support polygon it does not have, and the heel x = -0.1015
+    # that any touchdown reward would key off is 3.6 cm behind the real box.
+    # Expect I0b to score WORSE than I0a -- that is the point; sim becomes as
+    # hard as the robot. It is the honest baseline every later round builds on.
+    "I0b_foot": dict(**_OFF_PATH, **_OFF_ROBUST, **_OFF_PROTECT,
+                     **{"asset.feet_edge_pos": FOOT_EDGE_REAL}),
+}
+
+ARMS_ON_E0 = {"I0a_repro", "I0b_foot", "G1_speed", "G2_robust", "G3_full"}
 
 
 def set_dotted(cfg, dotted, value):
@@ -216,7 +240,7 @@ def set_dotted(cfg, dotted, value):
 # V8_ARMS (G4_smoothturn) was missing from this merge, so --only G4_smoothturn
 # raised KeyError before it ever reached the per-arm is_v8 branch below --
 # G4 has never successfully generated a config, let alone run its smoke test.
-ALL_ARMS = dict(**ARMS, **F_ARMS, **V8_ARMS)
+ALL_ARMS = dict(**ARMS, **F_ARMS, **I_ARMS, **V8_ARMS)
 
 # GPU 0 / GPU 1 split. F-batch: F1+F2 share GPU 0 (lighter, no disturbance),
 # F3 gets GPU 1 to itself (disturbance + higher flicker rate is the heavier one).
@@ -224,11 +248,15 @@ GPU_OF = {
     "E0_armB_armsdown": "cuda:0", "E1_path": "cuda:0", "E3_wide_nosched": "cuda:0",
     "E2_robust": "cuda:1", "V7_full": "cuda:1",
     "F1_timed": "cuda:0", "F2_grid": "cuda:0", "F3_stress": "cuda:1",
+    # R0 runs ONE process per card: the H data showed damage is decided by
+    # iteration 100, so round latency matters more than aggregate throughput.
+    "I0a_repro": "cuda:0", "I0b_foot": "cuda:1",
 }
 
 
 def default_checkpoint(arm):
-    return ARMSDOWN_CKPT if (arm in F_ARMS or arm in ARMS_ON_E0 or arm in V8_ARMS) else DEFAULT_CKPT
+    return ARMSDOWN_CKPT if (arm in F_ARMS or arm in I_ARMS or arm in ARMS_ON_E0
+                             or arm in V8_ARMS) else DEFAULT_CKPT
 
 
 def main():
