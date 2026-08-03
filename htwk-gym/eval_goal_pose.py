@@ -738,7 +738,12 @@ def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
             # 1 s of cadence keeps the remaining distance between roughly 1.2
             # and 2.0 m -- always approaching, never arriving.
             c["goal_dx"], c["goal_dy"] = [2.0, 2.0], [0.0, 0.0]
-            c["resampling_time_s"] = [1.0, 1.0]
+            # Not a constant: torch.randint's high is exclusive, so equal
+            # endpoints raise, and a constant interval would also resample all
+            # envs in lockstep -- every goal jumping on the same tick would put
+            # a synchronised dip in the speed histogram that is an artefact of
+            # the probe, not the policy.  0.8-1.2 s spreads them out.
+            c["resampling_time_s"] = [0.8, 1.2]
     # Fingerprint what the simulator will actually sample after every CLI and
     # common-profile override.  Cross-arm aggregation rejects a single missing
     # or unequal hash, preventing another comparison of unequal force/noise/DR

@@ -425,6 +425,21 @@ randomization:
     operation: "additive"
     distribution: "uniform"
 
+  # Joint zero drift.  The env has read these since E0 (goal_pose.py:358-364) but
+  # the keys were never in this file, so they were always None -> off.  Declared
+  # here at zero so arms can override them: set_dotted refuses paths the base
+  # does not define, which is what keeps a typo from creating dead config.
+  # range [0, 0] is an exact no-op -- apply_randomization adds lower +
+  # (upper-lower)*rand = 0 -- so every existing arm is unaffected.
+  joint_encoder_bias:      # what the policy SEES is wrong
+    range: [0.0, 0.0]
+    operation: "additive"
+    distribution: "uniform"
+  joint_target_offset:     # where the PD actually AIMS is wrong
+    range: [0.0, 0.0]
+    operation: "additive"
+    distribution: "uniform"
+
   base_com:
     range: [-0.1, 0.1]
     operation: "additive"
