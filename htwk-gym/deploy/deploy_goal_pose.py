@@ -48,6 +48,23 @@ from utils.timer import TimerConfig, Timer
 from utils.policy_goal_pose import GoalPosePolicy
 
 
+def _spin_node_isolated(node):
+    """Spin one node on its own executor, in its own thread.
+
+    rclpy.spin() drives the global default executor. This process has three
+    nodes (goal source, fall monitor, mode monitor), and spinning them all that
+    way makes their spin threads collide with "generator already executing";
+    the losers stop delivering messages. On the first hardware run that silently
+    disabled the mode monitor, so the standing gate never actually ran.
+    """
+    from rclpy.executors import SingleThreadedExecutor
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
+    t = threading.Thread(target=executor.spin, daemon=True)
+    t.start()
+    return executor, t
+
+
 class GoalSource:
     """Thread-safe robot-local goal (goal_rel_x, goal_rel_y, heading_error)."""
 
@@ -144,8 +161,7 @@ class RosGoalSource:
         self._debug_pub = self._node.create_publisher(String, debug_topic, 10)
         self.topic = topic
         self.debug_topic = debug_topic
-        self._spin = threading.Thread(target=lambda: rclpy.spin(self._node), daemon=True)
-        self._spin.start()
+        self._executor, self._spin = _spin_node_isolated(self._node)
 
     def _cb(self, msg):
         goal = np.array((msg.vector.x, msg.vector.y, msg.vector.z), dtype=np.float32)
@@ -235,7 +251,7 @@ class ModeMonitor:
             rclpy.init(args=None)
         self._node = Node("e0_mode_monitor")
         self._node.create_subscription(RobotStatesMsg, topic, self._cb, 10)
-        threading.Thread(target=lambda: rclpy.spin(self._node), daemon=True).start()
+        _spin_node_isolated(self._node)
         self.available = True
 
     def _cb(self, msg):
@@ -318,9 +334,7 @@ class FallMonitor:
         node.create_subscription(FallDownState, topic, self._cb_typed, 10)
         node.create_subscription(RawBytesMsg, raw_topic, self._cb_raw, 10)
         if self._own_node is not None:
-            self._spin = threading.Thread(
-                target=lambda: rclpy.spin(self._own_node), daemon=True)
-            self._spin.start()
+            self._executor, self._spin = _spin_node_isolated(self._own_node)
         self.available = True
         self.logger.info("FallMonitor subscribed to %s (typed) and %s (raw)",
                          topic, raw_topic)
@@ -617,6 +631,37 @@ class Controller:
         return low_state_age
 
     # ------------------------------------------------------------------ entry --
+    def _fill_low_cmd(self, q_target, kp, kd):
+        """Write one LowCmd frame, treating the parallel-mechanism joints correctly.
+
+        Those joints (measured at indices 14, 15, 20, 21) drive a linkage, not a
+        free axis. Commanding them by position fights the linkage: the first
+        hardware start shook the whole robot because this entry path set them to
+        a position target at prepare stiffness (450). The steady-state publish
+        loop has always done the right thing -- hold the measured angle, zero the
+        position gain, and drive with a torque feedforward -- so do the same here
+        rather than having two different behaviours on the same joints.
+        """
+        parallel = set(self.cfg.get("mech", {}).get("parallel_mech_indexes", []))
+        stiffness = self.cfg["common"]["stiffness"]
+        torque_limit = self.cfg["common"]["torque_limit"]
+        for i in range(self.joint_cnt):
+            self.low_cmd.motor_cmd[i].dq = 0.0
+            if i in parallel:
+                measured = float(self.dof_pos_latest[i])
+                self.low_cmd.motor_cmd[i].q = measured
+                self.low_cmd.motor_cmd[i].kp = 0.0
+                self.low_cmd.motor_cmd[i].kd = float(kd[i])
+                self.low_cmd.motor_cmd[i].tau = float(np.clip(
+                    (float(q_target[i]) - measured) * stiffness[i],
+                    -torque_limit[i], torque_limit[i]))
+            else:
+                self.low_cmd.motor_cmd[i].q = float(q_target[i])
+                self.low_cmd.motor_cmd[i].kp = float(kp[i])
+                self.low_cmd.motor_cmd[i].kd = float(kd[i])
+                self.low_cmd.motor_cmd[i].tau = 0.0
+
+
     def _enter_custom_latched(self, ramp_s=None):
         """Enter CUSTOM commanding the pose the robot is already in, then ramp.
 
@@ -645,11 +690,8 @@ class Controller:
         rl_damp = np.asarray(self.cfg["common"]["damping"], dtype=np.float32)
         rl_q = np.asarray(self.cfg["common"]["default_qpos"], dtype=np.float32)
 
-        init_Cmd_T1(self.low_cmd)
-        for i in range(self.joint_cnt):
-            self.low_cmd.motor_cmd[i].q = float(latched[i])
-            self.low_cmd.motor_cmd[i].kp = float(prep_stiff[i])
-            self.low_cmd.motor_cmd[i].kd = float(prep_damp[i])
+        init_Cmd_T1(self.low_cmd, self.joint_cnt)
+        self._fill_low_cmd(latched, prep_stiff, prep_damp)
         self.dof_target[:] = latched
         self.filtered_dof_target[:] = latched
         self._send_cmd(self.low_cmd)
@@ -675,16 +717,25 @@ class Controller:
         steps = max(1, int(ramp_s / dt))
         for s in range(1, steps + 1):
             a = s / steps
-            for i in range(self.joint_cnt):
-                self.low_cmd.motor_cmd[i].q = float((1 - a) * latched[i] + a * rl_q[i])
-                self.low_cmd.motor_cmd[i].kp = float((1 - a) * prep_stiff[i] + a * rl_stiff[i])
-                self.low_cmd.motor_cmd[i].kd = float((1 - a) * prep_damp[i] + a * rl_damp[i])
+            self._fill_low_cmd((1 - a) * latched + a * rl_q,
+                               (1 - a) * prep_stiff + a * rl_stiff,
+                               (1 - a) * prep_damp + a * rl_damp)
             self._send_cmd(self.low_cmd)
             time.sleep(dt)
 
         self.dof_target[:] = rl_q
         self.filtered_dof_target[:] = rl_q
         self._prepare_q = latched
+
+        # Start streaming immediately. The operator prompt that follows can sit
+        # for minutes -- it sat for 124 s on the first hardware start -- and
+        # until now nothing published during that window, so the robot held one
+        # stale frame the whole time. The publish loop is also the only place
+        # that keeps the parallel-mechanism torque feedforward tracking the
+        # measured angle.
+        if self.publish_runner is None or not self.publish_runner.is_alive():
+            self.publish_runner = threading.Thread(target=self._publish_cmd, daemon=True)
+            self.publish_runner.start()
         moved = float(np.max(np.abs(
             np.asarray(self.dof_pos_latest[:self.joint_cnt]) - latched)))
         self.logger.info(
@@ -883,11 +934,8 @@ class Controller:
         while True:
             if self.remoteControlService.start_rl_gait():
                 break
-            # Between CUSTOM entry and this prompt nothing publishes LowCmd
-            # unless --hold-prepare is set: the publish thread only starts below.
-            # The robot simply holds the single prepare frame it was given.
-            if self.hold_prepare:
-                self._send_cmd(self.low_cmd)
+            # The publish thread has been streaming since CUSTOM entry, so the
+            # robot is held properly for however long this prompt waits.
             time.sleep(0.1)
         self.logger.info(
             "[mode-timing] operator wait at RL-gait prompt: %.2f s "
@@ -895,22 +943,18 @@ class Controller:
             time.monotonic() - wait_t0,
             time.monotonic() - getattr(self, "_custom_mode_entered_monotonic", wait_t0))
 
-        if getattr(self, "_prepare_q", None) is not None:
-            self._log_joint_deviation("at RL-gait start (vs prepare)", self._prepare_q)
-        create_first_frame_rl_cmd(self.low_cmd, self.cfg)
-        rl_q = np.array([self.low_cmd.motor_cmd[i].q for i in range(self.joint_cnt)],
-                        dtype=np.float64)
-        # This is the second posture change of the sequence: prepare pose/gains
-        # -> RL pose/gains. Its size is the jump the policy has to start from.
+        # Deliberately no create_first_frame_rl_cmd here. The latched entry
+        # already ramped pose and gains to the RL values, and rebuilding the
+        # frame would put position control back on the parallel-mechanism joints
+        # -- the thing that shook the robot -- while racing the publish thread
+        # for the same buffer. Starting the gait is now purely "begin inference".
+        rl_q = np.asarray(self.cfg["common"]["default_qpos"], dtype=np.float64)
         self._log_joint_deviation("at RL-gait start (vs rl pose)", rl_q)
-        self._send_cmd(self.low_cmd)
         self.next_inference_time = self.timer.get_time()
         self.next_publish_time = self.timer.get_time()
         if self.goal_source_mode == "stdin":
             self.goal_source.start_stdin_reader(self.logger)
-        self.publish_runner = threading.Thread(target=self._publish_cmd)
-        self.publish_runner.daemon = True
-        self.publish_runner.start()
+        # The publisher already started at CUSTOM entry; do not start a second one.
         print(f"{self.remoteControlService.get_operation_hint()}")
 
     def run(self):

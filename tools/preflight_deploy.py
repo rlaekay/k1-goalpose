@@ -16,7 +16,13 @@ cfg = yaml.safe_load(open("configs/Goal_Pose_E0.yaml"))
 
 pol = m.GoalPosePolicy(cfg=cfg)
 mm = m.ModeMonitor(); fm = m.FallMonitor()
-time.sleep(2.5)
+# Wait for delivery rather than assuming a fixed sleep is enough: DDS discovery
+# has taken ~2 s here, and /robot_states only publishes at ~2 Hz.
+deadline = time.time() + 15.0
+while time.time() < deadline:
+    if mm.snapshot()[1] < 5.0 and fm.snapshot()[2] < 5.0:
+        break
+    time.sleep(0.2)
 print()
 print("policy leg slice : %d..%d  obs=%d act=%d"
       % (pol.leg_start, pol.leg_start + pol.num_act - 1, pol.num_obs, pol.num_act))
