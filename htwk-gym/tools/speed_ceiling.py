@@ -59,8 +59,11 @@ def load(seg_path):
             return None
         want = {"start_dist_m", "duration_s", "peak_speed_mps",
                 "mean_speed_mps", "category"}
-        idx = {k: head.index(k) for k in want if k in head}
-        if len(idx) < len(want):
+        # 순항 컬럼은 이 컬럼을 넣기 전에 돌린 eval에는 없다. 없으면 peak만 보고
+        # 하고, 있으면 순항까지 본다 -- 옛 결과를 못 읽게 만들 이유가 없다.
+        extra = {"cruise_1p3_s", "time_above_1p3_s"}
+        idx = {k: head.index(k) for k in want | extra if k in head}
+        if not want <= set(idx):
             return None
         for k in idx:
             cols[k] = []
@@ -70,6 +73,7 @@ def load(seg_path):
     if not cols["start_dist_m"]:
         return None
     num = {k: np.array(v, dtype=float) for k, v in cols.items() if k != "category"}
+    num["_has_cruise"] = "cruise_1p3_s" in cols
     num["category"] = np.array(cols["category"], dtype=object)
     num["_force"] = rep.get("force_profile")
     num["_terrain"] = rep.get("eval_terrain")
@@ -104,6 +108,17 @@ def report(label, d):
               % (lo, hi if np.isfinite(hi) else 9.9, rows[-1][2], rows[-1][3],
                  rows[-1][4], rows[-1][5], rows[-1][6],
                  100 * rows[-1][7], 100 * rows[-1][8]))
+    if d.get("_has_cruise"):
+        cru = d["cruise_1p3_s"][ok]
+        lm = dist >= 2.0
+        if lm.sum() >= 20:
+            print("  순항(>=2.0 m 구간 %d개): 최장연속 median %.2f s, p90 %.2f s, "
+                  "0.5s 이상 %.1f%%, 1.0s 이상 %.1f%%"
+                  % (int(lm.sum()), float(np.median(cru[lm])), _pct(cru[lm], 90),
+                     100 * float((cru[lm] >= 0.5).mean()),
+                     100 * float((cru[lm] >= 1.0).mean())))
+    else:
+        print("  순항: 미기록 (이 eval은 cruise_1p3_s 컬럼 이전이다 — peak만 판단 가능)")
     return rows
 
 

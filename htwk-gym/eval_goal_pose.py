@@ -65,6 +65,13 @@ CATEGORY_PATH = 5
 # start-distance bins [m] for the per-distance breakdown
 DISTANCE_BINS = [0.0, 0.25, 0.5, 1.0, 1.5, 2.0, float("inf")]
 
+# A segment shorter than this cannot contain a cruise: at 1.3 m/s the robot
+# needs ~1.4 m just to accelerate and brake, so anything under it reports a
+# transient no matter how the policy behaves.  P2's sustained reading is only
+# measurable above this distance, and 8-15 measured that only ~3% of segments
+# clear it -- which is a fact about the task, not the robot.
+LONG_SEGMENT_M = 2.0
+
 
 def wrap(x):
     return (x + torch.pi) % (2 * torch.pi) - torch.pi
@@ -801,6 +808,7 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
 
     keys = ("pos_err", "head_err", "speed", "category", "start_dist", "duration_s",
             "min_dist", "along", "cross", "peak_speed", "mean_speed", "cmd_speed",
+            "time_above_1p0", "time_above_1p3", "cruise_1p3",
             "path_lag", "time_to_0p5_s", "time_to_0p8_s", "time_to_1p0_s",
             "direction_time_to_0p5_s", "direction_time_to_0p8_s",
             "direction_time_to_1p0_s",
@@ -914,6 +922,16 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     peak_speed = torch.zeros(env.num_envs, device=env.device)
     sum_speed = torch.zeros(env.num_envs, device=env.device)
     n_speed = torch.zeros(env.num_envs, device=env.device)
+    # P2 is a SUSTAINED speed, and a peak cannot answer it.  A 1.4 m peak on a
+    # 0.7 m hop is an acceleration transient: the robot is speeding up and then
+    # immediately braking, and it never cruised at anything.  Time above the
+    # threshold answers "how long", and the longest CONTINUOUS stretch answers
+    # "in one piece or in scraps" -- the same total is a cruise or a dozen
+    # unrelated bursts, and only the second is what P2 asks for.
+    time_above_1p0 = torch.zeros(env.num_envs, device=env.device)
+    time_above_1p3 = torch.zeros(env.num_envs, device=env.device)
+    run_above_1p3 = torch.zeros(env.num_envs, device=env.device)
+    cruise_1p3 = torch.zeros(env.num_envs, device=env.device)
 
     obs, _ = env.reset()
     obs = obs.to(device)
@@ -1092,6 +1110,15 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
             cur_speed = torch.zeros(env.num_envs, device=env.device)
             cur_yawrate = torch.zeros(env.num_envs, device=env.device)
         torch.maximum(peak_speed, cur_speed, out=peak_speed)
+        # Steps with an invalid speed estimate are not counted as slow -- they
+        # are not counted at all, the same rule the mean below already follows.
+        hot10 = (cur_speed >= 1.0) & speed_valid
+        hot13 = (cur_speed >= 1.3) & speed_valid
+        time_above_1p0 += hot10.float() * env.dt
+        time_above_1p3 += hot13.float() * env.dt
+        run_above_1p3 = torch.where(hot13, run_above_1p3 + env.dt,
+                                    torch.zeros_like(run_above_1p3))
+        torch.maximum(cruise_1p3, run_above_1p3, out=cruise_1p3)
         # Excluded from the mean as well, not just zeroed: a zeroed sample still
         # drags the average down by ~pose_win steps after every reset.
         sum_speed += cur_speed
@@ -1611,6 +1638,9 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
             seg["min_dist"].extend(torch.minimum(min_dist[ids], d).cpu().tolist())
             seg["peak_speed"].extend(peak_speed[ids].cpu().tolist())
             seg["mean_speed"].extend((sum_speed[ids] / n_speed[ids].clamp(min=1.0)).cpu().tolist())
+            seg["time_above_1p0"].extend(time_above_1p0[ids].cpu().tolist())
+            seg["time_above_1p3"].extend(time_above_1p3[ids].cpu().tolist())
+            seg["cruise_1p3"].extend(cruise_1p3[ids].cpu().tolist())
             if has_path_speed:
                 seg["cmd_speed"].extend(prev_cmd_speed[ids].cpu().tolist())
             else:
@@ -1664,6 +1694,10 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
             peak_speed[stale] = 0.0
             sum_speed[stale] = 0.0
             n_speed[stale] = 0.0
+            time_above_1p0[stale] = 0.0
+            time_above_1p3[stale] = 0.0
+            run_above_1p3[stale] = 0.0
+            cruise_1p3[stale] = 0.0
             response_elapsed[stale] = 0.0
             response_min_speed_2s[stale] = float("inf")
             response_t05[stale] = float("nan")
@@ -2216,6 +2250,30 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
             "segment_peak_median": _median(peaks) if len(peaks) else float("nan"),
             "segment_peak_p90": _pct(peaks, 90) if len(peaks) else float("nan"),
             "segment_peak_max": float(np.max(peaks)) if len(peaks) else float("nan"),
+        }
+        # P2 read as a SUSTAINED speed.  Neither of the two numbers above can
+        # answer it.  A peak is an acceleration transient on a short hop, and a
+        # run-wide "share above 1 m/s" is dominated by the goal distribution
+        # rather than the robot: goal_categories puts 30% of draws at zero
+        # distance (stand + turn) and collapses straight/lateral onto one axis,
+        # so 44% of segments are under 0.5 m and only ~3% are over 2 m.  Pooling
+        # those measures the task.  Condition on segments long enough to permit
+        # a cruise at all, and report the longest CONTINUOUS stretch.
+        sd = np.asarray(roll.get("start_dist", []), dtype=float)
+        cru = np.asarray(roll.get("cruise_1p3", []), dtype=float)
+        t13 = np.asarray(roll.get("time_above_1p3", []), dtype=float)
+        long_m = ((sd >= LONG_SEGMENT_M) & np.isfinite(cru)
+                  if len(sd) and len(sd) == len(cru) else np.zeros(len(sd), bool))
+        n_long = int(long_m.sum())
+        results["body_speed"]["sustained_1p3"] = {
+            "long_segment_min_dist_m": LONG_SEGMENT_M,
+            "n_long_segments": n_long,
+            "cruise_median_s": _median(cru[long_m]) if n_long else float("nan"),
+            "cruise_p90_s": _pct(cru[long_m], 90) if n_long else float("nan"),
+            "cruise_max_s": float(np.max(cru[long_m])) if n_long else float("nan"),
+            "share_cruise_ge_0p5s": float((cru[long_m] >= 0.5).mean()) if n_long else float("nan"),
+            "share_cruise_ge_1p0s": float((cru[long_m] >= 1.0).mean()) if n_long else float("nan"),
+            "time_above_1p3_median_s": _median(t13[long_m]) if n_long else float("nan"),
         }
     else:
         results["body_speed"] = None
@@ -3519,7 +3577,9 @@ def write_outputs(out_dir, results, roll, report_md, env=None, cfg=None):
         w = csv.writer(f)
         w.writerow(["pos_err_m", "heading_err_deg", "final_speed_mps", "category",
                     "start_dist_m", "duration_s", "min_dist_m", "along_err_m", "cross_err_m",
-                    "peak_speed_mps", "mean_speed_mps", "cmd_speed_mps", "path_lag_m",
+                    "peak_speed_mps", "mean_speed_mps",
+                    "time_above_1p0_s", "time_above_1p3_s", "cruise_1p3_s",
+                    "cmd_speed_mps", "path_lag_m",
                     "time_to_0p5_s", "time_to_0p8_s", "time_to_1p0_s",
                     "direction_time_to_0p5_s", "direction_time_to_0p8_s",
                     "direction_time_to_1p0_s", "min_speed_first_2s",
@@ -3527,7 +3587,9 @@ def write_outputs(out_dir, results, roll, report_md, env=None, cfg=None):
         rows = zip(roll["pos_err"], np.degrees(roll["head_err"]), roll["speed"],
                    roll["category"], roll["start_dist"], roll["duration_s"],
                    roll["min_dist"], roll["along"], roll["cross"],
-                   roll["peak_speed"], roll["mean_speed"], roll["cmd_speed"],
+                   roll["peak_speed"], roll["mean_speed"],
+                   roll["time_above_1p0"], roll["time_above_1p3"], roll["cruise_1p3"],
+                   roll["cmd_speed"],
                    roll["path_lag"], roll["time_to_0p5_s"], roll["time_to_0p8_s"],
                    roll["time_to_1p0_s"], roll["direction_time_to_0p5_s"],
                    roll["direction_time_to_0p8_s"], roll["direction_time_to_1p0_s"],
