@@ -30,6 +30,7 @@ Usage (server):
 
 import argparse
 import copy
+import math
 import os
 
 # yaml is only needed to WRITE configs. Importing it at module scope made
@@ -360,6 +361,41 @@ I3_ARMS = {
     }),
 }
 
+# R3a -- joint zero drift.  The user reports K1's joint zero going off often
+# enough that posture visibly degrades and a re-calibration is needed, and asked
+# whether randomisation can absorb it.  Partly: the bias is NOT in the
+# observation, so the policy cannot learn to correct a direction it cannot see.
+# What it can learn is a posture that survives any offset -- which is
+# conservative, and 8-17 showed conservatism costs speed.  So clean
+# non-inferiority is part of the verdict, not an afterthought.
+#
+# encoder_bias moves what the policy SEES; target_offset moves where the PD
+# actually aims.  A real zero drift causes both, so they go on together at the
+# same magnitude (ibatch 484).
+#
+# Sizing is a search, not a claim.  hbatch's M2_jointdr proposed +/-0.015 rad
+# (0.86 deg) and was never run, and no measurement of real drift exists in this
+# repo.  The user chose to bracket from above at 10 deg and walk it down.  Note
+# what 10 deg means: every one of the 22 joints is drawn independently, so with
+# six leg joints the foot lands about 22 cm from where the policy thinks -- more
+# than the whole support polygon (foot half-length 9.4 cm).  Expect collapse
+# rather than a slowdown; that is still a useful upper bracket.  3 deg is run
+# alongside so one round brackets from both sides instead of two.
+def _jointcal(deg):
+    r = round(math.radians(deg), 5)
+    return {
+        "randomization.joint_encoder_bias": {
+            "range": [-r, r], "operation": "additive", "distribution": "uniform"},
+        "randomization.joint_target_offset": {
+            "range": [-r, r], "operation": "additive", "distribution": "uniform"},
+    }
+
+
+I3A_ARMS = {
+    "I3a_jointcal10": merge(_I3_BASE, _jointcal(10.0)),
+    "I3a_jointcal3": merge(_I3_BASE, _jointcal(3.0)),
+}
+
 ARMS_ON_E0 = {"I0a_repro", "I0b_foot", "I0c_h055", "I0d_h058",
               "I1a_base", "I1b_force", "I1c_cadence", "I1d_both",
               "I2a_dr", "I2b_terrain", "G1_speed", "G2_robust", "G3_full"}
@@ -378,7 +414,8 @@ def set_dotted(cfg, dotted, value):
 # V8_ARMS (G4_smoothturn) was missing from this merge, so --only G4_smoothturn
 # raised KeyError before it ever reached the per-arm is_v8 branch below --
 # G4 has never successfully generated a config, let alone run its smoke test.
-ALL_ARMS = dict(**ARMS, **F_ARMS, **I_ARMS, **I1_ARMS, **I2_ARMS, **I3_ARMS, **V8_ARMS)
+ALL_ARMS = dict(**ARMS, **F_ARMS, **I_ARMS, **I1_ARMS, **I2_ARMS, **I3_ARMS,
+                **I3A_ARMS, **V8_ARMS)
 
 # GPU 0 / GPU 1 split. F-batch: F1+F2 share GPU 0 (lighter, no disturbance),
 # F3 gets GPU 1 to itself (disturbance + higher flicker rate is the heavier one).
@@ -401,6 +438,8 @@ GPU_OF = {
     "I1c_cadence": "cuda:1", "I1d_both": "cuda:1",
     "I2a_dr": "cuda:0", "I2b_terrain": "cuda:1",
     "I3_rough": "cuda:0",
+    "I3a_jointcal10": "cuda:0",
+    "I3a_jointcal3": "cuda:1",
 }
 
 

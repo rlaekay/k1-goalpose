@@ -724,6 +724,21 @@ def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
             c["goal_dx"], c["goal_dy"] = [0.0, 0.0], [-2.0, 2.0]
         elif goal_pattern == "reverse":
             c["goal_dx"], c["goal_dy"] = [-2.0, -1.0], [0.0, 0.0]
+        elif goal_pattern == "forward_hold":
+            # Steady-state speed.  On the normal task the robot covers 2.25 m and
+            # stops, so acceleration and braking own most of the segment and no
+            # cruise is ever held long enough to read (8-19: even the ideal run
+            # holds 1.3 m/s for about a second).  Putting the goal back 2 m ahead
+            # on a fixed cadence means it is never reached, never decelerates to
+            # a stop, and simply walks -- so body_speed becomes the policy's
+            # sustained speed rather than a transient.
+            #
+            # 2 m is the trained goal range (goal_dx +-2), so the observation
+            # stays in distribution; a far goal like 20 m would not.
+            # 1 s of cadence keeps the remaining distance between roughly 1.2
+            # and 2.0 m -- always approaching, never arriving.
+            c["goal_dx"], c["goal_dy"] = [2.0, 2.0], [0.0, 0.0]
+            c["resampling_time_s"] = [1.0, 1.0]
     # Fingerprint what the simulator will actually sample after every CLI and
     # common-profile override.  Cross-arm aggregation rejects a single missing
     # or unequal hash, preventing another comparison of unequal force/noise/DR
@@ -3916,7 +3931,7 @@ def main():
         help="video-only HBatch protocol: path-only goals plus a guaranteed early support force")
     parser.add_argument("--feasible_speed", type=float, help="override evaluation.feasible_speed_mps (m/s) used by the feasibility check")
     parser.add_argument("--stress", choices=["jitter"], help="robustness stress mode instead of a gate evaluation. 'jitter': the true goal is redrawn uniformly in a +-3 m box every control step (50 Hz), modelling BT thrash / ball re-detection. Scored on falls and body oscillation -- position error is undefined in this mode.")
-    parser.add_argument("--goal_pattern", choices=["lateral", "reverse"],
+    parser.add_argument("--goal_pattern", choices=["lateral", "reverse", "forward_hold"],
                         help="force abrupt robot-local side or rear waypoint goals")
     parser.add_argument("--exploratory", action="store_true", help="label this run as a non-authoritative preview rather than an official gate evaluation")
     parser.add_argument("--out", help="output dir (default: <run_dir>/eval/<timestamp>)")
