@@ -24,7 +24,7 @@ SESSION="${SESSION:-g}"
 ITERS="${ITERS:-12000}"
 ENVS="${ENVS:-4096}"
 CKPT="${CKPT:-logs/K1/K1/Goal_Pose_V7/2026-07-26-19-36-15_E0_armB_armsdown/nn/model_6200.pth}"
-MAX_WAIT_MIN="${MAX_WAIT_MIN:-90}"
+MAX_WAIT_MIN="${MAX_WAIT_MIN:-20}"   # GPU 여유 대기 상한. 0 = 즉시 진행
 
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 # 통과한 arm만 먼저 띄우고 싶을 때:  ARMS="G1_speed G2_robust" bash tools/tonight.sh
@@ -45,19 +45,29 @@ if [ "$DRYRUN" != "1" ] && [ ! -f "$CKPT" ]; then
 fi
 say "warm start: $CKPT"
 
-# ---- 1) 재평가가 끝나기를 기다린다 ------------------------------------------
+# ---- 1) GPU가 빌 때까지 기다린다 --------------------------------------------
+# 예전에는 `pgrep reeval_v7.sh|select_best_checkpoint.py`로 대기했다. 그 조건은
+# "평가가 도는 중"일 뿐 "GPU가 없다"가 아니다. R1 재실행이 정확히 여기 걸렸다 —
+# 완주한 두 arm의 후처리 평가가 카드 하나만 쓰고 있는데 90분을 기다리려 했다.
+# 이제 실제 여유 VRAM을 본다. 학습 프로세스 하나가 약 2.6 GB를 쓴다.
+NEED_MB="${NEED_MB:-6000}"      # arm 하나를 안전하게 띄우는 데 필요한 여유
 waited=0
-while pgrep -f "reeval_v7.sh|select_best_checkpoint.py" >/dev/null 2>&1; do
+free_mb() {
+  nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null \
+    | sort -rn | head -1
+}
+while :; do
+  f=$(free_mb); f="${f:-999999}"
+  [ "$f" -ge "$NEED_MB" ] && break
   if [ "$waited" -ge "$MAX_WAIT_MIN" ]; then
-    say "재평가가 ${MAX_WAIT_MIN}분째 안 끝남 — 더 기다리지 않고 진행한다."
-    say "  (재평가는 학습이 아니라 언제든 다시 돌릴 수 있다)"
+    say "GPU가 ${MAX_WAIT_MIN}분째 안 비었다 (여유 ${f} MiB) — 그래도 진행한다."
     break
   fi
-  [ $((waited % 10)) -eq 0 ] && say "재평가 진행 중... ${waited}분 경과 (최대 ${MAX_WAIT_MIN}분 대기)"
+  [ $((waited % 5)) -eq 0 ] && say "GPU 대기... 여유 ${f} MiB < ${NEED_MB} (${waited}/${MAX_WAIT_MIN}분)"
   sleep 60
   waited=$((waited + 1))
 done
-say "재평가 대기 종료 (${waited}분)"
+say "GPU 대기 종료 (${waited}분, 여유 $(free_mb) MiB)"
 
 # GPU가 실제로 비었는지 — 공유 서버라 남의 작업이 올라와 있을 수 있다
 say "현재 GPU 점유:"
