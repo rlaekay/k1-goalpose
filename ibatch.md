@@ -1835,3 +1835,79 @@ what creates a speed demand**"*. §P7의 기록대로 **의도적으로 뺐고**
 **둘 다 필요하다.** 요구속도 1.3을 만들려면 `d/T ≥ 1.3`인데, 현재 마감 4–8 s에서는
 d가 5–10 m여야 한다 — 상자(최대 2.5 m) 밖이다. 거리 2.5–4 m에 **마감 약 d/1.4 ≈ 2.5–3 s**를
 같이 줘야 한다. **거리만 늘리는 안은 작동하지 않는다.**
+
+---
+
+## 8-16. 실행 전 전수조사 — 그리고 I2b는 애초에 지형 시험이 아니었다 (2026-08-04 04:0x)
+
+두 번 헛돌린 뒤(§8-13 `--config` 오류로 35.6분) 이번 세션에 바꾼 코드와 드릴 명령을
+전부 코드로 확인했다. **12항목 전부 통과**, 그리고 **더 큰 결함 하나를 찾았다.**
+
+### (1) I2b 재선택 실수의 전모 — path 하나가 아니라 24개 키였다
+
+`sweeps/I2b_terrain.yaml`을 직접 생성해 `envs/K1/Goal_Pose_V7.yaml`과 비교했다.
+`--config envs/K1/Goal_Pose_V7.yaml`은 지형만 바꾼 게 아니라 **24개 키**를 바꿨다:
+
+| 바뀐 것 | arm(학습된 것) | 내가 준 V7 base |
+|---|---|---|
+| **`asset.feet_edge_pos`** | 교정된 발(I0b) | **옛 발** |
+| `commands.goal_mode_mixture` | waypoint 1.0 | path 0.35 |
+| `noise.goal_*` (5개) | 전부 0 | 관측 노이즈 ON |
+| `randomization.disturbance.*` (5개) | 저용량 | 고용량 |
+| `rewards.base_height_target` | 0.55 (I0c) | 0.52 |
+| `rewards.scales.*` (5개) | OFF | ON |
+
+**교정된 발 기하까지 되돌아갔다.** 6.2 cm는 지형이나 path 때문이 아니라 **완전히 다른
+실험**이었다. `eval_goal_pose.py:648`에 지형만 덮는 `--terrain`이 이미 있었는데
+안 찾아보고 config를 통째로 바꾸는 길을 골랐다. 선택기에 그 플래그를 추가했다(6e0cb1d).
+
+### (2) ⛔ 더 중요한 것 — I2b_terrain은 깨끗한 지형 시험이 아니다
+
+I2a_dr과 I2b_terrain을 직접 비교하면 **지형만 다른 게 아니다**:
+
+| 키 | I2a_dr | I2b_terrain |
+|---|---|---|
+| `randomization.base_com.range` | **[-0.025, 0.025]** | **[-0.1, 0.1]** |
+| `randomization.base_mass.range` | [0.92, 1.08] | [0.8, 1.2] |
+| `dof_stiffness/damping.range` | [0.85, 1.15] | [0.95, 1.05] |
+| `terrain.type` | plane | trimesh |
+
+**I2b는 DR 교정을 안 싣고 있다.** `_I2_BASE + trimesh`이고, `_I2_BASE`는 §8-10이
+*"CoM이 지지면 밖으로 나간다 … 정적으로 균형이 불가능한 로봇"*이라고 판정한 그
+`base_com ±0.1`을 그대로 쓴다.
+
+**그래서 I2b가 느리고(1.25 m/s / 28.9%) 부정확한 것은 지형 탓인지 미교정 DR 탓인지
+분리되지 않는다.** 두 arm 모두 `_I2_BASE`에서 뻗은 단일 레버라 *"어느 레버가 나은가"*는
+유효한 질문이지만, *"지형이 대가를 치르게 하는가"*는 **이 설계로 답할 수 없다.**
+
+### (3) 그 질문은 이미 I3_rough의 것이다
+
+```
+I3_rough vs I2a_dr 차이:  terrain.type / proportions / random_height / slope / discrete
+                          → 지형 키 5개뿐. 나머지 전부 동일.
+_I3_BASE = merge(_I2_BASE, _I2_DR)   → DR 교정을 싣는다.
+```
+
+**I3_rough는 I2a_dr과 지형만 다르다.** 게다가 지형이 현실적이다 —
+**±2 cm turf**(`random_height 0.02`, slope 0, random only) vs I2b의 **±10 cm rubble +
+경사 0.1 + discrete 50%**.
+
+> **판정: I2b 평지 재선택을 하지 않는다.** 36분을 써도 지형 질문에 답하지 못하고,
+> 그 질문은 I3_rough가 깨끗하게 답한다. **I2b_terrain은 여기서 종료한다.**
+
+### (4) 전수조사 결과
+
+| # | 항목 | 확인 방법 | 결과 |
+|---|---|---|---|
+| 1 | segments.csv 헤더 ↔ zip 정렬 | 26 대 26 원소별 대조 | ✅ category 인덱스 3 유지 |
+| 2 | 새 seg 키 초기화·적재 | `seg = {k: [] for k in keys}` | ✅ peak_speed와 같은 블록·같은 `ids` |
+| 3 | 구간 경계 리셋 | 트래커 4개 | ✅ |
+| 4 | `speed_valid` dtype | `long >= int` → bool | ✅ `bool & bool` 정상 |
+| 5 | `env.dt` = 스텝 증분 | `rollout(int(duration_s/env.dt))` | ✅ |
+| 6 | 선택기 `--terrain`이 env 생성 전 | 424/426 < 480 | ✅ |
+| 7 | `Terrain`이 type만으로 분기 | `utils/terrain.py:13-20` | ✅ trimesh 잔재 없음 |
+| 8 | `EVAL_TERRAIN` → report.json | `summarize():2088` | ✅ |
+| 9 | `results["gates"]["falls"]` 존재 | `:2146` | ✅ `legacy_pass`가 의존 |
+| 10 | `constellation_radius` = 1.0 | I2a_dr.yaml | ✅ 과제오차 1°≡1.75 cm 근거 확인 |
+| 11 | 순항 출력 경로 | 합성 데이터 실행 | ✅ |
+| 12 | 옛 eval 하위호환 | 컬럼 없는 CSV 실행 | ✅ "미기록" 명시 |
