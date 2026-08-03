@@ -830,7 +830,12 @@ class Controller:
         # recovery.
         if self.fall_monitor is not None:
             fstate, _avail, fage = self.fall_monitor.snapshot()
-            if fage < 5.0 and fstate in (FallState.HAS_FALLEN, FallState.IS_FALLING):
+            # IS_GETTING_UP is deliberately not a trigger, and IS_FALLING is not
+            # relied on: a measured get-up went HAS_FALLEN -> IS_READY without
+            # ever reporting IS_GETTING_UP, so the intermediate states of this
+            # 1 Hz topic cannot be assumed to appear at all. The IMU watchdog is
+            # what actually catches a fall in progress.
+            if fage < 5.0 and fstate == FallState.HAS_FALLEN:
                 self._request_recovery("fall_down=%s" % FallState.NAMES.get(fstate, fstate))
                 return
 

@@ -140,8 +140,12 @@ safety:
     fall_raw_topic: "/fall_down_recovery_state"    # 3-byte fallback
     damping_settle_s: 1.5         # let the robot come to rest before asking to get up
     recovery_wait_timeout_s: 10.0 # give up if get-up never becomes available
+    # Measured on hardware: HAS_FALLEN -> IS_READY took 8.0 s.
     getup_timeout_s: 20.0
-    getup_blind_wait_s: 8.0       # only used when the fall topic is unavailable
+    # Only used when the fall topic is unavailable. Must clear the measured 8.0 s
+    # with margin, or we would declare the robot standing while it is still
+    # getting up.
+    getup_blind_wait_s: 12.0
     # CUSTOM entry ramps from the *measured* pose to the RL pose over this long.
     # Latching the measured pose makes the step zero regardless of where we come
     # from; measured cost of the old snap entry was 0.53 rad / 2.8 s.
