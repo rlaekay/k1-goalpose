@@ -1,4 +1,4 @@
-import json,glob,os,math,statistics as stt
+import json,glob,os,math,sys,statistics as stt
 def te(d):
     return math.hypot(d['pos_err_m']['median'], math.radians(d['heading_err_deg']['median']))*100
 def rng(v):
@@ -7,7 +7,8 @@ def rng(v):
 roots=sorted(glob.glob('logs/force_ab/*'))
 if not roots: print('force_ab 결과 없음')
 else:
-    R=roots[-1]; print('== force_ab:',R,'==')
+    R=sys.argv[1] if len(sys.argv)>1 else roots[-1]
+    print('== force_ab:',R,'==')
     cells={}
     print('%-10s %-5s %4s %7s %7s %8s %6s %7s %8s %7s %7s'%('arm','mode','seed','pos cm','head°','과제cm','낙상','구간','/1000','events','FDF'))
     for p in sorted(glob.glob(os.path.join(R,'*','*_seed*','**','report.json'),recursive=True)):

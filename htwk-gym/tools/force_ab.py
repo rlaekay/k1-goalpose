@@ -107,12 +107,23 @@ def main():
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--skip-clean", dest="skip_clean", action="store_true",
                     help="force test only (clean numbers already known)")
+    ap.add_argument("--skip-force", dest="skip_force", action="store_true",
+                    help="clean 셀만 돈다 — 이미 끝난 force 셀에 clean을 채워 넣을 때")
+    ap.add_argument("--out_run",
+                    help="새 타임스탬프를 만들지 않고 이 run 디렉터리에 이어 쓴다. "
+                         "force 셀이 이미 있는 run에 clean을 합쳐 2x2를 닫을 때 쓴다 "
+                         "— 따로 돌리면 다른 폴더로 가서 clean/force 비교가 안 된다.")
     ap.add_argument("--out", default=os.path.join(ROOT, "logs", "force_ab"))
     a = ap.parse_args()
 
-    out_root = os.path.join(a.out, time.strftime("%Y-%m-%d-%H-%M-%S"))
+    if a.skip_clean and a.skip_force:
+        ap.error("--skip-clean과 --skip-force를 같이 주면 돌 셀이 없다")
+    modes = [m for m in ("clean", "force")
+             if not (m == "clean" and a.skip_clean)
+             and not (m == "force" and a.skip_force)]
+    out_root = a.out_run or os.path.join(a.out, time.strftime("%Y-%m-%d-%H-%M-%S"))
     os.makedirs(out_root, exist_ok=True)
-    n_cells = len(a.arm) * len(a.seeds) * (1 if a.skip_clean else 2)
+    n_cells = len(a.arm) * len(a.seeds) * len(modes)
     print("held-out force: interval 4-8 s, collision 50-120 N, support 4-10 N")
     print("seeds %s, %d envs x %.0f s" % (a.seeds, a.num_envs, a.duration_s))
     print("총 %d회 평가, 회당 약 14분 -> 예상 %.1f시간\n" % (n_cells, n_cells * 14 / 60.0))
@@ -121,7 +132,6 @@ def main():
     for name, ckpt, cfg in a.arm:
         print("  [%s]" % name, flush=True)
         res[name] = {"clean": [], "force": []}
-        modes = ["force"] if a.skip_clean else ["clean", "force"]
         for mode in modes:
             for s in a.seeds:
                 d = one(name, ckpt, cfg, a.task, s, a.num_envs, a.duration_s,
@@ -156,7 +166,12 @@ def main():
         rs = res[name]["force"]
         if rs and all((r.get("_events") or 0) == 0 for r in rs):
             print("  !!! %s: force event 0회 — 이 결과는 강건성 근거가 아니다." % name)
-    print("  결과: %s\n" % out_root)
+    print("  결과: %s" % out_root)
+    if a.out_run:
+        print("  (이어쓰기) 이 run의 clean/force 전체 표: "
+              "python tools/review_round.py\n")
+    else:
+        print()
     return 0
 
 
