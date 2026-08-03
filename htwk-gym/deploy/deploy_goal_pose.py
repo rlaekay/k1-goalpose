@@ -186,9 +186,16 @@ class RosGoalSource:
 
 class Controller:
     def __init__(self, cfg_file, goal_source_mode="ros", initial_goal=None,
-                 goal_topic=None, debug_topic=None) -> None:
+                 goal_topic=None, debug_topic=None,
+                 hold_prepare=False, prepare_settle_log_s=1.0) -> None:
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
+
+        # Mode-transition instrumentation/behaviour knobs. See --hold-prepare.
+        self.hold_prepare = bool(hold_prepare)
+        self.prepare_settle_log_s = float(prepare_settle_log_s)
+        self._custom_mode_entered_monotonic = 0.0
+        self._prepare_q = None
 
         with open(cfg_file, "r", encoding="utf-8") as f:
             self.cfg = yaml.load(f.read(), Loader=yaml.FullLoader)
@@ -307,6 +314,23 @@ class Controller:
             if hasattr(self, "low_state_subscriber"):
                 self.low_state_subscriber.CloseChannel()
 
+    def _log_joint_deviation(self, tag, target_q):
+        """Report how far the measured legs are from a commanded pose.
+
+        The mode transition is not instantaneous, and the only way to see what
+        the robot is actually doing during it is the measured-vs-commanded gap on
+        the 12 policy joints.  Everything else (SDK internals, the mode state
+        machine) is opaque from here.
+        """
+        legs = slice(self.policy.leg_start, self.policy.leg_start + self.policy.num_act)
+        err = np.asarray(self.dof_pos[legs], dtype=np.float64) - np.asarray(target_q[legs], dtype=np.float64)
+        worst = int(np.argmax(np.abs(err)))
+        self.logger.info(
+            "[mode-timing] %-22s max|q_meas-q_cmd|=%.4f rad at leg idx %d  rms=%.4f rad",
+            tag, float(np.max(np.abs(err))), self.policy.leg_start + worst,
+            float(np.sqrt(np.mean(err ** 2))),
+        )
+
     def start_custom_mode_conditionally(self):
         self._require_fresh_low_state("before waiting for CUSTOM mode")
         print(f"{self.remoteControlService.get_custom_mode_operation_hint()}")
@@ -320,14 +344,41 @@ class Controller:
         # the earlier check alone cannot make that transition safe.
         self._require_fresh_low_state("immediately before CUSTOM mode")
         create_prepare_cmd(self.low_cmd, self.cfg)
+        prepare_q = np.array([self.low_cmd.motor_cmd[i].q for i in range(B1JointCnt)],
+                             dtype=np.float64)
         for i in range(B1JointCnt):
             self.dof_target[i] = self.low_cmd.motor_cmd[i].q
             self.filtered_dof_target[i] = self.low_cmd.motor_cmd[i].q
+
+        # The `prepare` pose and gains are NOT the RL ones: prepare holds hips at
+        # -0.1 / knees 0.2 with stiffness 350-450, while the policy runs at
+        # -0.2 / 0.4 with stiffness 100/50.  Entering CUSTOM therefore snaps the
+        # legs to a different, much stiffer posture before the policy ever runs,
+        # and that snap is the visible part of the "mode change delay".
+        self._log_joint_deviation("before prepare cmd", prepare_q)
         self._send_cmd(self.low_cmd)
+
         # Mark the transition as attempted before the SDK call: if ChangeMode
         # raises after the robot accepted it, cleanup must still request DAMPING.
         self._custom_mode_started = True
+        t0 = time.monotonic()
         self.client.ChangeMode(RobotMode.kCustom)
+        self._custom_mode_entered_monotonic = time.monotonic()
+        self.logger.info("[mode-timing] ChangeMode(kCustom) returned in %.3f s",
+                         self._custom_mode_entered_monotonic - t0)
+
+        # Watch the legs settle onto the prepare pose. Nothing publishes LowCmd
+        # between here and the RL-gait prompt unless --hold-prepare is given, so
+        # without this the entire transition is invisible.
+        settle_deadline = time.monotonic() + max(0.0, self.prepare_settle_log_s)
+        while time.monotonic() < settle_deadline:
+            if self.hold_prepare:
+                self._send_cmd(self.low_cmd)
+            time.sleep(0.1)
+            self._log_joint_deviation(
+                "settling +%.1fs" % (time.monotonic() - self._custom_mode_entered_monotonic),
+                prepare_q)
+        self._prepare_q = prepare_q
 
     def _require_fresh_low_state(self, context):
         low_state_timeout = float(self.cfg.get("safety", {}).get("low_state_timeout_s", 0.2))
@@ -341,11 +392,30 @@ class Controller:
 
     def start_rl_gait_conditionally(self):
         print(f"{self.remoteControlService.get_rl_gait_operation_hint()}")
+        wait_t0 = time.monotonic()
         while True:
             if self.remoteControlService.start_rl_gait():
                 break
+            # Between CUSTOM entry and this prompt nothing publishes LowCmd
+            # unless --hold-prepare is set: the publish thread only starts below.
+            # The robot simply holds the single prepare frame it was given.
+            if self.hold_prepare:
+                self._send_cmd(self.low_cmd)
             time.sleep(0.1)
+        self.logger.info(
+            "[mode-timing] operator wait at RL-gait prompt: %.2f s "
+            "(CUSTOM entered %.2f s ago)",
+            time.monotonic() - wait_t0,
+            time.monotonic() - getattr(self, "_custom_mode_entered_monotonic", wait_t0))
+
+        if getattr(self, "_prepare_q", None) is not None:
+            self._log_joint_deviation("at RL-gait start (vs prepare)", self._prepare_q)
         create_first_frame_rl_cmd(self.low_cmd, self.cfg)
+        rl_q = np.array([self.low_cmd.motor_cmd[i].q for i in range(B1JointCnt)],
+                        dtype=np.float64)
+        # This is the second posture change of the sequence: prepare pose/gains
+        # -> RL pose/gains. Its size is the jump the policy has to start from.
+        self._log_joint_deviation("at RL-gait start (vs rl pose)", rl_q)
         self._send_cmd(self.low_cmd)
         self.next_inference_time = self.timer.get_time()
         self.next_publish_time = self.timer.get_time()
@@ -488,6 +558,15 @@ if __name__ == "__main__":
                         help="Override deploy_goal.topic for ROS mission mode.")
     parser.add_argument("--debug-topic", type=str, default=None,
                         help="Override deploy_goal.debug_topic for ROS mission mode.")
+    parser.add_argument("--hold-prepare", action="store_true",
+                        help="Keep republishing the prepare frame from CUSTOM entry "
+                             "until RL gait starts. By default a single frame is sent "
+                             "and then nothing publishes until the operator starts the "
+                             "gait, which makes the transition timing depend on how "
+                             "long the prompt is left waiting.")
+    parser.add_argument("--prepare-settle-log-s", type=float, default=1.0,
+                        help="Seconds to log measured-vs-commanded joint error right "
+                             "after entering CUSTOM (0 disables).")
     args = parser.parse_args()
     cfg_file = os.path.join("configs", args.config)
 
@@ -505,6 +584,8 @@ if __name__ == "__main__":
         initial_goal=initial_goal,
         goal_topic=args.goal_topic,
         debug_topic=args.debug_topic,
+        hold_prepare=args.hold_prepare,
+        prepare_settle_log_s=args.prepare_settle_log_s,
     ) as controller:
         time.sleep(2)  # wait for channels
         print("Initialization complete.")

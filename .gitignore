@@ -233,3 +233,9 @@ htwk-gym/monitor/
 htwk-gym/logs/monitor.log
 
 server-dump/
+
+# Deploy connection settings (hosts/accounts/paths stay local)
+tools/deploy_env.sh
+
+# sim2real worktree that codex parked in here; not part of this repo
+.worktrees/

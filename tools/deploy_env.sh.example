@@ -1,0 +1,25 @@
+# Copy to tools/deploy_env.sh and fill in. That file is gitignored: hosts,
+# accounts and paths stay off GitHub.
+#
+#   cp tools/deploy_env.sh.example tools/deploy_env.sh
+#   $EDITOR tools/deploy_env.sh
+#
+# No passwords go in here. Use SSH keys.
+
+# --- training server ---
+export SERVER="user@server-host"
+export SERVER_PORT="22"
+export SERVER_REPO="/path/to/k1-goalpose"
+export CONDA_ENV="k1goalpose"
+
+# --- robot ---
+export ROBOT="user@robot-host"
+export ROBOT_PORT="22"
+# Mission staging workspace. Must be the clean one, not the game repo.
+export ROBOT_WS="/path/to/mission_ws"
+
+# --- optional ---
+# This Mac has two default routes (robot ethernet + wifi). If the server is only
+# reachable over wifi, bind to that interface:
+#   export SSH_BIND="$(ipconfig getifaddr en0)"
+# export SSH_BIND=""
