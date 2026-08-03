@@ -2181,10 +2181,20 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
     ok_head = head_deg <= g_head_med
     ok_stop = speed <= stop_thr
 
+    _cmds = cfg.get("commands", {}) or {}
     results = {
         "checkpoint": checkpoint,
         "config": config_path,
         "task": task,
+        # effective_protocol은 해시만 남기고 사라진다. 나중에 report.json만 보고
+        # "이게 어떤 프로토콜이었나"를 알 수 있어야 한다 -- forward_hold처럼 도착이
+        # 정의되지 않는 실행에서 도착 오차를 읽는 사고를 막는 것이 목적이다.
+        "goal_pattern": (cfg.get("evaluation", {}) or {}).get("goal_pattern"),
+        "sampled_commands": {
+            "goal_dx": _cmds.get("goal_dx"),
+            "goal_dy": _cmds.get("goal_dy"),
+            "resampling_time_s": _cmds.get("resampling_time_s"),
+        },
         "experiment_description": cfg.get("basic", {}).get("description", ""),
         "date": time.strftime("%Y-%m-%d %H:%M:%S"),
         "seed": seed,

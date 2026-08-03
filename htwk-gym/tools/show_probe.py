@@ -36,7 +36,7 @@ def show(path):
     # goal_pattern은 report.json 최상위에 없다(effective_protocol 안에서 해시될 뿐).
     # 라벨 대신 실제로 샘플링된 값을 찍는다 -- 프로브가 정말 돌았는지의 증거는
     # 이름이 아니라 goal_dx와 resample 주기다.
-    cm = d.get("commands") or {}
+    cm = d.get("sampled_commands") or d.get("commands") or {}
     print("  바닥 %s | 외력 %s | 구간 %s" % (
         d.get("eval_terrain"), d.get("force_profile"), d.get("segments_completed")))
     print("  goal_dx %s  goal_dy %s  resample %s s" % (
@@ -44,15 +44,21 @@ def show(path):
     dur = d.get("duration_s") or 0
     ne = d.get("num_envs") or 0
     n = d.get("segments_completed") or 0
-    if dur and ne and n:
-        seg_s = dur * ne / float(n)
+    seg_s = dur * ne / float(n) if (dur and ne and n) else 0.0
+    if seg_s:
         print("  구간 길이 실측 %.2f s -> 순항 최장연속은 이 값에 상한이 걸린다"
               % seg_s)
 
     # forward_hold 판별: 목표 범위가 한 점([2,2])이면 도착하지 않도록 만든 프로브다.
     # 정상 과제는 [-2, 2]다. 라벨이 아니라 실제 샘플링 범위로 판별한다.
     dx = cm.get("goal_dx") or []
-    is_probe = len(dx) == 2 and dx[0] == dx[1] and dx[0] != 0.0
+    is_probe = bool(d.get("goal_pattern")) or (
+        len(dx) == 2 and dx[0] == dx[1] and dx[0] != 0.0)
+    # 옛 report.json에는 goal_pattern도 sampled_commands도 없다. 그때는 구간 길이로
+    # 가른다: 정상 과제는 resample 4-8 s라 구간이 4 s를 훨씬 넘고, forward_hold는
+    # 0.8-1.2 s다. 판별에 실패해 도착 오차를 찍는 쪽이 훨씬 나쁜 결과라 보수적으로 본다.
+    if not is_probe and seg_s and seg_s < 2.0:
+        is_probe = True
     if not is_probe:
         # 정상 과제에서는 도착 지표가 결과다. 프로브에서만 숨긴다.
         pe = d.get("pos_err_m") or {}
