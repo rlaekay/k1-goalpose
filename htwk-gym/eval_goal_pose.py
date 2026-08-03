@@ -938,12 +938,6 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
 
     # closest approach to the goal currently being pursued, per env
     min_dist = torch.full((env.num_envs,), float("inf"), device=env.device)
-    # Swing apex height, per foot.  A foot only trips on what its LOWEST corner
-    # fails to clear, and on a plane feet_swing stops paying once that corner is
-    # 1 cm up -- so nothing in training asks for more and nothing in eval has
-    # ever looked.  Terrain arms exist precisely to raise this, and without it
-    # they get adopted or rejected on strict success, which is accuracy, not the
-    # thing being bought.  Recorded at touchdown so each swing contributes once.
     # Support state and load sharing.  These exist because the FALL COUNT is not
     # measurable at the exposure this project can afford -- 8-12a retired a gate
     # for exactly that, and 4 falls in 13,922 segments cannot rank anything.  The
@@ -955,6 +949,12 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     ss_hist = np.zeros(150, dtype=np.int64)           # 0..3 s, 20 ms bins
     ss_hist_max_s = 3.0
     load_asym_hist = np.zeros(100, dtype=np.int64)    # 0..1
+    # Swing apex height, per foot.  A foot only trips on what its LOWEST corner
+    # fails to clear, and on a plane feet_swing stops paying once that corner is
+    # 1 cm up -- so nothing in training asks for more and nothing in eval has
+    # ever looked.  Terrain arms exist precisely to raise this, and without it
+    # they get adopted or rejected on strict success, which is accuracy, not the
+    # thing being bought.  Recorded at touchdown so each swing contributes once.
     swing_apex = None
     swing_apex_hist = np.zeros(200, dtype=np.int64)   # 0..20 cm, 1 mm bins
     swing_apex_max_m = 0.20
@@ -1372,7 +1372,9 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
                     0, len(ss_hist) - 1), 1)
             ss_run = torch.where(single, ss_run + 1.0, torch.zeros_like(ss_run))
             prev_single = single
-            if has_contact_forces:
+            # Left/right sharing is only defined for two feet; guard rather
+            # than index columns 0 and 1 on faith.
+            if has_contact_forces and len(env.feet_indices) == 2:
                 ff = torch.norm(env.contact_forces[:, env.feet_indices, :], dim=-1)
                 both = (n_contact == 2) & alive
                 if bool(both.any()):
@@ -1384,6 +1386,12 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
 
         # ---- swing apex ---------------------------------------------------
         if swing_apex is not None and prev_feet_contact is not None:
+            # A reset teleports the robot, so feet_clearance jumps and any apex
+            # carried across that boundary is spawn geometry rather than a step.
+            # This file has been burned by exactly this before: a speed window
+            # straddling a reset once reported 203 m/s (see pose_hist above).
+            swing_apex = torch.where(done.unsqueeze(-1),
+                                     torch.zeros_like(swing_apex), swing_apex)
             airborne = ~env.feet_contact
             swing_apex = torch.where(
                 airborne, torch.maximum(swing_apex, env.feet_clearance), swing_apex)
