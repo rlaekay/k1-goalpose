@@ -235,7 +235,46 @@ I_ARMS = {
                      **{"rewards.base_height_target": 0.58}),
 }
 
-ARMS_ON_E0 = {"I0a_repro", "I0b_foot", "I0c_h055", "I0d_h058", "G1_speed", "G2_robust", "G3_full"}
+# ---- I batch R1 (2026-08-03) ------------------------------------------------
+# R0 carried two winners that were never run TOGETHER: the corrected foot (falls
+# 15 -> 4 per ~740 attempts) and base_height_target 0.55 (best p90 4.81, best
+# strict 91.7%, falls 4). I1a is that combination and is R1's control.
+#
+# The two levers on top are a 2x2 factorial, not four unrelated arms, because
+# the standing question and the speed question are suspected to interact: the
+# cadence fix removes the forced torso lean, and disturbance is what should make
+# an upright stance necessary rather than rewarded. I1d is the interaction cell
+# and is labelled as such -- it is the one arm that is deliberately not a single
+# lever.
+# save_interval 100 gave R0 exactly two checkpoints (0 and 200), so watch_eval
+# scored one of them and the stop rule could only fire at the very end -- the
+# early-stop budget was zero. 25 gives eight scoring points across the round.
+_I1_BASE = dict(**_OFF_PATH, **_OFF_ROBUST, **_OFF_PROTECT,
+                **{"asset.feet_edge_pos": FOOT_EDGE_REAL,
+                   "rewards.base_height_target": 0.55,
+                   "runner.save_interval": 25})
+# Low dose. E2 and G2 both collapsed to a near-stationary policy when the whole
+# robustness bundle went on at once, so this turns on ONLY the two-class contact
+# wrench -- no goal jitter, no bias, no flicker, no staleness.
+_I1_FORCE = {
+    "randomization.disturbance.enabled": True,
+    "randomization.disturbance.interval_s": [8.0, 14.0],
+    "randomization.disturbance.collision.force_n": [40.0, 100.0],
+    "randomization.disturbance.collision.duration_s": [0.06, 0.10],
+    "randomization.disturbance.support.force_n": [3.0, 8.0],
+    "randomization.disturbance.support.duration_s": [0.5, 1.5],
+}
+_I1_CADENCE = {"commands.cadence_coupling.enabled": True}
+
+I1_ARMS = {
+    "I1a_base": dict(_I1_BASE),
+    "I1b_force": dict(**_I1_BASE, **_I1_FORCE),
+    "I1c_cadence": dict(**_I1_BASE, **_I1_CADENCE),
+    "I1d_both": dict(**_I1_BASE, **_I1_FORCE, **_I1_CADENCE),
+}
+
+ARMS_ON_E0 = {"I0a_repro", "I0b_foot", "I0c_h055", "I0d_h058",
+              "I1a_base", "I1b_force", "I1c_cadence", "I1d_both", "G1_speed", "G2_robust", "G3_full"}
 
 
 def set_dotted(cfg, dotted, value):
@@ -251,7 +290,7 @@ def set_dotted(cfg, dotted, value):
 # V8_ARMS (G4_smoothturn) was missing from this merge, so --only G4_smoothturn
 # raised KeyError before it ever reached the per-arm is_v8 branch below --
 # G4 has never successfully generated a config, let alone run its smoke test.
-ALL_ARMS = dict(**ARMS, **F_ARMS, **I_ARMS, **V8_ARMS)
+ALL_ARMS = dict(**ARMS, **F_ARMS, **I_ARMS, **I1_ARMS, **V8_ARMS)
 
 # GPU 0 / GPU 1 split. F-batch: F1+F2 share GPU 0 (lighter, no disturbance),
 # F3 gets GPU 1 to itself (disturbance + higher flicker rate is the heavier one).
@@ -268,11 +307,15 @@ GPU_OF = {
     # control vs foot on one, and the two height values on the other.
     "I0a_repro": "cuda:0", "I0b_foot": "cuda:0",
     "I0c_h055": "cuda:1", "I0d_h058": "cuda:1",
+    # Factorial pairs share a card so control-vs-lever runs under one thermal
+    # and clock condition: (control, force) on 0, (cadence, both) on 1.
+    "I1a_base": "cuda:0", "I1b_force": "cuda:0",
+    "I1c_cadence": "cuda:1", "I1d_both": "cuda:1",
 }
 
 
 def default_checkpoint(arm):
-    return ARMSDOWN_CKPT if (arm in F_ARMS or arm in I_ARMS or arm in ARMS_ON_E0
+    return ARMSDOWN_CKPT if (arm in F_ARMS or arm in I_ARMS or arm in I1_ARMS or arm in ARMS_ON_E0
                              or arm in V8_ARMS) else DEFAULT_CKPT
 
 

@@ -701,6 +701,41 @@ class GoalPoseV7(GoalPoseV3):
                 self.path_run_gait_frequency[self.is_path_env] = self.gait_frequency[
                     self.is_path_env]
             self.commands[self.is_path_env, 3] = self.gait_frequency[self.is_path_env]
+        self._couple_cadence_to_speed()
+
+    def _couple_cadence_to_speed(self):
+        """Pick cadence from the speed the goal actually demands.
+
+        gait_frequency is otherwise drawn uniformly from [1.8, 2.4] Hz with no
+        reference to the goal, and one cycle is two steps, so stride length is
+        forced to v / (2f). At 1.8 Hz a 1.5 m/s demand needs a 0.417 m stride
+        against roughly 0.28 m of leg travel -- physically impossible, and the
+        only compliant response left to the policy is to throw the torso forward
+        and fall in the intended direction. That is the high-speed lean the user
+        observed, and it is also why G1's achieved speed sat flat at 0.32-0.49
+        m/s across every commanded bin: cadence, not effort, was the binding
+        constraint.
+
+        This is a COMMAND-DISTRIBUTION change, not a reward: nothing is being
+        paid for holding a posture. The stride the task asks for simply becomes
+        one the leg can take, and the lean stops being the optimal answer.
+        Observation width is untouched -- gait_frequency already occupies
+        command slot 3.
+        """
+        c = self.cfg["commands"].get("cadence_coupling") or {}
+        if not c.get("enabled", False):
+            return
+        stride = float(c.get("max_stride_m", 0.28))
+        lo, hi = c.get("hz_range", [1.6, 3.2])
+        # Required speed for this segment: how far, over how long it has to last.
+        secs = (self.cmd_resample_time - self.episode_length_buf).clamp(min=1).float() * self.dt
+        need = (self.goal_dist / secs.clamp(min=1e-3))
+        f = (need / (2.0 * stride)).clamp(min=float(lo), max=float(hi))
+        # Standing goals keep a frozen clock; overriding it would re-enable the
+        # stepping incentive that makes standing still non-optimal.
+        live = self.gait_frequency > 1.0e-8
+        self.gait_frequency = torch.where(live, f, self.gait_frequency)
+        self.commands[:, 3] = self.gait_frequency
 
     def _update_goal_state(self):
         self._advance_paths()
