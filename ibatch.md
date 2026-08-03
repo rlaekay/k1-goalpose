@@ -2206,3 +2206,59 @@ R4b = R4a - 누진            (누진의 기여를 분리)
 적어놓고 셋 다 없다.** `grep`으로 확인. 여기에 **발 클리어런스**를 더해 넷이다.
 
 R3(안정화 우선)·I3_rough 판정에 전부 필요하다. **GPU를 안 쓰므로 학습과 병렬로 넣는다.**
+
+---
+
+## 8-21. 라운드별 eval 사양 확정 — 다음에 코드 다시 안 읽어도 되게 (2026-08-04 06:0x)
+
+`eval_goal_pose.py`(3900행) `goal_pose.py` `select_best_checkpoint.py` `make_v7_arms.py`
+`utils/terrain.py` 전수 확인. report.json 최상위 지표 **147개**를 뽑아 라운드별로 매핑했다.
+
+### 공통 규칙 — 이걸 어겨서 두 번 헛돌렸다
+
+| 규칙 | 근거 |
+|---|---|
+| `--config`는 **arm 자기 `sweeps/<arm>.yaml`** | `envs/K1/Goal_Pose_V7.yaml`을 주면 **24개 키**가 바뀐다(§8-16) |
+| 바닥은 **`--terrain plane`**으로만 통일 | config 교체는 과제까지 바꾼다 |
+| 외력은 **`--force_profile heldout`**으로만 통일 | 각자 자기 외란으로 채점 금지(§8-9) |
+| 선택기에 **`--max_iteration 200`** | 라운드 설계값. 안 주면 오래 돈 arm은 tail만 뽑혀 **레버가 아니라 추가 학습**을 잰다 |
+| 1순위 판정은 **과제오차** `sqrt(d²+r²θ²)` | strict·위치 median은 heading에 둔감(§8-14, §8-17) |
+| 낙상은 **순위 제외, 보고만** | 노출 없는 개수는 판정 불가(§8-12a). 비교는 `force_ab` 다중 seed로 |
+
+### 라운드별 판정 지표와 코드 상태
+
+| 라운드 | 판정 지표 (report.json 경로) | 코드 |
+|---|---|---|
+| **I3_rough**<br>(지형) | **`swing_apex_m.p10` / `.median` / `.share_below_0p02`** ← 1차<br>`success_rate_strict`, 과제오차 ← 대가 | ✅ **방금 심음**<br>`goal_pose.py:703` `feet_clearance`<br>`eval_goal_pose.py:1322` 스윙 정점, `:2330` 요약 |
+| **R3a**<br>캘리브레이션 DR | held-out bias/offset 열화폭<br>+ clean 비열세 | ⚠️ **기전은 이미 있다**<br>`goal_pose.py:358-364, 568, 805`<br>→ **config 키만 추가**(`randomization.joint_encoder_bias` / `joint_target_offset`)<br>❌ IMU 회전은 env 코드 필요 |
+| **R3b**<br>지연 DR 20–60 ms | held-out 지연 열화폭 | ❌ **env 코드 필요**<br>현재 `delay_steps`(`:247,:372,:581`)는 **제어주기 안 0–18 ms**,<br>에피소드마다 고정. 20–60 ms는 제어주기 1–3개분 →<br>과거 타깃 버퍼가 있어야 한다 |
+| **R4**<br>속도 | `per_start_distance.required_speed_p90` ← **과제가 요구했나(설계검증)**<br>`body_speed.sustained_1p3.cruise_median_s` ← **정책이 했나**<br>`swing_apex_m` ← **빨라지며 발을 덜 드는지 감시** | ❌ env 코드 3곳<br>sprint 카테고리 `goal_pose.py:448` `probs`<br>카테고리별 마감 `:516`<br>누진 `goal_reached` `:868` |
+| **R5**<br>goal 불확실성 | bias/jitter **분리** 열화폭<br>+ 속도 유지 게이트(L4) | ✅ **config만**<br>`noise.goal_pos_bias` / `goal_pos`를 0.30–0.50으로<br>(현재 전부 0 — `_OFF_ROBUST` 때문) |
+
+### I3_rough 기각 조건 — §8-12b를 개정한다
+
+§8-12b는 *"strict 하락 2%p 초과면 기각"*만 정했다. **그건 정확도지 지형이 존재하는
+이유가 아니다.** 클리어런스를 심었으므로 조건을 둘로 만든다:
+
+```
+채택 : swing_apex_m.p10 이 I2a_dr 대비 상승  AND  strict 하락 <= 2%p
+기각 : 클리어런스가 안 올랐으면 strict가 통과해도 기각
+       -> 지형이 대가 없이 아무것도 안 산 것이므로 켤 이유가 없다
+보류 : 클리어런스는 올랐는데 strict가 2%p 넘게 빠짐
+       -> 거래다. 실기 걸림 위험 대 정확도로 사용자 판단
+```
+
+**p10을 median보다 앞에 둔다.** 걸림은 최악값 사건이라 **낮은 스윙이 얼마나 뜨는지**가
+위험이고, 평균 스윙 높이가 아니다.
+
+### 아직 안 심긴 계측 (§7이 "비용 0"이라 적어놓은 것)
+
+| 계측 | 용도 | 상태 |
+|---|---|---|
+| 발 클리어런스 | 지형 판정 | ✅ **심음** |
+| 전환 지표(7-6) | R3 "불안정 시 안정화 우선" | ❌ |
+| 단일지지 생존시간 | 낙상 원인 국소화 | ❌ |
+| 발 하중분배 | 낙상 원인 국소화 | ❌ (`contact_force`는 있으나 좌우 분배 아님) |
+
+낙상 27건 중 3건만 외력 중이었다(§8-13) — **남은 낙상의 원인은 아직 아무 지표도 못 짚는다.**
+아래 셋이 그걸 짚을 후보다.

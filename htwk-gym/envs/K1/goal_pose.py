@@ -302,6 +302,11 @@ class GoalPose(BaseTask):
         self.feet_pitch = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.float, device=self.device)
         self.last_feet_pos = torch.zeros_like(self.feet_pos)
         self.feet_contact = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device)
+        # How high the foot actually is, measured at its LOWEST corner -- that is
+        # the corner that catches on anything.  feet_contact only says whether it
+        # is under 1 cm, which is all feet_swing ever asks for; this says by how
+        # much, so terrain arms can be judged on the thing they exist to change.
+        self.feet_clearance = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.float, device=self.device)
         self.dof_pos_ref = torch.zeros(self.num_envs, self.num_dofs, dtype=torch.float, device=self.device)
         self.default_dof_pos = torch.zeros(1, self.num_dofs, dtype=torch.float, device=self.device)
         for i in range(self.num_dofs):
@@ -691,12 +696,11 @@ class GoalPose(BaseTask):
         expanded_feet_pos = self.feet_pos.unsqueeze(2).expand(-1, -1, feet_edge_relative_pos.shape[2], -1).reshape(-1, 3)
         expanded_feet_quat = self.feet_quat.unsqueeze(2).expand(-1, -1, feet_edge_relative_pos.shape[2], -1).reshape(-1, 4)
         feet_edge_pos = expanded_feet_pos + quat_rotate(expanded_feet_quat, feet_edge_relative_pos.reshape(-1, 3))
-        self.feet_contact[:] = torch.any(
-            (feet_edge_pos[:, 2] - self.terrain.terrain_heights(feet_edge_pos) < 0.01).reshape(
-                self.num_envs, len(self.feet_indices), feet_edge_relative_pos.shape[2]
-            ),
-            dim=2,
-        )
+        edge_height = (
+            feet_edge_pos[:, 2] - self.terrain.terrain_heights(feet_edge_pos)
+        ).reshape(self.num_envs, len(self.feet_indices), feet_edge_relative_pos.shape[2])
+        self.feet_contact[:] = torch.any(edge_height < 0.01, dim=2)
+        self.feet_clearance[:] = edge_height.min(dim=2).values
 
     def _check_termination(self):
         """Check if environments need to be reset"""

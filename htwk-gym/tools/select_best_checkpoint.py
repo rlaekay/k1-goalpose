@@ -361,6 +361,10 @@ def main():
     p.add_argument("--stages", default="20,60,120", help="rollout seconds per stage, increasing")
     p.add_argument("--keep", default="5,2", help="survivors after each stage (len == stages-1)")
     p.add_argument("--max_candidates", type=int, default=12)
+    p.add_argument("--max_iteration", type=int, default=None,
+                   help="이 iteration을 넘는 체크포인트는 후보에서 제외한다. 라운드가 "
+                        "200 iter 설계인데 한 arm만 더 오래 돌았을 때, 그 arm의 tail만 "
+                        "뽑히면 비교가 '레버'가 아니라 '추가 학습'을 재게 된다.")
     p.add_argument("--tail_frac", type=float, default=0.6,
                    help="search the last X of the iteration range (early checkpoints are never best)")
     p.add_argument("--include", default="", help="comma-separated iterations to force into the candidate set")
@@ -449,6 +453,16 @@ def main():
                       "than {} ({} vs {}). Evaluating it in this env measures the wrong thing — "
                       "give it its own --config.".format(
                           run_dir, config_path, env_signature(run_cfg), env_signature(cfg)))
+        if args.max_iteration is not None:
+            kept = [(i, p_) for i, p_ in items if i <= args.max_iteration]
+            if len(kept) != len(items):
+                print("  {}: iteration <= {} 로 {} -> {} 개".format(
+                    os.path.basename(run_dir.rstrip("/")), args.max_iteration,
+                    len(items), len(kept)))
+            items = kept
+            if not items:
+                raise SystemExit("--max_iteration {} 아래로 남는 체크포인트가 없다".format(
+                    args.max_iteration))
         for it, path in pick_candidates(items, args.tail_frac, args.max_candidates, include):
             candidates.append({"iteration": it, "checkpoint": path, "run_dir": run_dir})
     if not candidates:

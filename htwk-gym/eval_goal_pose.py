@@ -918,6 +918,17 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
 
     # closest approach to the goal currently being pursued, per env
     min_dist = torch.full((env.num_envs,), float("inf"), device=env.device)
+    # Swing apex height, per foot.  A foot only trips on what its LOWEST corner
+    # fails to clear, and on a plane feet_swing stops paying once that corner is
+    # 1 cm up -- so nothing in training asks for more and nothing in eval has
+    # ever looked.  Terrain arms exist precisely to raise this, and without it
+    # they get adopted or rejected on strict success, which is accuracy, not the
+    # thing being bought.  Recorded at touchdown so each swing contributes once.
+    swing_apex = None
+    swing_apex_hist = np.zeros(200, dtype=np.int64)   # 0..20 cm, 1 mm bins
+    swing_apex_max_m = 0.20
+    if hasattr(env, "feet_clearance"):
+        swing_apex = torch.zeros_like(env.feet_clearance)
     # peak and accumulated body speed within the segment currently in progress
     peak_speed = torch.zeros(env.num_envs, device=env.device)
     sum_speed = torch.zeros(env.num_envs, device=env.device)
@@ -1306,6 +1317,19 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
         stability_counts["valid"] += int(valid_phase.sum().item())
         stability_counts["accel"] += int(accel_phase.sum().item())
         stability_counts["cruise"] += int(cruise_phase.sum().item())
+
+        # ---- swing apex ---------------------------------------------------
+        if swing_apex is not None and prev_feet_contact is not None:
+            airborne = ~env.feet_contact
+            swing_apex = torch.where(
+                airborne, torch.maximum(swing_apex, env.feet_clearance), swing_apex)
+            touchdown = env.feet_contact & ~prev_feet_contact & ~done.unsqueeze(-1)
+            if bool(touchdown.any()):
+                vals = swing_apex[touchdown].detach().cpu().numpy()
+                idx = np.clip((vals / swing_apex_max_m * len(swing_apex_hist)).astype(int),
+                              0, len(swing_apex_hist) - 1)
+                np.add.at(swing_apex_hist, idx, 1)
+                swing_apex = torch.where(touchdown, torch.zeros_like(swing_apex), swing_apex)
 
         # ---- first-contact foot placement / impact -----------------------
         if (prev_feet_contact is not None and prev_feet_world_vz is not None
@@ -1783,6 +1807,8 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     out["total_steps"] = total_steps
     out["instrumented"] = instrumented
     out["overlay_states"] = overlay_states
+    out["swing_apex_hist"] = swing_apex_hist
+    out["swing_apex_max_m"] = swing_apex_max_m
     out["speed_hist"] = speed_hist
     out["speed_hist_max"] = speed_hist_max
     out["angvel_hist"] = angvel_hist
@@ -2286,6 +2312,30 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
         }
     else:
         results["body_speed"] = None
+
+    # ---- swing apex (foot clearance) -------------------------------------
+    # The number terrain arms exist to move.  p10 matters more than the median:
+    # tripping is a worst-case event, so what the LOW swings clear is the risk,
+    # not what the average one does.
+    sa_hist = roll.get("swing_apex_hist")
+    sa_max = float(roll.get("swing_apex_max_m", 0.20))
+    if sa_hist is not None and int(np.sum(sa_hist)) > 0:
+        sa_edges = np.arange(len(sa_hist)) * (sa_max / len(sa_hist))
+        sa_cdf = np.cumsum(sa_hist) / float(np.sum(sa_hist))
+
+        def _sa_pct(p):
+            i = int(np.searchsorted(sa_cdf, p / 100.0))
+            return float(sa_edges[min(i, len(sa_edges) - 1)])
+
+        results["swing_apex_m"] = {
+            "n_swings": int(np.sum(sa_hist)),
+            "p10": _sa_pct(10), "median": _sa_pct(50), "p90": _sa_pct(90),
+            "share_below_0p02": float(sa_hist[sa_edges < 0.02].sum() / np.sum(sa_hist)),
+            "share_below_0p03": float(sa_hist[sa_edges < 0.03].sum() / np.sum(sa_hist)),
+            "contact_threshold_m": 0.01,
+        }
+    else:
+        results["swing_apex_m"] = None
 
     # ---- path floor/leash telemetry at control-step resolution ------------
     # This is intentionally separate from segment-end path_tracking.  A carrot
