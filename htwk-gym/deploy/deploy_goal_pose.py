@@ -539,17 +539,21 @@ class Controller:
         self._verify_joint_layout(low_state_msg)
         self._last_low_state_monotonic = time.monotonic()
         self._latest_rpy[:] = low_state_msg.imu_state.rpy
-        # Tilt of the robot's up-axis from world up, not raw roll/pitch.
+        # How far gravity has moved from where it sits when the robot is upright.
         #
-        # rpy is ZYX Euler, so roll is degenerate near pitch = +-90 deg: a robot
-        # lying face down at pitch 78.8 deg reported roll 172.7 deg, which reads
-        # as "flipped onto its back" and is not. cos(pitch) scales the roll term
-        # to 0.19 there, so it swings freely. The angle between the body up-axis
-        # and world up has no such singularity and is what "fallen" actually
-        # means: 0 upright, 90 horizontal.
-        roll, pitch = low_state_msg.imu_state.rpy[0], low_state_msg.imu_state.rpy[1]
-        cos_tilt = float(np.clip(np.cos(pitch) * np.cos(roll), -1.0, 1.0))
-        tilt = float(np.arccos(cos_tilt))
+        # Not raw roll/pitch: rpy is ZYX Euler, so roll is degenerate near
+        # pitch = +-90 deg. A robot lying face down at pitch 78.8 deg reported
+        # roll 172.7 deg, which reads as "flipped onto its back" and is not --
+        # cos(pitch) is 0.19 there, so the roll term swings freely. Reading the
+        # gravity direction in the body frame has no such singularity, and it is
+        # the same quantity the policy already consumes as obs[0:3], so the two
+        # cannot drift apart.
+        #
+        # Upright, gravity in the body frame is [0, 0, -1]. The angle away from
+        # that is the tilt: 0 upright, 90 deg horizontal.
+        roll, pitch, yaw = (float(v) for v in low_state_msg.imu_state.rpy)
+        g_body = rotate_vector_inverse_rpy(roll, pitch, yaw, np.array([0.0, 0.0, -1.0]))
+        tilt = float(np.arccos(np.clip(-g_body[2], -1.0, 1.0)))
         self._latest_tilt = tilt
         safety = self.cfg.get("safety", {})
         rpy_limit = float(safety.get("fall_tilt_limit_rad",

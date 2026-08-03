@@ -130,10 +130,16 @@ safety:
   # topic only publishes at 1 Hz, so waiting for it would let the policy keep
   # driving a robot that is already going over.
   #
-  # Measured as the angle between the robot's up-axis and world up: 0 upright,
-  # 90 deg horizontal. NOT raw roll/pitch -- rpy is ZYX Euler and roll is
-  # degenerate near pitch +-90 deg, where a prone robot reported roll 172 deg.
-  fall_tilt_limit_rad: 1.0        # 57 deg
+  # Angle between gravity-in-body-frame and its upright value [0,0,-1]:
+  # 0 upright, 90 deg horizontal. NOT raw roll/pitch -- rpy is ZYX Euler and
+  # roll is degenerate near pitch +-90 deg, where a prone robot reported
+  # roll 172 deg. Same vector the policy reads as obs[0:3].
+  #
+  # 45 deg is well past any lean a walking humanoid should hold and well short
+  # of horizontal, so it catches a fall in progress without firing on normal
+  # motion. TUNE IT FROM DATA: policy_debug carries tilt_deg every cycle, so
+  # after a few clean runs set this above the observed walking maximum.
+  fall_tilt_limit_rad: 0.785      # 45 deg
   roll_pitch_limit_rad: 1.0       # legacy name, used only if the above is absent
 
   recovery:
