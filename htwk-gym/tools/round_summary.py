@@ -116,8 +116,14 @@ def main():
         w = last_watch(run)
         reps = reports(run)
         src = None
+        clean = []
         if reps:
-            d = reps[-1]
+            # A force-ON report has the same shape as a clean one but a very
+            # different fall count, so picking "the newest report" silently mixed
+            # test conditions -- I1a_base showed 17 falls, which is exactly its
+            # held-out force median, next to clean numbers from other arms.
+            clean = [d for d in reps if not d.get("force_profile")]
+            d = (clean or reps)[-1]
             src = dict(pos=(d.get("pos_err_m") or {}).get("median"),
                        p90=(d.get("pos_err_m") or {}).get("p90"),
                        hd=(d.get("heading_err_deg") or {}).get("median"),
@@ -134,10 +140,14 @@ def main():
             trouble.append((arm, run))
             continue
         it = re.sub(r"^model_|\.pth$", "", str(src["it"]))
+        mode = ""
+        if reps and reps[-1].get("force_profile") and not clean:
+            mode = "  << 외력 리포트만 있음 (clean과 비교 불가)"
         print(hdr % (arm[:32], started, it[:8], cm(src["pos"]), cm(src["p90"]),
                      "-" if src["hd"] is None else "%.1f" % src["hd"],
                      "-" if src["falls"] is None else str(src["falls"]),
-                     "-" if src["strict"] is None else "%.1f" % (src["strict"] * 100)))
+                     "-" if src["strict"] is None else "%.1f" % (src["strict"] * 100))
+              + mode)
         stops = [r for r in w if r.get("stop")]
         if stops:
             print("%14s   STOP: %s" % ("", stops[-1]["why"]))
