@@ -28,7 +28,7 @@ MAX_WAIT_MIN="${MAX_WAIT_MIN:-90}"
 
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 
-say "=== 오늘 밤 계획: 재평가 대기 -> 스모크 4종 -> G 배치 4종 ==="
+say "=== ${NARMS}종: 스모크 -> 학습 (${ITERS} iter, 카드당 1개) ==="
 
 # ---- 0) warm-start 체크포인트가 실제로 있는지 ------------------------------
 if [ ! -f "$CKPT" ]; then
@@ -88,7 +88,6 @@ NARMS=$(echo $ARMS | wc -w)
 say "=== config 생성 + 스모크 (${NARMS}종: $ARMS) ==="
 for arm in $ARMS; do
   task="K1/Goal_Pose_V7"
-  [ "$arm" = "G4_smoothturn" ] && task="K1/Goal_Pose_V8"
 
   if ! python tools/make_v7_arms.py --only "$arm" --checkpoint "$CKPT" \
         --num_envs "$ENVS" --max_iterations "$ITERS" > /dev/null 2>&1; then
@@ -130,7 +129,6 @@ PRELUDE="source '$CONDA_BASE/etc/profile.d/conda.sh' && conda activate '$ENV_NAM
 
 launch() {  # name gpu
   local name=$1 gpu=$2 task="K1/Goal_Pose_V7"
-  [ "$name" = "G4_smoothturn" ] && task="K1/Goal_Pose_V8"
   local cmd="$PRELUDE cd $REPO_ROOT && TRAIN=train_v7.py STRESS=1 VIDEO_S=60 \
 bash tools/train_and_eval.sh cuda:$gpu cuda:$gpu -- \
 --task=$task --config sweeps/$name.yaml --headless True \
@@ -177,12 +175,12 @@ if [ -n "$DEAD" ]; then
 fi
 
 say ""
-say "=== 4개 전부 실행 중. 자러 가셔도 됩니다. ==="
-say "아침에:"
-say "  python tools/progress.py --task Goal_Pose_V7"
-say "  python tools/progress.py --task Goal_Pose_V8      # G4"
-say "  bash htwk-gym/tools/fetch_results.sh              # (Mac에서)"
+say "=== ${NARMS}종 실행 중 ==="
+say "진행 상황:"
+say "  http://<서버IP>:$MON_PORT/          웹 (배치별 분류 + reward 그래프)"
+say "  python tools/monitor.py --tui      터미널"
+say "  tmux attach -t $SESSION"
 say ""
-say "예상: 4개가 GPU당 2개씩 동시에 돈다(직렬 아님). v7 배치 실측이 3.5~3.9 s/iter"
-say "      였으므로 12000 iter면 12~13시간. 아침에 거의 끝나 있거나 평가 단계일 것."
-say "      학습 후 최적 체크포인트 탐색 + 영상 + stress가 30~60분 더 붙는다."
+say "예상: 카드당 1 프로세스, v7 실측 3.5~3.9 s/iter -> ${ITERS} iter 기준"
+say "      $(awk -v i=$ITERS 'BEGIN{printf "%.1f~%.1f시간", i*3.5/3600, i*3.9/3600}')."
+say "      학습 후 체크포인트 탐색 + 영상 + stress가 30~60분 더 붙는다."

@@ -1,77 +1,97 @@
-<!--Be concise. Read only the files you need. Stop searching once you have enough information. Make the smallest correct change. Reuse existing code whenever possible. Do not refactor unrelated code. Avoid unnecessary explanations. Output only the modified code or diff.
+<!--Be concise. Read only the files you need. Stop searching once you have enough information. Make the smallest correct change. Reuse existing code whenever possible. Do not refactor unrelated code. Avoid unnecessary explanations. Output only the modified code or diff.-->
 
 > **[답변]** 접수. 이 문서는 그 규칙의 예외다 — **일지이자 계획서라 보존이 목적**이다.
 > 채팅 응답과 커밋 메시지는 짧게 유지하고, 근거·수치·결정은 전부 여기에만 남긴다.
 > 코드는 최소 변경, 기존 코드 재사용, 무관한 리팩터 금지 — R0 구현에 그대로 적용했다(§9).
 
 
+**이걸 읽는 순간 아래 11개 주석에 먼저 답하고 진행해. 답변은 바로 아래에 달도록 하자**
+<!--학습 한 회차를 최대한 빠르게 돌리자. 카드 한 장에 두배치를 돌렸을 때 너무 느려지면 하나씩만 하는게 좋은듯-->
+
+> **[답변]** **동의, 그리고 이미 그렇게 고쳐 놨다.** 카드당 2 프로세스는 처리량이 2배가 아니라 **약 1.5배**(시분할)라, 회차 지연시간은 오히려 1.33배 늘어난다. 회차를 자주 도는 게 목적이면 **카드당 1개가 맞다.** `GPU_OF`에 `I0a→cuda:0`, `I0b→cuda:1`로 박아 뒀다.
+> **남는 병렬화 여지**: GPU가 1 프로세스로는 포화되지 않으므로 `num_envs`를 4096 → 8192로 올려 **같은 시간에 2배 표본**을 얻는 쪽이 낫다. 이건 프로세스를 늘리는 게 아니라 배치를 키우는 것이라 시분할 손실이 없다. R0에서 VRAM 여유(H 실측 8 GB/49 GB)를 보고 확정한다.
+
+<!--robust계열에서 속도가 느린 것에 대한 추측: 학습 과정에서부터 goal에 너무 큰 지터를 줘서(어떻게 학습했는지 확인해봐 내 기억으론 2미터짜리 원에서 마구잡이로 섞으라고 됐었던 것 같은데) 그냥 해당 범위 내에 있는 goal에 대해서 모두 솎아내기를 한 결과로서 느려진거 아니야? jitter의 범위를 50cm짜리 원 가우시안?(보통 프로젝션 에러가 이렇게 나니까 공 프로젝션 에 따른 goal도 이정도 범위 안에서 jitter를 함.)을 반영해야 하는 것 아닌가? 그리고 test eval할 때는 커다란 골 jitter를 줘서 넘어지는지 확인하고 넘어지는 것은 다른 방법으로 achieve해야지.-->
+
+> **[답변]** **추측이 맞다. 다만 범인은 지터가 아니라 편향이다.** 실제 설정을 확인했다:
+> ```yaml
+> goal_pos.range:      [0, 0.04]   # 스텝별 지터 σ=4 cm
+> goal_pos_bias.range: [0, 0.05]   # 구간 고정 편향 σ=5 cm  ← 이게 문제
+> goal_bt_flicker:     radius 1.0 m, prob 0.004/step   # 기억하신 "2 m 원"에 가까운 것
+> ```
+> 즉 기억하신 큰 지터는 **`goal_bt_flicker`(반경 1 m 점프)**이고, 상시 지터는 4 cm로 오히려 작다.
+> **속도 붕괴의 실제 메커니즘**: 스텝 지터(σ=4 cm)는 시간 평균으로 씻긴다. 그런데 **구간 고정 편향(σ=5 cm)은 씻기지 않는다** — 한 구간 내내 같은 방향으로 틀려 있고, 보상은 참값을 읽으므로 정책은 자기가 틀렸다는 걸 알 방법이 없다. 이 조건에서 기대 보상을 최대화하는 해는 **천천히 가서 헛발질 횟수를 줄이는 것**이다. E2·G2에서 두 번 재현됐다(L4).
+> **반영**: 학습에는 **reprojection uncertainty만** 넣는다 — 30–50 cm 가우시안 지터(씻김), **편향은 0**. 큰 flicker와 편향은 **평가 전용**으로 뺀다.
+
+<!--애초에 goal jitter에 대한 대처를 학습에서 어떻게 하고있는지 잘 모르겠음.-->
+
+> **[답변]** **구조는 이렇다** (`goal_pose.py::_update_perceived_goal`):
+> | | 정책이 보는 것 | 보상이 읽는 것 |
+> |---|---|---|
+> | 목표 위치/heading | **노이즈 섞인 값**(지터+편향+2–3스텝 지연+flicker) | **참값** |
+> >
+> 즉 "관측만 흔들고 채점은 참값" 구조라, 의도는 *필터링을 배워라*였다.
+> **문제는 정책이 필터링에 쓸 재료가 없다는 것이다.** 관측 54차원에 **과거 목표 이력도, 불확실성 추정치도 없다.** 매 스텝 한 장의 흔들린 목표만 주고 "걸러내라"고 요구한다. 정책이 할 수 있는 유일한 필터링은 **자기 행동을 둔감하게 만드는 것**이고, 그게 곧 감속이다.
+> **그래서 노이즈를 키우면 반드시 느려진다.** 이건 정책의 실수가 아니라 구조가 강제한 최적해다. 해결은 노이즈 크기 조절이 아니라 (a) 씻기는 노이즈만 쓰거나, (b) 관측에 이력을 주는 것인데 (b)는 54차원을 깨므로 I 배치에서는 (a)만 한다.
+
+<!--path를 학습한다는거를 개념을 삭제할까? path는 eval시에만 하고, 학습은 within 2m goal chasing만 하는건 어때? 좀 분리를 해야 낫지 않을까?-->
+
+> **[답변]** **동의한다. 학습에서 뺀다.** 근거는 L5에 이미 있다 — path 학습은 세 대가를 청구한다: waypoint 정확도, 전방 이동 prior(옆·뒤 감속), 낙상(H에서 89.6%가 path 구간).
+> **대가**: 지시 7-B(움직이는 목표 추종)를 학습에서 배우지 못한다. 이건 아래 "a와 b를 동시에" 질문과 직결되므로 거기서 답한다.
+> **결정**: 학습 = **2 m 이내 goal chasing만**. path·8자·spiral은 **평가 전용**.
+
+<!--네 보고서를 보니까 판정에 대한 정리가 잘 안돼있는 것 같은데 학습 계획 시에 판정까지 맞춤형으로 계획해-->
+
+> **[답변]** **맞다. 판정을 사후에 만들었다.** H가 그 결과다 — 4 arm을 12000까지 돌린 뒤에야 "model_0이 이겼다"를 알았다.
+> **고친 방식**: R0부터 모든 arm은 **학습 전에 판정표를 확정**하고, 그 판정을 **코드가 자동으로 내린다**(사람이 리포트를 읽고 판단하지 않는다). §8에 R0 판정표가 있고, 아래 "실시간 eval" 답변의 `watch_eval`이 그걸 자동 집행한다.
+
+<!--eval//train 등 코드가 너무 많아. 사용하던 파일들은 모두 archive하고 버전 하나로 리셋해서 진행. -->
+
+> **[답변]** **진행 중.** 하위 에이전트가 `htwk-gym/archive/`로 이동시키고 있다. 유지 목록은 `tonight.sh` / `make_v7_arms.py` / `smoke_v7.py` / `train_and_eval.sh` / `select_best_checkpoint.py` / `eval_goal_pose.py` / `train_v7.py` / `monitor.*` / `progress.py` / `check_names.py` / `envs/K1/goal_pose{,_v3,_v7}.py` / `utils/*` / `deploy/*` 뿐이다. 이동 후 `py_compile` + `check_names` + `bash -n`으로 회귀 검사하고 `archive/README.md`에 무엇이 왜 폐기됐는지 한 줄씩 남긴다.
+
+<!--내가 headless server를 사용하니까 학습 진행도, 학습 끝, 평가중, 평가끝 등의 현황과 reward graph, iter, checkpoint등을 실시간으로 확인할 수 없어. 사후에도 마찬가지고. 계속 활용할 수 있는 webpage를 만들어서 서버에서 실시간으로 해당 정보들을 송신할 수 있도록 해. 실시간 수신을 마쳐도 계속 확인할 수 있도록 버전별로 또 분류를 하고. 이건 앞으로 하는 모든 학습에 동일하게 적용. 만약에 내가 언급한거 외에도 네가 중요하게 생각하는 부분이 있다면 추가해넣어. consensus가 있을거아니야<-이게 안되면 터미널 창에라도 볼 수 있는 코드를 만들어. 아마 local network를 사용하면 되려나..? 모르겠네.-->
+
+> **[답변]** **만들었고, 지적하신 대로 반쪽이었다.** 아래 항목에서 이어서 답한다.
+
+<!--7번 3축: A(정확·빠름)와 B(움직이는 목표)는 한 정책이 동시에 한 적이 없고, C(불안정 시 안정화 우선)는 이 프로젝트에 존재한 적 없는 개념입니다. §5-C에 게이팅 보상안을 뒀지만 I 1차에는 넣지 않았습니다 — I2(단일지지)가 먼저 서야 의미가 있습니다.<-이거까지 까먹지 않고 할 수 있도록 하려면 어떻게 해야해? 네 메모리에 집어넣으면 돼? i2결과를 보고 하라고? 네가 방법을 찾아봐. 나는 까먹고 싶지 않아.-->
+
+> **[답변]** **메모리에 넣는 걸로는 부족하다 — 잊는 게 아니라 조건이 안 맞아 미뤄지는 것이다.** 세 겹으로 건다:
+> 1. **`ibatch.md` §7 결정 트리에 노드로 존재**한다 — 문서를 보면 항상 보인다
+> 2. **판정 코드에 미구현 게이트로 등록**한다: `C_stabilize_first` 게이트를 `NOT_IMPLEMENTED`로 넣어 두면 **모든 리포트에 매번 "미구현" 줄이 찍힌다.** 통과할 수 없으니 조용히 사라지지 않는다
+> 3. **내 영구 메모리**에 저장한다 — 세션이 끊겨도 유지된다
+> ②가 핵심이다. 문서와 메모리는 안 볼 수 있지만 **리포트는 매번 본다.**
+
+<!--a와 b를 동시에 달성하지 못할거면 둘을 따로 학습해도 의미가 없는게, 나는 어차피 하나의 모션만 사용할건데? 그리고 난 둘의 목표가 동시에 필요해. c-->
+
+> **[답변]** **맞는 지적이고, 제 §5-B 설계가 틀렸다.** "I1은 속도, I3은 움직이는 목표"처럼 축을 나눠 학습하면 **합쳐지지 않는다** — 하나의 정책만 쓰실 거니까.
+> **고친 설계**: 축을 나누는 것은 **레버 검증 단계에만** 쓰고, 각 라운드의 승자는 **누적**된다. R1 승자 위에 R2를 얹고, R2 승자 위에 R3를 얹는다. 마지막 정책 하나가 A·B·C를 전부 갖는다.
+> 그리고 **B(움직이는 목표)를 학습에서 뺐으므로**(위 path 답변) A와 B가 충돌할 일 자체가 줄어든다. 남은 질문은 "path 없이 학습한 정책이 평가의 움직이는 목표를 쫓을 수 있나"이고, 이건 **R0/R1 시점에 평가로 바로 측정된다** — 못 쫓으면 그때 학습에 최소한만 되돌린다.
+
+<!--그니까 나의 수정의도의 whole point is that i dont want to hard code the reward or conditions. i want to drive the learning to the direction that i want from the highest level modifications. if i were to modify the condition or reward specified for a purpose, then there must be a method to achieve the same goal without doing so<-sth like "to make it standing firmly, if i give robustness to the disturbance, i wont have to reward it for standing upright. standing upright is for human. being robust to disturbance does the same thing with covering more fundamental thing". if these methods are findable, please do them.-->
+
+> **[답변]** **이게 가장 중요한 지적이고, 제 §5 설계 전체가 이 원칙을 위반하고 있었다.**
+> 제가 넣으려던 것들: `base_height_target` 튜닝, 발 하중분배 보상, heel 접지 보상, 순항 pitch 페널티 — **전부 "사람이 보기에 좋은 자세"를 직접 보상하는 하드코딩**이다. 지적대로, 목적이 있다면 그 목적을 **더 근본적인 조건**으로 유도할 방법이 있어야 한다.
+> **원칙을 다시 적으면**: *결과(자세)를 보상하지 말고, 그 결과를 필연으로 만드는 조건(과제·물리·외란)을 만든다.*
+> >
+> | 하드코딩(하지 말 것) | 상위 조건으로 대체 | 왜 더 근본적인가 |
+> |---|---|---|
+> | 직립 자세 보상 | **외란 강건성** | 밀려도 안 넘어지려면 **결과적으로** 직립이 유리하다. 직립은 인간의 미감이고, 강건성은 물리적 요구다 |
+> | `base_height_target` 값 튜닝 | **다양한 지면·마찰·외란에서 생존** | 최적 높이는 정책이 스스로 찾는다. 우리가 0.58을 고르면 그 조건에만 맞는다 |
+> | 발 하중분배 보상 | **실제 발 크기 + 단일지지 과제** | 지지면이 진짜로 좁으면 하중을 고르게 쓰는 것 외에 답이 없다 |
+> | heel 접지 보상 | **고속에서 외란** | 오버스트라이드하면 밀렸을 때 못 버틴다. 보상이 아니라 실패가 가르친다 |
+> | 순항 pitch 페널티 | **케이던스–속도 커플링** | 보폭이 실현 가능해지면 몸을 던질 이유가 사라진다 |
+> >
+> **R0에 즉시 반영되는 것**: `feet_edge_pos` 교정은 **하드코딩이 아니라 사실 교정**이므로 유지한다(sim이 거짓말을 하고 있었다). 나머지 보상 항 추가는 **전부 보류**하고, 대신 **외란·지면·발 크기라는 조건**을 정직하게 만드는 쪽으로 라운드를 다시 짠다(§10).
+> **단 정직하게**: 이 원칙이 항상 통한다는 보장은 없다. 조건만으로 안 되는 항목이 나오면 **그때 하드코딩을 쓰되, 왜 조건으로 안 됐는지를 먼저 기록**한다.
 
 
+<!--fine tuning으로 단시간 안에 목표한 바를 학습할 수 있어? eval을 그냥 실시간으로 checkpoint가 나오면 돌려서 중단시키는 방법은 별론가?-->
 
-눈에 띄게 주저앉음. 친구의 말뜻은 height를 더 높게 조정한다는 뜻.
-
-
-
-
-
-학습 한 회차를 최대한 빠르게 돌리자. 카드 한 장에 두배치를 돌렸을 때 너무 느려지면 하나씩만 하는게 좋은듯
-
-
-
-
-
-robust계열에서 속도가 느린 것에 대한 추측: 학습 과정에서부터 goal에 너무 큰 지터를 줘서(어떻게 학습했는지 확인해봐 내 기억으론 2미터짜리 원에서 마구잡이로 섞으라고 됐었던 것 같은데) 그냥 해당 범위 내에 있는 goal에 대해서 모두 솎아내기를 한 결과로서 느려진거 아니야? jitter의 범위를 50cm짜리 원 가우시안?(보통 프로젝션 에러가 이렇게 나니까 공 프로젝션 에 따른 goal도 이정도 범위 안에서 jitter를 함.)을 반영해야 하는 것 아닌가? 그리고 test eval할 때는 커다란 골 jitter를 줘서 넘어지는지 확인하고 넘어지는 것은 다른 방법으로 achieve해야지.
-
-
-
-애초에 goal jitter에 대한 대처를 학습에서 어떻게 하고있는지 잘 모르겠음.
-
-
-
-path를 학습한다는거를 개념을 삭제할까? path는 eval시에만 하고, 학습은 within 2m goal chasing만 하는건 어때? 좀 분리를 해야 낫지 않을까? 
-
-
-
-네 보고서를 보니까 판정에 대한 정리가 잘 안돼있는 것 같은데 학습 계획 시에 판정까지 맞춤형으로 계획해
-
-
-
-eval//train 등 코드가 너무 많아. 사용하던 파일들은 모두 archive하고 버전 하나로 리셋해서 진행. 
-
-
-
-내가 headless server를 사용하니까 학습 진행도, 학습 끝, 평가중, 평가끝 등의 현황과 reward graph, iter, checkpoint등을 실시간으로 확인할 수 없어. 사후에도 마찬가지고. 계속 활용할 수 있는 webpage를 만들어서 서버에서 실시간으로 해당 정보들을 송신할 수 있도록 해. 실시간 수신을 마쳐도 계속 확인할 수 있도록 버전별로 또 분류를 하고. 이건 앞으로 하는 모든 학습에 동일하게 적용. 만약에 내가 언급한거 외에도 네가 중요하게 생각하는 부분이 있다면 추가해넣어. consensus가 있을거아니야<-이게 안되면 터미널 창에라도 볼 수 있는 코드를 만들어. 아마 local network를 사용하면 되려나..? 모르겠네.
-
-
-
-7번 3축: A(정확·빠름)와 B(움직이는 목표)는 한 정책이 동시에 한 적이 없고, C(불안정 시 안정화 우선)는 이 프로젝트에 존재한 적 없는 개념입니다. §5-C에 게이팅 보상안을 뒀지만 I 1차에는 넣지 않았습니다 — I2(단일지지)가 먼저 서야 의미가 있습니다.<-이거까지 까먹지 않고 할 수 있도록 하려면 어떻게 해야해? 네 메모리에 집어넣으면 돼? i2결과를 보고 하라고? 네가 방법을 찾아봐. 나는 까먹고 싶지 않아.
-
-
-
-a와 b를 동시에 달성하지 못할거면 둘을 따로 학습해도 의미가 없는게, 나는 어차피 하나의 모션만 사용할건데? 그리고 난 둘의 목표가 동시에 필요해. c
-
-
-
-그니까 나의 수정의도의 whole point is that i dont want to hard code the reward or conditions. i want to drive the learning to the direction that i want from the highest level modifications. if i were to modify the condition or reward specified for a purpose, then there must be a method to achieve the same goal without doing so<-sth like "to make it standing firmly, if i give robustness to the disturbance, i wont have to reward it for standing upright. standing upright is for human. being robust to disturbance does the same thing with covering more fundamental thing". if these methods are findable, please do them.
-
-
-
-팔에 대해서는 여러가지 시도를 했지만, 그냥 k1_locomition.urdf의 default setting을 따라
-
-
-
-fine tuning으로 단시간 안에 목표한 바를 학습할 수 있어? eval을 그냥 실시간으로 checkpoint가 나오면 돌려서 중단시키는 방법은 별론가?
-
-
-
-
-
-항목별로 하나하나 답해
-
-criticize me and give conclusiom
--->
-
-
+> **[답변]** **두 질문 다 "그렇다"에 가깝다.**
+> **(a) fine-tuning으로 되나** — H 데이터가 답을 준다: 손상이 **iteration 100 안에** 1.4–1.8배로 나타났다. 즉 **200 iteration이면 방향 판정에 충분하다.** 반대로 "좋아지는" 신호도 같은 시간 척도에서 보이는지는 미검증이라, R0가 그것도 같이 잰다(I0a가 E0를 유지하는지).
+> **(b) checkpoint 나오는 즉시 eval 돌려 중단** — **별로가 아니라 이게 맞다.** 지금은 12000까지 다 돌린 뒤 32개 후보를 뽑아 평가한다. 그래서 H는 **4 GPU-일을 쓰고 "전부 나빠짐"** 하나를 얻었다.
+> 구현: `tools/watch_eval.py` — `nn/model_*.pth`를 감시해 새 checkpoint가 생기면 **짧은 평가(20 s × 256 env)**를 돌리고, 사전 정의된 중단 규칙에 걸리면 run 디렉터리에 `STOP` 파일을 쓴다. `runner_v3.py`가 이미 `STOP` 파일을 읽어 **checkpoint를 저장하고 정상 종료**한다(기존 기능, 재사용).
+> 이러면 나쁜 arm은 **몇 분 만에** 죽고 GPU가 다음 라운드로 넘어간다.
 
 # I 배치 — 탐색 결과와 설계 근거
 

@@ -130,6 +130,36 @@ def scalars(run, keep=400):
     return out
 
 
+def watch_series(run):
+    """Per-checkpoint screening scores written by tools/watch_eval.py.
+
+    This is what turns the dashboard from "reward went up" into "accuracy went
+    down at iteration 300" -- the question H could not answer until four
+    GPU-days later.
+    """
+    p = os.path.join(run, "watch_eval.jsonl")
+    if not os.path.exists(p):
+        return {}
+    out, stop = {}, None
+    try:
+        for line in open(p, encoding="utf-8", errors="replace"):
+            line = line.strip()
+            if not line.endswith("}"):
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            for k in ("pos_median", "pos_p90", "falls", "strict"):
+                if d.get(k) is not None:
+                    out.setdefault("watch/" + k, []).append((d["it"], d[k]))
+            if d.get("stop"):
+                stop = d.get("why")
+    except OSError:
+        return {}
+    return {"series": out, "stop": stop}
+
+
 def eval_results(run, shared="shared_eval_videos"):
     """Any evaluation output that names this run, with its gate verdict."""
     name = os.path.basename(run)
@@ -207,6 +237,9 @@ def collect():
     runs = []
     for run in run_dirs():
         cks = checkpoints(run)
+        sc = scalars(run)
+        w = watch_series(run)
+        sc.update(w.get("series", {}))
         cfg = read_cfg(run)
         ev = eval_results(run)
         spi, _ = pace(cks)
@@ -232,7 +265,10 @@ def collect():
             "checkpoints": [c[0] for c in cks],
             "best": _best(run),
             "evals": ev,
-            "scalars": scalars(run),
+            "scalars": sc,
+            "last_reward": (sc.get("reward") or [[None, None]])[-1][1],
+            "last_pos": (sc.get("watch/pos_median") or [[None, None]])[-1][1],
+            "stopped": w.get("stop"),
         })
     runs.sort(key=lambda r: (r["batch"], r["desc"]))
     return runs
@@ -276,18 +312,34 @@ def hms(s):
     return "%d:%02d:%02d" % (s // 3600, (s % 3600) // 60, s % 60)
 
 
-def tui(runs):
+def live_only(runs):
+    """Runs that are actually moving right now.
+
+    The terminal view exists to answer "what is happening", so showing every
+    historical run buries the two lines that matter. History belongs in the web
+    UI, where you can click into a batch. --all overrides.
+    """
+    return [r for r in runs if r["phase"] in ("training", "evaluating", "stalled")]
+
+
+def tui(runs, show_all=False):
+    shown = runs if show_all else live_only(runs)
     icon = {"training": "\033[32m▶\033[0m", "stalled": "\033[31m■\033[0m",
             "done": "\033[36m✓\033[0m", "evaluating": "\033[33m◐\033[0m",
             "evaluated": "\033[35m★\033[0m", "empty": "\033[90m·\033[0m"}
     print("\033[2J\033[H", end="")
-    print("K1 학습 모니터  %s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
-    if not runs:
-        print("  logs/ 아래에 run이 없다. htwk-gym 디렉터리에서 실행했는지 확인할 것.")
+    print("K1 학습 모니터  %s   (%s)\n" % (
+        time.strftime("%Y-%m-%d %H:%M:%S"),
+        "전체 %d" % len(runs) if show_all else "진행 중 %d / 전체 %d" % (len(shown), len(runs))))
+    if not shown:
+        if runs:
+            print("  지금 돌고 있는 run이 없다. 과거 기록은 --all 또는 웹에서 볼 것.")
+        else:
+            print("  logs/ 아래에 run이 없다. htwk-gym 디렉터리에서 실행했는지 확인할 것.")
         return
     cur = None
     hdr = "  %-1s %-26s %9s %8s %8s %9s  %s"
-    for r in runs:
+    for r in shown:
         if r["batch"] != cur:
             cur = r["batch"]
             print("\033[1m[%s 배치]\033[0m" % cur)
@@ -299,6 +351,12 @@ def tui(runs):
                 ev["checkpoint"],
                 ("%.1f" % (ev["pos_median"] * 100)) if ev["pos_median"] is not None else "-",
                 ev["falls"])
+        if not note and r.get("last_pos") is not None:
+            note = "pos %.2f cm" % (r["last_pos"] * 100)
+        if not note and r.get("last_reward") is not None:
+            note = "reward %.3g" % r["last_reward"]
+        if r.get("stopped"):
+            note = "STOP: " + r["stopped"][:40]
         print(hdr % (icon.get(r["phase"], "?"), r["desc"][:26],
                      "%d/%s" % (r["iter"], r["max_iter"] or "?"),
                      ("%.2f" % r["s_per_iter"]) if r["s_per_iter"] else "-",
@@ -355,6 +413,7 @@ def main():
     ap.add_argument("--once", action="store_true", help="one collection pass, then exit")
     ap.add_argument("--port", type=int, default=8420)
     ap.add_argument("--interval", type=float, default=30.0)
+    ap.add_argument("--all", action="store_true", help="TUI: 끝난 run까지 전부")
     ap.add_argument("--root", default=None, help="repo root holding logs/ (default: this repo)")
     a = ap.parse_args()
     if a.root:
@@ -364,14 +423,14 @@ def main():
     elif a.tui:
         try:
             while True:
-                tui(collect())
+                tui(collect(), a.all)
                 time.sleep(a.interval)
         except KeyboardInterrupt:
             pass
     else:
         runs = collect()
         n = write(runs)
-        tui(runs)
+        tui(runs, a.all)
         print("\n  monitor/data 에 %d개 기록. 웹으로 보려면: python tools/monitor.py --serve" % n)
     return 0
 
