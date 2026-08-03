@@ -124,26 +124,56 @@ def main():
     head("PD 게인 — 실기에서 조정 가능한 값과 맞는가")
     print("  cfg stiffness: %s" % cfg["control"]["stiffness"])
     print("  cfg damping  : %s" % cfg["control"]["damping"])
+    # Per joint GROUP. Pooling Hip/Knee (100) with Ankle (50) makes min/median
+    # meaningless -- the first version of this reported a ratio of 0.487 and
+    # looked like a randomisation bug when it was just 50/100.
     ds = env.dof_stiffness.float()
     dd = env.dof_damping.float()
-    print("  실측 stiffness  min %.2f  median %.2f  max %.2f"
-          % (ds.min(), ds.median(), ds.max()))
-    print("  실측 damping    min %.2f  median %.2f  max %.2f"
-          % (dd.min(), dd.median(), dd.max()))
-    r = cfg["randomization"].get("dof_stiffness", {}).get("range")
-    print("  랜덤화 범위     %s  ->  실측 비 %.3f ~ %.3f"
-          % (r, float(ds.min() / ds.median()), float(ds.max() / ds.median())))
+    r = (cfg["randomization"].get("dof_stiffness") or {}).get("range")
+    print("  랜덤화 범위 %s (stiffness)" % (r,))
+    names = getattr(env, "dof_names", None) or []
+    groups = {}
+    for i, nm in enumerate(names):
+        for g in cfg["control"]["stiffness"]:
+            if g in nm:
+                groups.setdefault(g, []).append(i)
+                break
+    if not groups:
+        print("  dof_names를 못 얻었다 — 전체 범위만: stiffness %.2f~%.2f, damping %.2f~%.2f"
+              % (ds.min(), ds.max(), dd.min(), dd.max()))
+    for g, idx in sorted(groups.items()):
+        sg = ds[:, idx]
+        dg = dd[:, idx]
+        nom = float(cfg["control"]["stiffness"][g])
+        print("  %-6s stiffness cfg %-6.1f 실측 %.2f~%.2f (비 %.3f~%.3f)   damping cfg %-5.1f 실측 %.2f~%.2f"
+              % (g, nom, sg.min(), sg.max(), float(sg.min()) / nom, float(sg.max()) / nom,
+                 float(cfg["control"]["damping"][g]), dg.min(), dg.max()))
 
     head("도메인 랜덤화 — 설정이 실제로 표본에 반영됐는가")
+    # base_mass / friction are applied to rigid-body and shape properties at
+    # actor creation, not held as a per-env tensor, so the sampled multiplier is
+    # what to look at -- base_mass_scaled columns are [com.x, com.y, com.z, mass].
     for key, attr in (("joint_encoder_bias", "joint_encoder_bias"),
-                      ("joint_target_offset", "joint_target_offset"),
-                      ("base_mass", None), ("friction", None)):
+                      ("joint_target_offset", "joint_target_offset")):
         rng = (cfg["randomization"].get(key) or {}).get("range")
-        t = getattr(env, attr, None) if attr else None
+        t = getattr(env, attr, None)
         if t is None:
             row(key, rng, "런타임 텐서 없음")
         else:
-            row(key, rng, "[%+.4f, %+.4f]" % (float(t.min()), float(t.max())))
+            zero = "  (전부 0 = 이 arm에서 꺼짐)" if float(t.abs().max()) == 0 else ""
+            row(key, rng, "[%+.4f, %+.4f]" % (float(t.min()), float(t.max())), zero)
+    bm = getattr(env, "base_mass_scaled", None)
+    if bm is not None and bm.numel():
+        print("  %-30s cfg %-16s 실측 mass배율 %.3f~%.3f, CoM %+.3f~%+.3f m"
+              % ("base_mass / base_com",
+                 (cfg["randomization"].get("base_mass") or {}).get("range"),
+                 float(bm[:, 3].min()), float(bm[:, 3].max()),
+                 float(bm[:, :3].min()), float(bm[:, :3].max())))
+    fr = getattr(env, "friction_coeffs", None)
+    print("  %-30s cfg %-16s 실측 %s"
+          % ("friction", (cfg["randomization"].get("friction") or {}).get("range"),
+             ("%.3f~%.3f" % (float(fr.min()), float(fr.max()))) if fr is not None
+             else "actor 생성 시 shape 속성에 적용 (텐서로 보관 안 함)"))
 
     head("외란 — 실제로 몇 스텝에, 얼마나 큰 힘이 걸리는가")
     d = cfg["randomization"].get("disturbance") or {}
