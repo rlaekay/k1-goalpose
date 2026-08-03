@@ -445,6 +445,8 @@ class Controller:
         self._latest_rpy = np.zeros(3, dtype=np.float32)
         self._last_pre_custom_log = -1e9
         self._latest_tilt = 0.0
+        self._moving_gait_frequency = float(self.cfg["policy"]["gait_frequency"])
+        self._walking = False
 
         # SDK channels FIRST, while this is still a single-threaded process.
         #
@@ -789,9 +791,14 @@ class Controller:
             self._require_fresh_low_state("during CUSTOM entry ramp")
             alpha = min(1.0, (time.monotonic() - ramp_start) / max(1e-6, ramp_s))
             blend = alpha * alpha * (3.0 - 2.0 * alpha)
+            # Position only. The gains stay at prepare (legs 350/250) until the
+            # gait starts, exactly as the E1 wrapper does. Ramping them down to
+            # the policy values here left the robot holding a crouch on 100/50,
+            # which are the gains the policy closes its own loop with -- with
+            # nobody closing it, the ankles could not hold and it went over
+            # forwards.
             self._fill_low_cmd((1 - blend) * latched + blend * rl_q,
-                               (1 - blend) * prep_stiff + blend * rl_stiff,
-                               (1 - blend) * prep_damp + blend * rl_damp)
+                               prep_stiff, prep_damp)
             self._send_cmd(self.low_cmd)
             if alpha >= 1.0:
                 break
@@ -801,6 +808,8 @@ class Controller:
         self.dof_target[:] = rl_q
         self.filtered_dof_target[:] = rl_q
         self._prepare_q = latched
+        # Gains are still the prepare ones; start_rl_gait_conditionally swaps
+        # them for the policy gains at the same moment inference begins.
 
         # Start streaming immediately. The operator prompt that follows can sit
         # for minutes -- it sat for 124 s on the first hardware start -- and
@@ -1090,11 +1099,14 @@ class Controller:
             time.monotonic() - wait_t0,
             time.monotonic() - getattr(self, "_custom_mode_entered_monotonic", wait_t0))
 
-        # Deliberately no create_first_frame_rl_cmd here. The latched entry
-        # already ramped pose and gains to the RL values, and rebuilding the
-        # frame would put position control back on the parallel-mechanism joints
-        # -- the thing that shook the robot -- while racing the publish thread
-        # for the same buffer. Starting the gait is now purely "begin inference".
+        # Swap prepare gains for the policy gains, holding the current position.
+        # The pose is already the policy default from the entry ramp; only the
+        # gains change, and they change exactly when the policy starts closing
+        # the loop that those gains assume.
+        self._fill_low_cmd(self.filtered_dof_target,
+                           np.asarray(self.cfg["common"]["stiffness"], dtype=np.float32),
+                           np.asarray(self.cfg["common"]["damping"], dtype=np.float32))
+        self._send_cmd(self.low_cmd)
         rl_q = np.asarray(self.cfg["common"]["default_qpos"], dtype=np.float64)
         self._log_joint_deviation("at RL-gait start (vs rl pose)", rl_q)
         self.next_inference_time = self.timer.get_time()
@@ -1154,6 +1166,7 @@ class Controller:
             }
         goal_rel_x, goal_rel_y, heading_error = goal
         self._last_goal = goal
+        self._update_arrival_gait(goal_rel_x, goal_rel_y, heading_error)
         dof_target = self.policy.inference(
             time_now=time_now,
             dof_pos=self.dof_pos,
@@ -1173,6 +1186,38 @@ class Controller:
         self.dof_target[:] = dof_target
         self._publish_policy_debug(low_state_age, goal_status)
         time.sleep(0.001)
+
+    def _update_arrival_gait(self, goal_rel_x, goal_rel_y, heading_error):
+        """Zero the gait clock once the goal is reached, with hysteresis.
+
+        Training assigns gait_frequency = 0 to stand-category goals
+        (goal_pose.py: "stand-category envs get a zero gait clock ... so
+        standing still is optimal"), and the goal mixture is named "No More
+        Marching" for that reason. Feeding a constant 2 Hz at (0,0,0) asks for
+        behaviour the stand portion of the training set never contained, and the
+        robot marches in place.
+
+        Setting policy.gait_frequency to 0 also freezes gait_process, since it
+        is computed as fmod(t * gait_frequency, 1), so both the command channel
+        and the clock inputs match the stand case.
+
+        Separate stop/start thresholds keep it from chattering at the boundary.
+        """
+        dg = self.cfg.get("deploy_goal", {})
+        stop_pos = float(dg.get("stop_radius_m", 0.06))
+        start_pos = float(dg.get("start_radius_m", 0.10))
+        stop_heading = float(dg.get("stop_heading_rad", 0.06))
+        start_heading = float(dg.get("start_heading_rad", 0.10))
+        distance = float(np.hypot(goal_rel_x, goal_rel_y))
+        heading = abs(float(heading_error))
+
+        if self._walking:
+            self._walking = distance > stop_pos or heading > stop_heading
+        else:
+            self._walking = distance > start_pos or heading > start_heading
+
+        self.policy.gait_frequency = (
+            self._moving_gait_frequency if self._walking else 0.0)
 
     def _publish_policy_debug(self, low_state_age, goal_status):
         if self.goal_source_mode != "ros":
@@ -1200,6 +1245,8 @@ class Controller:
             "low_state_age_sec": low_state_age,
             "rpy_rad": [float(v) for v in self._latest_rpy],
             "tilt_deg": float(np.degrees(self._latest_tilt)),
+            "walking": self._walking,
+            "gait_frequency": float(self.policy.gait_frequency),
             "action_min": float(np.min(self.policy.actions)),
             "action_max": float(np.max(self.policy.actions)),
             "running": self.running,

@@ -131,7 +131,15 @@ deploy_goal:
   heading_error: 0.0
   topic: "/locomotion_test/goal_rel"
   debug_topic: "/locomotion_test/policy_debug"
-  stale_timeout_s: 0.5        # live source only: replace a stale goal with (0,0,0)
+  stale_timeout_s: 0.5
+  # Arrival hysteresis for the gait clock. Training gives stand-category goals
+  # gait_frequency = 0 ("No More Marching" mixture), so holding 2 Hz at (0,0,0)
+  # asks for behaviour that portion of the training set never contained -- the
+  # robot marches in place. Stop tighter than you start, or it chatters.
+  stop_radius_m: 0.06
+  start_radius_m: 0.10
+  stop_heading_rad: 0.06
+  start_heading_rad: 0.10        # live source only: replace a stale goal with (0,0,0)
   debug_period_s: 0.10        # 10 Hz end-to-end policy bridge diagnostics
 
 safety:
