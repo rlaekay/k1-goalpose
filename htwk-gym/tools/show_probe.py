@@ -49,6 +49,28 @@ def show(path):
         print("  구간 길이 실측 %.2f s -> 순항 최장연속은 이 값에 상한이 걸린다"
               % seg_s)
 
+    # forward_hold 판별: 목표 범위가 한 점([2,2])이면 도착하지 않도록 만든 프로브다.
+    # 정상 과제는 [-2, 2]다. 라벨이 아니라 실제 샘플링 범위로 판별한다.
+    dx = cm.get("goal_dx") or []
+    is_probe = len(dx) == 2 and dx[0] == dx[1] and dx[0] != 0.0
+    if not is_probe:
+        # 정상 과제에서는 도착 지표가 결과다. 프로브에서만 숨긴다.
+        pe = d.get("pos_err_m") or {}
+        he = d.get("heading_err_deg") or {}
+        import math as _m
+        te = (_m.hypot(pe.get("median", float("nan")),
+                       _m.radians(he.get("median", float("nan")))) * 100
+              if pe.get("median") is not None and he.get("median") is not None
+              else float("nan"))
+        print("\n  [도착 — 정상 과제의 결과]")
+        print("    위치 median %.2f cm  p90 %.2f cm | heading %.2f° | 과제오차 %.2f cm"
+              % (100 * pe.get("median", float("nan")),
+                 100 * pe.get("p90", float("nan")),
+                 he.get("median", float("nan")), te))
+        print("    strict %.1f%%  |  낙상 %s / 구간 %s"
+              % (100 * (d.get("success_rate_strict") or 0.0),
+                 d.get("falls"), d.get("segments_completed")))
+
     b = d.get("body_speed") or {}
     print("\n  [몸통속도 — 이 프로브의 결과]")
     print("    median %.2f   p90 %.2f   p99 %.2f   max %.2f m/s"
@@ -113,8 +135,8 @@ def main():
     if not found:
         print("report.json이 없다. 아직 도는 중이거나 경로가 다르다: %s" % roots)
         return 1
-    print("주의: 이 프로브에서 pos_err_m / success_rate / 게이트는 의미가 없다.")
-    print("      목표에 도착하지 않도록 설계된 실행이므로 도착 오차가 정의되지 않는다.")
+    print("주의: goal_dx가 한 점인 실행(forward_hold)에서는 도착 지표를 찍지 않는다 --")
+    print("      도착하지 않도록 설계된 프로브라 도착 오차가 정의되지 않기 때문이다.")
     return 0
 
 
