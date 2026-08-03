@@ -741,14 +741,20 @@ class Controller:
         # Ramp pose and gains together. Keeping the command streaming through
         # the transition is what makes it smooth; a single frame followed by
         # silence leaves the robot on a stale target.
+        # Drive the ramp off wall-clock, not a sleep count. time.sleep(0.002)
+        # actually takes ~20 ms here, so counting 300 steps of dt turned a 0.6 s
+        # ramp into 7 s -- the measured "entry done in 8.04 s" was almost all
+        # this.
         dt = float(self.cfg["common"]["dt"])
-        steps = max(1, int(ramp_s / dt))
-        for s in range(1, steps + 1):
-            a = s / steps
+        ramp_start = time.monotonic()
+        while True:
+            a = min(1.0, (time.monotonic() - ramp_start) / max(1e-6, ramp_s))
             self._fill_low_cmd((1 - a) * latched + a * rl_q,
                                (1 - a) * prep_stiff + a * rl_stiff,
                                (1 - a) * prep_damp + a * rl_damp)
             self._send_cmd(self.low_cmd)
+            if a >= 1.0:
+                break
             time.sleep(dt)
 
         self.dof_target[:] = rl_q
@@ -855,6 +861,43 @@ class Controller:
             "robot did not reach PREPARE within %.0fs (still %s). Refusing to "
             "enter CUSTOM from a non-standing state." % (
                 timeout, RobotModeId.NAMES.get(self.mode_monitor.snapshot()[0], "?")))
+
+    def log_hold_diagnostic(self, seconds):
+        """Record what the ankles do while holding a static pose in CUSTOM.
+
+        Two failure modes look similar from across the room but are opposite
+        problems: a joint with no position servo drifts steadily away from its
+        target, while an under-damped one oscillates around it. This logs target
+        vs measured on the parallel-mechanism joints so the difference is a
+        number rather than a guess.
+        """
+        parallel = list(self.cfg.get("mech", {}).get("parallel_mech_indexes", []))
+        t0 = time.monotonic()
+        rows = []
+        while time.monotonic() - t0 < seconds:
+            time.sleep(0.05)
+            t = time.monotonic() - t0
+            rows.append((t, [float(self.filtered_dof_target[i]) for i in parallel],
+                         [float(self.dof_pos_latest[i]) for i in parallel],
+                         float(np.degrees(self._latest_tilt))))
+        self.logger.info("[hold-diag] %d samples over %.1fs, joints %s",
+                         len(rows), seconds, parallel)
+        for t, tgt, meas, tilt in rows[::max(1, len(rows)//20)]:
+            errs = " ".join("%+.4f" % (m - g) for g, m in zip(tgt, meas))
+            self.logger.info("[hold-diag] t=%5.2fs tilt=%5.1fdeg  err(meas-target)= %s",
+                             t, tilt, errs)
+        if rows:
+            first = np.array(rows[0][2]) - np.array(rows[0][1])
+            last = np.array(rows[-1][2]) - np.array(rows[-1][1])
+            drift = last - first
+            allerr = np.array([np.array(m) - np.array(g) for _, g, m, _ in rows])
+            spread = allerr.max(axis=0) - allerr.min(axis=0)
+            self.logger.info("[hold-diag] net drift over window: %s",
+                             " ".join("%+.4f" % v for v in drift))
+            self.logger.info("[hold-diag] peak-to-peak:          %s",
+                             " ".join("%.4f" % v for v in spread))
+            self.logger.info("[hold-diag] drift >> spread means no position servo; "
+                             "spread >> drift means under-damped")
 
     # --------------------------------------------------------------- recovery --
     def _request_recovery(self, reason):
@@ -1186,6 +1229,10 @@ if __name__ == "__main__":
                              "and then nothing publishes until the operator starts the "
                              "gait, which makes the transition timing depend on how "
                              "long the prompt is left waiting.")
+    parser.add_argument("--hold-diag", type=float, default=0.0,
+                        help="After CUSTOM entry, hold and log ankle target-vs-measured "
+                             "for this many seconds before the gait prompt. Tells drift "
+                             "(no position servo) apart from oscillation (under-damped).")
     parser.add_argument("--prepare-settle-log-s", type=float, default=1.0,
                         help="Seconds to log measured-vs-commanded joint error right "
                              "after entering CUSTOM (0 disables).")
@@ -1212,6 +1259,8 @@ if __name__ == "__main__":
         time.sleep(2)  # wait for channels
         print("Initialization complete.")
         controller.start_custom_mode_conditionally()
+        if args.hold_diag > 0:
+            controller.log_hold_diagnostic(args.hold_diag)
         controller.start_rl_gait_conditionally()
 
         try:
