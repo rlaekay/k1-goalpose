@@ -293,8 +293,40 @@ I1_ARMS = {
     "I1d_both": merge(_I1_BASE, _I1_FORCE, _I1_CADENCE),
 }
 
+# ---- I batch R2 (2026-08-03) ------------------------------------------------
+# R1 adopted disturbance (falls -77%) and held cadence (it cancels that gain).
+# R2 is not a new hypothesis pair; both arms correct conditions the simulator
+# was inventing, in the same class as the feet_edge_pos fix.
+#
+# base_com randomises the Trunk's centre of mass by +/-0.1 m on every axis. The
+# Trunk's own collision box is 0.12 x 0.18, i.e. half-extents of 0.060 and
+# 0.090, so the sampled CoM lands OUTSIDE the trunk -- 1.7x its half-length in
+# x. The foot spans -0.066 to +0.094, so a 0.1 m shift in x puts the CoM past
+# the edge of the support polygon: a robot that cannot balance standing still,
+# demanded not to fall. Real CoM uncertainty from cables, battery and camera
+# placement is 1-3 cm. This is not a robustness trade; it is a fiction being
+# removed, which is why it belongs before the speed round rather than after.
+_I2_BASE = merge(_I1_BASE, _I1_FORCE)          # R1 winner: foot + h055 + force
+I2_ARMS = {
+    "I2a_dr": merge(_I2_BASE, {
+        "randomization.base_com.range": [-0.025, 0.025],
+        "randomization.base_mass.range": [0.92, 1.08],
+        "randomization.dof_stiffness.range": [0.85, 1.15],
+        "randomization.dof_damping.range": [0.85, 1.15],
+    }),
+    # feet_swing pays for "swing foot not in contact", and contact is any corner
+    # within 1 cm of the ground, so 1.1 cm of clearance already earns full marks
+    # -- on a perfectly flat plane nothing ever asks for more. Uneven ground asks
+    # for it without naming a number, which is the difference between creating a
+    # condition and hardcoding a target.
+    "I2b_terrain": merge(_I2_BASE, {
+        "terrain.type": "trimesh",
+    }),
+}
+
 ARMS_ON_E0 = {"I0a_repro", "I0b_foot", "I0c_h055", "I0d_h058",
-              "I1a_base", "I1b_force", "I1c_cadence", "I1d_both", "G1_speed", "G2_robust", "G3_full"}
+              "I1a_base", "I1b_force", "I1c_cadence", "I1d_both",
+              "I2a_dr", "I2b_terrain", "G1_speed", "G2_robust", "G3_full"}
 
 
 def set_dotted(cfg, dotted, value):
@@ -310,7 +342,7 @@ def set_dotted(cfg, dotted, value):
 # V8_ARMS (G4_smoothturn) was missing from this merge, so --only G4_smoothturn
 # raised KeyError before it ever reached the per-arm is_v8 branch below --
 # G4 has never successfully generated a config, let alone run its smoke test.
-ALL_ARMS = dict(**ARMS, **F_ARMS, **I_ARMS, **I1_ARMS, **V8_ARMS)
+ALL_ARMS = dict(**ARMS, **F_ARMS, **I_ARMS, **I1_ARMS, **I2_ARMS, **V8_ARMS)
 
 # GPU 0 / GPU 1 split. F-batch: F1+F2 share GPU 0 (lighter, no disturbance),
 # F3 gets GPU 1 to itself (disturbance + higher flicker rate is the heavier one).
@@ -331,11 +363,13 @@ GPU_OF = {
     # and clock condition: (control, force) on 0, (cadence, both) on 1.
     "I1a_base": "cuda:0", "I1b_force": "cuda:0",
     "I1c_cadence": "cuda:1", "I1d_both": "cuda:1",
+    "I2a_dr": "cuda:0", "I2b_terrain": "cuda:1",
 }
 
 
 def default_checkpoint(arm):
-    return ARMSDOWN_CKPT if (arm in F_ARMS or arm in I_ARMS or arm in I1_ARMS or arm in ARMS_ON_E0
+    return ARMSDOWN_CKPT if (arm in F_ARMS or arm in I_ARMS or arm in I1_ARMS
+                             or arm in I2_ARMS or arm in ARMS_ON_E0
                              or arm in V8_ARMS) else DEFAULT_CKPT
 
 
