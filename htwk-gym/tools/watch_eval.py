@@ -75,16 +75,31 @@ def evaluate(ckpt, cfg, task, device, seconds, envs):
 
 
 def verdict(rep, ref, stop_ratio, ref_falls, fall_ratio):
-    """Pre-registered stop rule. Returns (stop: bool, reason: str)."""
+    """Is this checkpoint over the line? (over: bool, reason: str)
+
+    Being over the line once is NOT a reason to stop -- see main(). A warm-start
+    policy re-adapting to a changed condition gets worse before it gets better,
+    and I1b proved it: 3 falls at iteration 125, 2 at 150, then ZERO at 175 with
+    every gate passing. I1a, I1c and I1d were all killed at iteration 50 on a
+    single reading of 8-10 falls, which is the same transient I1b walked out of.
+    """
     pos = (rep.get("pos_err_m") or {}).get("median")
     if pos is None:
         return False, "no position median"
     if ref and pos > ref * stop_ratio:
         return True, ("pos median %.4f m > %.2fx reference %.4f"
                       % (pos, stop_ratio, ref))
+    # Compare RATES, not counts. The screening eval completes a different number
+    # of segments per arm (731-743 observed), so a raw count silently compares
+    # different denominators.
     falls = rep.get("falls")
-    if ref_falls is not None and falls is not None and falls > max(ref_falls * fall_ratio, ref_falls + 5):
-        return True, "falls %s > %.1fx reference %s" % (falls, fall_ratio, ref_falls)
+    rate = rep.get("fall_rate_per_attempt")
+    if ref_falls is not None and rate is not None:
+        segs = rep.get("segments_completed") or 0
+        ref_rate = (float(ref_falls) / segs) if segs else None
+        if ref_rate and rate > ref_rate * fall_ratio:
+            return True, ("fall rate %.4f > %.1fx reference %.4f (falls %s/%s)"
+                          % (rate, fall_ratio, ref_rate, falls, segs))
     return False, "pos %.4f m, falls %s" % (pos, falls)
 
 
@@ -109,6 +124,11 @@ def main():
     ap.add_argument("--seconds", type=float, default=20.0)
     ap.add_argument("--envs", type=int, default=256)
     ap.add_argument("--poll", type=float, default=60.0)
+    ap.add_argument("--warmup-iters", dest="warmup_iters", type=int, default=100,
+                    help="never stop before this iteration; warm-start re-adaptation "
+                         "is transiently worse and killing it discards the recovery")
+    ap.add_argument("--strikes", type=int, default=2,
+                    help="consecutive over-the-line checkpoints required to stop")
     a = ap.parse_args()
 
     # The launcher cannot pass a run dir because the trainer has not created it
@@ -138,7 +158,7 @@ def main():
         return 2
     cfg = a.config or os.path.join(run, "config.yaml")
     hist = os.path.join(run, "watch_eval.jsonl")
-    done, seen_any = set(), 0
+    done, seen_any, strikes = set(), 0, 0
     print("watch_eval: %s  (ref %s, stop at %.2fx)" % (run, a.ref, a.stop_ratio), flush=True)
 
     while True:
@@ -156,8 +176,15 @@ def main():
             if rep is None:
                 print("  iter %d: eval failed (see watch_eval/); NOT stopping" % it, flush=True)
                 continue
-            stop, why = verdict(rep, a.ref, a.stop_ratio, a.ref_falls, a.fall_ratio)
-            rec = {"it": it, "t": time.time(), "stop": stop, "why": why,
+            over, why = verdict(rep, a.ref, a.stop_ratio, a.ref_falls, a.fall_ratio)
+            strikes = strikes + 1 if over else 0
+            stop = over and it >= a.warmup_iters and strikes >= a.strikes
+            if over and not stop:
+                why += "  (over the line, strike %d/%d%s)" % (
+                    strikes, a.strikes,
+                    ", warmup until %d" % a.warmup_iters if it < a.warmup_iters else "")
+            rec = {"it": it, "t": time.time(), "stop": stop, "over": over,
+                   "strikes": strikes, "why": why,
                    "pos_median": (rep.get("pos_err_m") or {}).get("median"),
                    "pos_p90": (rep.get("pos_err_m") or {}).get("p90"),
                    "heading_median": (rep.get("heading_err_deg") or {}).get("median"),

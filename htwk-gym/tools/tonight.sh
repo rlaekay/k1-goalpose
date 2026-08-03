@@ -183,9 +183,15 @@ done
 # 100에 이미 있었다(7.25 -> 10.4~13.2 cm). 판정은 학습 전에 고정하고 코드가 집행한다.
 # REF/REF_FALLS는 비교 대상 정책의 실측값이다: E0@6200 = 2.72 cm / 낙상 2.
 LAUNCH_T=$(date +%s)
-REF="${REF:-0.0272}"
-REF_FALLS="${REF_FALLS:-2}"
+# Reference = the best VERIFIED policy under the current task, not E0's raw
+# number. R1 ran with REF_FALLS=2 (E0) and killed three of four arms at
+# iteration 50 on the warm-start transient; I0c_h055 measured 2.71 cm / 4 falls
+# under the corrected foot, and that is the honest bar.
+REF="${REF:-0.0271}"
+REF_FALLS="${REF_FALLS:-4}"
 STOP_RATIO="${STOP_RATIO:-1.3}"
+WARMUP_ITERS="${WARMUP_ITERS:-100}"   # no stop before this: re-adaptation dips first
+STRIKES="${STRIKES:-2}"               # consecutive violations required
 if [ "${WATCH_EVAL:-1}" = "1" ]; then
   for name in $ARMS; do
     gpu=$(python tools/make_v7_arms.py --gpu-of "$name" 2>/dev/null || echo 0)
@@ -193,8 +199,9 @@ if [ "${WATCH_EVAL:-1}" = "1" ]; then
     nohup python -u tools/watch_eval.py --run-glob "logs/*/*/*/*${name}" \
         --newer-than "$LAUNCH_T" --device "cuda:$gpu" \
         --ref "$REF" --ref-falls "$REF_FALLS" --stop-ratio "$STOP_RATIO" \
+        --warmup-iters "$WARMUP_ITERS" --strikes "$STRIKES" \
         > "logs/watch_eval/${name}.log" 2>&1 &
-    say "  watch_eval: $name (ref ${REF} m, ${STOP_RATIO}x 초과 시 STOP)"
+    say "  watch_eval: $name (ref ${REF} m / 낙상 ${REF_FALLS}, ${STOP_RATIO}x·${STRIKES}회 연속·iter ${WARMUP_ITERS} 이후)"
   done
 fi
 
