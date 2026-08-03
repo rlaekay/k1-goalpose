@@ -33,10 +33,21 @@ def show(path):
     print("=" * 78)
     print(os.path.relpath(os.path.dirname(path)))
     print("  checkpoint : %s" % os.path.basename(d.get("checkpoint") or "?"))
-    print("  goal_pattern %s | 바닥 %s | 외력 %s | 구간 %s"
-          % (_g(d, "evaluation", "goal_pattern") or d.get("goal_pattern"),
-             d.get("eval_terrain"), d.get("force_profile"),
-             d.get("segments_completed")))
+    # goal_pattern은 report.json 최상위에 없다(effective_protocol 안에서 해시될 뿐).
+    # 라벨 대신 실제로 샘플링된 값을 찍는다 -- 프로브가 정말 돌았는지의 증거는
+    # 이름이 아니라 goal_dx와 resample 주기다.
+    cm = d.get("commands") or {}
+    print("  바닥 %s | 외력 %s | 구간 %s" % (
+        d.get("eval_terrain"), d.get("force_profile"), d.get("segments_completed")))
+    print("  goal_dx %s  goal_dy %s  resample %s s" % (
+        cm.get("goal_dx"), cm.get("goal_dy"), cm.get("resampling_time_s")))
+    dur = d.get("duration_s") or 0
+    ne = d.get("num_envs") or 0
+    n = d.get("segments_completed") or 0
+    if dur and ne and n:
+        seg_s = dur * ne / float(n)
+        print("  구간 길이 실측 %.2f s -> 순항 최장연속은 이 값에 상한이 걸린다"
+              % seg_s)
 
     b = d.get("body_speed") or {}
     print("\n  [몸통속도 — 이 프로브의 결과]")
