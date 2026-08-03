@@ -31,6 +31,12 @@ class Recorder:
         self.model_dir = os.path.join(self.dir, "nn")
         os.mkdir(self.model_dir)
         self.writer = SummaryWriter(os.path.join(self.dir, "summaries"))
+        # Plain-text mirror of every scalar. tools/monitor.py reads this instead
+        # of decoding tfevents: the server is headless, so the dashboard has to
+        # work without tensorboard installed and without a protobuf decoder.
+        # Append-only JSONL means a reader never has to lock or wait for a
+        # writer, and a half-written trailing line is simply skipped.
+        self._scalar_log = os.path.join(self.dir, "scalars.jsonl")
         if self.cfg["runner"]["use_wandb"]:
             # Sanitize project name for wandb (remove invalid characters)
             project_name = self._sanitize_project_name(self.cfg["basic"]["task"])
@@ -49,6 +55,14 @@ class Recorder:
 
         with open(os.path.join(self.dir, "config.yaml"), "w") as file:
             yaml.dump(self.cfg, file)
+
+    def _scalar(self, tag, value, it):
+        try:
+            with open(self._scalar_log, "a") as f:
+                f.write('{"it": %d, "t": %.3f, "tag": "%s", "v": %.6g}\n'
+                        % (int(it), time.time(), tag, float(value)))
+        except Exception:
+            pass          # telemetry must never be able to kill a training run
 
     def _sanitize_project_name(self, task_name):
         """Sanitize task name for wandb project name by removing invalid characters."""
@@ -94,6 +108,7 @@ class Recorder:
                 path = ("" if key == "steps" or key == "reward" else "episode/") + key
                 value = self._mean(self.last_episode[key])
                 self.writer.add_scalar(path, value, it)
+                self._scalar(path, value, it)
                 if self.cfg["runner"]["use_wandb"]:
                     wandb.log({path: value}, step=it)
                 self.last_episode[key].clear()
@@ -101,6 +116,7 @@ class Recorder:
     def record_statistics(self, statistics, it):
         for key, value in statistics.items():
             self.writer.add_scalar(key, float(value), it)
+            self._scalar(key, float(value), it)
             if self.cfg["runner"]["use_wandb"]:
                 wandb.log({key: float(value)}, step=it)
 

@@ -229,3 +229,5 @@ shared_eval_videos/  # tools/train_and_eval.sh output -- pull via scp/rsync, nev
 K1_walk.zip
 K1_walk/
 hbatch-results-codex/
+htwk-gym/monitor/
+htwk-gym/logs/monitor.log
