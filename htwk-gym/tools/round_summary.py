@@ -33,7 +33,14 @@ def newest_runs(arms):
         run = os.path.dirname(p)
         name = os.path.basename(run)
         m = re.match(r"\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}_(.+)$", name)
-        arm = m.group(1) if m else name
+        # Runs from before Recorder tagged dirs with a description have no arm
+        # name at all; showing the bare timestamp is honest but noisy, so they
+        # are only included when explicitly asked for.
+        arm = m.group(1) if m else None
+        if arm is None:
+            if not arms:
+                continue
+            arm = name
         if arms and arm not in arms:
             continue
         if arm not in out or name > os.path.basename(out[arm]):
@@ -98,9 +105,9 @@ def main():
 
     print("=== 라운드 요약  %s ===" % time.strftime("%Y-%m-%d %H:%M:%S"))
     print("기준: 위치 median %.2f cm / 낙상 %d  (E0@6200)\n" % (a.ref * 100, a.ref_falls))
-    hdr = "%-14s %-13s %6s %9s %8s %7s %7s %8s"
+    hdr = "%-32s %-13s %8s %9s %8s %7s %7s %8s"
     print(hdr % ("arm", "시작", "iter", "pos med cm", "p90 cm", "hd °", "falls", "strict %"))
-    print("-" * 82)
+    print("-" * 100)
 
     trouble = []
     for arm in sorted(runs):
@@ -123,10 +130,11 @@ def main():
                        strict=r.get("strict"), it=str(r.get("it")))
         n_ck = len(glob.glob(os.path.join(run, "nn", "model_*.pth")))
         if src is None:
-            print(hdr % (arm, started, "ck %d" % n_ck, "-", "-", "-", "-", "-") + "   << 결과 없음")
+            print(hdr % (arm[:32], started, "ck %d" % n_ck, "-", "-", "-", "-", "-") + "  << 결과 없음")
             trouble.append((arm, run))
             continue
-        print(hdr % (arm, started, str(src["it"])[:6], cm(src["pos"]), cm(src["p90"]),
+        it = re.sub(r"^model_|\.pth$", "", str(src["it"]))
+        print(hdr % (arm[:32], started, it[:8], cm(src["pos"]), cm(src["p90"]),
                      "-" if src["hd"] is None else "%.1f" % src["hd"],
                      "-" if src["falls"] is None else str(src["falls"]),
                      "-" if src["strict"] is None else "%.1f" % (src["strict"] * 100)))

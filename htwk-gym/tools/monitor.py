@@ -140,7 +140,7 @@ def watch_series(run):
     p = os.path.join(run, "watch_eval.jsonl")
     if not os.path.exists(p):
         return {}
-    out, stop = {}, None
+    out, stop, rows = {}, None, []
     try:
         for line in open(p, encoding="utf-8", errors="replace"):
             line = line.strip()
@@ -153,11 +153,17 @@ def watch_series(run):
             for k in ("pos_median", "pos_p90", "falls", "strict"):
                 if d.get(k) is not None:
                     out.setdefault("watch/" + k, []).append((d["it"], d[k]))
+            rows.append({"path": "watch_eval.jsonl", "date": time.strftime(
+                            "%Y-%m-%d %H:%M:%S", time.localtime(d.get("t", 0))),
+                         "checkpoint": "model_%s.pth" % d.get("it"),
+                         "pos_median": d.get("pos_median"), "pos_p90": d.get("pos_p90"),
+                         "heading_median": d.get("heading_median"), "falls": d.get("falls"),
+                         "strict": d.get("strict"), "gates_pass": None})
             if d.get("stop"):
                 stop = d.get("why")
     except OSError:
         return {}
-    return {"series": out, "stop": stop}
+    return {"series": out, "stop": stop, "rows": rows}
 
 
 def eval_results(run, shared="shared_eval_videos"):
@@ -268,7 +274,7 @@ def collect():
                 cks[0][1] if cks else _dir_time(run))),
             "checkpoints": [c[0] for c in cks],
             "best": _best(run),
-            "evals": ev,
+            "evals": ev + w.get("rows", []),
             "scalars": sc,
             "last_reward": (sc.get("reward") or [[None, None]])[-1][1],
             "last_pos": (sc.get("watch/pos_median") or [[None, None]])[-1][1],
