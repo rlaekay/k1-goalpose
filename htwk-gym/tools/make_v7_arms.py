@@ -464,11 +464,30 @@ _L_BASE = merge(_I3_BASE, {
     "rewards.scales.feet_offset_y": -10.0,     # R3b adopted (8-32)
     "rewards.base_height_target": 0.52,        # 도달 가능한 최대. 8-33
     "runner.save_interval": 250,
+    # 발 관성 교정. 기존 asset의 발은 주모멘트 삼각부등식을 2.6배 위반한다 --
+    # 어떤 강체도 가질 수 없는 값이고, foot_yaw_L/R이 -1.0으로 그 위에서 학습돼 왔다.
+    # 벤더 파일(k1/K1_locomotion.urdf)의 발 inertial만 이식했다. 그 파일은 엉덩이가
+    # 15 mm 낮고 링크마다 4-5% 무거운 다른 리비전이라 통째로는 쓰지 않는다.
+    "asset.file": "resources/K1/K1_locomotion_armsdown_footfix.urdf",
 })
 
 L_ARMS = {
     "L1_long": merge(_L_BASE),
     "L2_cadence": merge(_L_BASE, {"commands.cadence_coupling.enabled": True}),
+    # 위상 없는 보행. feet_swing은 gait_process 위에 정의돼 있어서 클럭을 지우면
+    # 발을 들 이유가 사라진다 -- 그래서 삭제가 아니라 교체다. 관측 채널(9, 16, 17)은
+    # 그대로 두므로 obs 54가 유지되고 warm start가 산다: 정책은 클럭을 계속 보지만
+    # 그걸 따를 이유가 없어진다. 스스로 타이밍을 만들면 위상 자유가 증명되고, 그때
+    # 채널을 지우는 것은 값싼 후속 작업이다.
+    #
+    # 스케일은 feet_swing의 실제 기여에 맞췄다. feet_swing은 사이클의 40%에서 1.0을
+    # 주므로 3.0 x dt x 0.4 = 0.024/step. air_time은 착지에서만(초당 4회) 값이
+    # 나오고 크기는 0.14-0.10 = 0.04이므로 step당 평균 0.0032. 같은 기여를 내려면
+    # 375다. 희소 보상이라 스케일이 커 보이는 것이지 세다는 뜻이 아니다.
+    "L3_phasefree": merge(_L_BASE, {
+        "rewards.scales.feet_swing": 0.0,
+        "rewards.scales.feet_air_time": 375.0,
+    }),
 }
 
 
@@ -517,7 +536,8 @@ GPU_OF = {
     "I3a_jointcal10": "cuda:0",
     "I3b_stance10": "cuda:0",
     "L1_long": "cuda:0",
-    "L2_cadence": "cuda:1",
+    "L2_cadence": "cuda:0",
+    "L3_phasefree": "cuda:1",
     "I3b_stance30": "cuda:1",
     "I3a_jointcal3": "cuda:1",
 }

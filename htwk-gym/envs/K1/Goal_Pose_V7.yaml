@@ -489,6 +489,7 @@ rewards:
     feet_pitch: -0.1
     feet_offset_x: -0.        # disabled at milestone 2 (was velocity-scaled by old vx/vy command; see MASTERPLAN log)
     feet_offset_y: -0.        # disabled at milestone 2
+    feet_air_time: 0.       # 위상 없는 대체물. L3에서만 켠다 (8-34)
     feet_swing: 3.
     # --- modular goal-reward alternatives, swap in by setting nonzero scales ---
     constellation: 3.5        # paper-faithful unified pos+heading kernel ("No More Marching" arXiv:2508.14098)
@@ -512,6 +513,11 @@ rewards:
   soft_dof_vel_limit: 1.
   soft_torque_limit: 1.
   swing_period: 0.2
+  # feet_air_time: 위상 없는 feet_swing 대체물. 착지 때 실제 체공시간을 보상한다.
+  # target 0.10 s 는 실측 단일지지 구간 median 0.12-0.14 s 바로 아래라 양의 보상이
+  # 나오면서도 더 들라는 압력이 남는다. clip 0.30 은 hopping으로 보상을 긁는 것을 막는다.
+  feet_air_time_target: 0.10
+  feet_air_time_clip: 0.30
   feet_distance_ref: 0.18
   final_window_s: 0.0          # v3 Rudin timed gate; 0 = off
 

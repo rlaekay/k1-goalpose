@@ -307,6 +307,12 @@ class GoalPose(BaseTask):
         # is under 1 cm, which is all feet_swing ever asks for; this says by how
         # much, so terrain arms can be judged on the thing they exist to change.
         self.feet_clearance = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.float, device=self.device)
+        # Phase-free swing accounting for _reward_feet_air_time. Self-contained:
+        # the reward accumulates, reads at touchdown and clears, so it needs no
+        # update site elsewhere and cannot get out of order with the contact
+        # refresh.
+        self.feet_air_time = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.float, device=self.device)
+
         self.dof_pos_ref = torch.zeros(self.num_envs, self.num_dofs, dtype=torch.float, device=self.device)
         self.default_dof_pos = torch.zeros(1, self.num_dofs, dtype=torch.float, device=self.device)
         for i in range(self.num_dofs):
@@ -368,6 +374,8 @@ class GoalPose(BaseTask):
         self.filtered_lin_vel[env_ids] = 0.0
         self.filtered_ang_vel[env_ids] = 0.0
         self.cmd_resample_time[env_ids] = 0
+        # 리셋은 순간이동이라, 넘겨받은 체공시간은 이번 에피소드의 스윙이 아니다.
+        self.feet_air_time[env_ids] = 0.0
 
         self.delay_steps[env_ids] = torch.randint(0, self.cfg["control"]["decimation"], (len(env_ids),), device=self.device)
         self.extras["time_outs"] = self.time_out_buf
@@ -1043,6 +1051,40 @@ class GoalPose(BaseTask):
         max_lateral_vel = self.cfg["rewards"]["feet_offset_vel_scale_y"]
         vel_scale = torch.clamp((1.0 - torch.abs(lateral_vel) / max_lateral_vel) ** 2, min=0.0, max=1.0)
         return y_reward * vel_scale
+
+    def _reward_feet_air_time(self):
+        """Reward the swing duration that actually occurred, at touchdown.
+
+        feet_swing is defined ON the gait phase: it pays when a foot is not in
+        contact during the window the clock scheduled for it. That makes the
+        clock load-bearing -- remove it and nothing rewards lifting a foot at
+        all, so the robot stops stepping. This is the standard phase-free
+        replacement: measure how long the foot was airborne and pay for it when
+        it lands.
+
+        Two guards matter. The reward is gated on the OTHER foot being down,
+        which restores the alternation the phase used to enforce for free --
+        without it, hopping on both feet scores the same as walking. And it is
+        gated on a live gait clock, so stand goals (which freeze the clock at 0)
+        still get no stepping incentive; that keeps the existing standing
+        mechanism working even though the clock no longer drives the reward.
+        """
+        contact = self.feet_contact
+        # 착지 순간: 공중에 있던 시간이 쌓여 있고 지금 닿았다.
+        first_contact = (self.feet_air_time > 0.0) & contact
+        self.feet_air_time = self.feet_air_time + self.dt
+        other_down = (contact[:, [1, 0]] if len(self.feet_indices) == 2
+                      else torch.ones_like(contact))
+        target = float(self.cfg["rewards"].get("feet_air_time_target", 0.10))
+        clip = float(self.cfg["rewards"].get("feet_air_time_clip", 0.30))
+        credit = (self.feet_air_time - target).clamp(max=clip)
+        rew = torch.sum(credit * (first_contact & other_down).float(), dim=-1)
+        # 닿은 발의 누적을 지운다. 보상을 읽은 뒤여야 한다.
+        self.feet_air_time = self.feet_air_time * (~contact).float()
+        live = self.gait_frequency > 1.0e-8
+        if live.dim() > 1:
+            live = live.squeeze(-1)
+        return rew * live.float()
 
     def _reward_feet_swing(self):
         left_swing = (torch.abs(self.gait_process - 0.25) < 0.5 * self.cfg["rewards"]["swing_period"]) & (self.gait_frequency > 1.0e-8)
