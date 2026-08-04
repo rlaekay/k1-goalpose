@@ -396,6 +396,42 @@ I3A_ARMS = {
     "I3a_jointcal3": merge(_I3_BASE, _jointcal(3.0)),
 }
 
+# R3b -- stance width.  The deployed policy walks with its feet 7.0 cm apart
+# centre to centre (8-31), and the foot is 7.0 cm wide, so the commanded gait has
+# the feet touching.  On the real robot they collide and it falls after three
+# steps.  Nothing asks for anything else: feet_offset_x and feet_offset_y are
+# both at scale 0, so a narrow stance is free -- it cuts lateral CoM travel and
+# saves feet_slip and energy, and on a flat floor with no latency it costs
+# nothing at all.
+#
+# Only the scale needs changing.  _reward_feet_offset_y already exists, the
+# target channel commands[:,9] is live at 0, feet_distance_ref is 0.18 so a
+# target of 0 means exactly an 18 cm stance, and the lateral-speed rolloff
+# (feet_offset_vel_scale_y 0.3) already relaxes the term for sidesteps.
+#
+# The scale must be NEGATIVE: the function returns clip(|error|, 0, 0.1), an
+# unsigned magnitude, so a positive scale would pay the policy to stand wrong.
+#
+# Sizing is measured, not guessed.  _prepare_reward_function multiplies by dt
+# (0.02), and the term saturates at 0.1, so the per-step contribution is
+# scale * 0.002.  Against the live terms at their operating point --
+# constellation +0.070, feet_swing +0.060, goal_reached +0.020 -- a scale of
+# -0.5 would be -0.001, which is nothing.  -10 gives -0.020, the size of
+# goal_reached; -30 gives -0.060, the size of feet_swing.  That brackets
+# "noticeable" against "as strong as the gait term itself".
+#
+# Note the saturation: at the current 7 cm stance the error is 11 cm, past the
+# 0.1 clip, so there is no local gradient there -- only a constant penalty that
+# makes the sub-10 cm region preferable. The p90 tail at 11.5 cm is inside the
+# clip and does have one.
+_I3_STANCE_BASE = merge(_I2_BASE, _I2_DR)
+
+I3B_ARMS = {
+    "I3b_stance10": merge(_I3_STANCE_BASE, {"rewards.scales.feet_offset_y": -10.0}),
+    "I3b_stance30": merge(_I3_STANCE_BASE, {"rewards.scales.feet_offset_y": -30.0}),
+}
+
+
 ARMS_ON_E0 = {"I0a_repro", "I0b_foot", "I0c_h055", "I0d_h058",
               "I1a_base", "I1b_force", "I1c_cadence", "I1d_both",
               "I2a_dr", "I2b_terrain", "G1_speed", "G2_robust", "G3_full"}
@@ -415,7 +451,7 @@ def set_dotted(cfg, dotted, value):
 # raised KeyError before it ever reached the per-arm is_v8 branch below --
 # G4 has never successfully generated a config, let alone run its smoke test.
 ALL_ARMS = dict(**ARMS, **F_ARMS, **I_ARMS, **I1_ARMS, **I2_ARMS, **I3_ARMS,
-                **I3A_ARMS, **V8_ARMS)
+                **I3A_ARMS, **I3B_ARMS, **V8_ARMS)
 
 # GPU 0 / GPU 1 split. F-batch: F1+F2 share GPU 0 (lighter, no disturbance),
 # F3 gets GPU 1 to itself (disturbance + higher flicker rate is the heavier one).
@@ -439,6 +475,8 @@ GPU_OF = {
     "I2a_dr": "cuda:0", "I2b_terrain": "cuda:1",
     "I3_rough": "cuda:0",
     "I3a_jointcal10": "cuda:0",
+    "I3b_stance10": "cuda:0",
+    "I3b_stance30": "cuda:1",
     "I3a_jointcal3": "cuda:1",
 }
 
