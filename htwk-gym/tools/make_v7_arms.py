@@ -480,13 +480,15 @@ L_ARMS = {
     # 그걸 따를 이유가 없어진다. 스스로 타이밍을 만들면 위상 자유가 증명되고, 그때
     # 채널을 지우는 것은 값싼 후속 작업이다.
     #
-    # 스케일은 feet_swing의 실제 기여에 맞췄다. feet_swing은 사이클의 40%에서 1.0을
-    # 주므로 3.0 x dt x 0.4 = 0.024/step. air_time은 착지에서만(초당 4회) 값이
-    # 나오고 크기는 0.14-0.10 = 0.04이므로 step당 평균 0.0032. 같은 기여를 내려면
-    # 375다. 희소 보상이라 스케일이 커 보이는 것이지 세다는 뜻이 아니다.
+    # 스케일은 추정이 아니라 실측 비율로 맞췄다. 절대값은 에피소드 길이에 따라
+    # 움직이므로 같은 run 안에서 constellation 대비 비율을 본다:
+    #   stance10  feet_swing/constellation = 32.04/102.26 = 0.313
+    #   L3 smoke(375) feet_air_time/constellation = 3.96/5.58 = 0.709  -> 2.3배 과함
+    # 175면 0.331로 거의 같아진다. 희소 보상이라 스케일 숫자가 커 보이는 것이지
+    # 세다는 뜻이 아니다 -- 착지에서만 값이 나온다.
     "L3_phasefree": merge(_L_BASE, {
         "rewards.scales.feet_swing": 0.0,
-        "rewards.scales.feet_air_time": 375.0,
+        "rewards.scales.feet_air_time": 175.0,
     }),
 }
 
