@@ -2195,6 +2195,13 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
             "goal_dy": _cmds.get("goal_dy"),
             "resampling_time_s": _cmds.get("resampling_time_s"),
         },
+        # 같은 이유로 관절 영점 DR도 남긴다. --joint_encoder_bias_rad는 arm의 config를
+        # 양방향으로 덮어쓰므로(--force_profile과 같은 원리), 파일만 보고 "이 실행에
+        # drift가 걸렸나"를 알 수 없으면 drift ON/OFF 셀을 뒤바꿔 읽게 된다.
+        "sampled_joint_dr": {
+            k: ((cfg.get("randomization", {}) or {}).get(k) or {}).get("range")
+            for k in ("joint_encoder_bias", "joint_target_offset")
+        },
         "experiment_description": cfg.get("basic", {}).get("description", ""),
         "date": time.strftime("%Y-%m-%d %H:%M:%S"),
         "seed": seed,

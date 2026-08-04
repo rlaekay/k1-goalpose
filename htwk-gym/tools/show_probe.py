@@ -41,6 +41,16 @@ def show(path):
         d.get("eval_terrain"), d.get("force_profile"), d.get("segments_completed")))
     print("  goal_dx %s  goal_dy %s  resample %s s" % (
         cm.get("goal_dx"), cm.get("goal_dy"), cm.get("resampling_time_s")))
+    jd = d.get("sampled_joint_dr")
+    if jd is not None:
+        eb = jd.get("joint_encoder_bias")
+        import math as _mm
+        deg = ("%.1f도" % _mm.degrees(eb[1])) if eb and eb[1] else "0"
+        print("  관절 영점 DR: encoder %s / target %s  -> ±%s" % (
+            eb, jd.get("joint_target_offset"), deg))
+    else:
+        print("  관절 영점 DR: 미기록 — 이 실행은 조건을 파일에 안 남겼다."
+              " 경로/체크포인트로만 구분된다")
     dur = d.get("duration_s") or 0
     ne = d.get("num_envs") or 0
     n = d.get("segments_completed") or 0
