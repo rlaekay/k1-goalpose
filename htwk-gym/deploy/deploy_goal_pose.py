@@ -1197,9 +1197,15 @@ class Controller:
         behaviour the stand portion of the training set never contained, and the
         robot marches in place.
 
-        Setting policy.gait_frequency to 0 also freezes gait_process, since it
-        is computed as fmod(t * gait_frequency, 1), so both the command channel
-        and the clock inputs match the stand case.
+        Setting policy.gait_frequency to 0 also freezes gait_process, so both the
+        command channel and the clock inputs match the stand case. That holds
+        only because the phase is integrated, as training does; the closed form
+        this wrapper used first would have snapped it to 0 here instead. See
+        GoalPosePolicy.advance_gait_clock.
+
+        feet_swing is itself gated on gait_frequency > 0 (goal_pose.py:1048), so
+        a non-zero clock at the goal also sits on a stepping incentive, and
+        goal_reached pays only while the base is below stop_speed_threshold.
 
         Separate stop/start thresholds keep it from chattering at the boundary.
         """
