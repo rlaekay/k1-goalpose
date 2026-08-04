@@ -486,6 +486,12 @@ L_ARMS = {
     #   L3 smoke(375) feet_air_time/constellation = 3.96/5.58 = 0.709  -> 2.3배 과함
     # 175면 0.331로 거의 같아진다. 희소 보상이라 스케일 숫자가 커 보이는 것이지
     # 세다는 뜻이 아니다 -- 착지에서만 값이 나온다.
+    # L1_long과 config가 같다. 바뀐 것은 config가 아니라 판정이다.
+    # L1은 --ref 0.0253 으로 죽었는데 그 값은 옛 발 관성에서 나온 것이고, 발이 29%
+    # 무거워진 로봇에게 옛 기준을 들이댄 것이었다. 낙상이 iteration 500에 이미 18로
+    # 시작부터 높았던 것도 점진적 악화가 아니라 재적응의 시작점이다. 이번에는 새
+    # 동역학에서 뽑은 기준(L1 @500 = 0.0284)으로, 훨씬 관대하게 보면서 끝까지 간다.
+    "L4_settle": merge(_L_BASE),
     "L3_phasefree": merge(_L_BASE, {
         "rewards.scales.feet_swing": 0.0,
         "rewards.scales.feet_air_time": 175.0,
@@ -540,6 +546,7 @@ GPU_OF = {
     "L1_long": "cuda:0",
     "L2_cadence": "cuda:0",
     "L3_phasefree": "cuda:1",
+    "L4_settle": "cuda:1",
     "I3b_stance30": "cuda:1",
     "I3a_jointcal3": "cuda:1",
 }
