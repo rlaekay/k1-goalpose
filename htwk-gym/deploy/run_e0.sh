@@ -9,6 +9,11 @@
 #   ./run_e0.sh                 # fixed goal (0,0,0), bring-up
 #   ./run_e0.sh ros             # mission mode, goal from Brain
 #   ./run_e0.sh fixed 0.2,0,0   # fixed goal, 0.2 m forward
+#
+# Anything after those two is passed through to deploy_goal_pose.py, so the
+# diagnostic runs do not need the long command either:
+#
+#   ./run_e0.sh fixed 0,0,0 --hold-prepare
 
 set -o pipefail
 cd "$(dirname "$0")"
@@ -21,9 +26,12 @@ export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}"
 
 SOURCE="${1:-fixed}"
 GOAL="${2:-0,0,0}"
+[ $# -gt 0 ] && shift
+[ $# -gt 0 ] && shift
 
 ARGS=(--config Goal_Pose_E0.yaml --net 127.0.0.1 --goal-source "$SOURCE")
 [ "$SOURCE" = "fixed" ] && ARGS+=(--goal "$GOAL")
+ARGS+=("$@")
 
 echo "starting: python3 deploy_goal_pose.py ${ARGS[*]}"
 python3 deploy_goal_pose.py "${ARGS[@]}"
