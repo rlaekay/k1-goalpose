@@ -121,6 +121,16 @@ def show(path):
     else:
         print("    미기록 (이 실행은 swing_apex 계측 이전이다)")
 
+    th = d.get("trunk_height_m")
+    if th:
+        print("\n  [몸통 높이 — 걸을 때 주저앉는가]")
+        print("    전체    median %.3f m  p10 %.3f m" % (th["median"], th["p10"]))
+        print("    이동중  median %.3f m  p10 %.3f m  (%d 표본)"
+              % (th["walking_median"], th["walking_p10"], th["n_walking"]))
+        print("    목표 %.3f m | 종료 임계 %.3f m | 이동중 처짐 %.0f mm"
+              % (th["target"], th["terminate_height"],
+                 1000 * (th["target"] - th["walking_median"])))
+
     fs = d.get("foot_support")
     print("\n  [지지 상태 — 낙상 개수를 대체하는 연속량]")
     if fs:

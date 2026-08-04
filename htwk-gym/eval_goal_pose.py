@@ -957,6 +957,15 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     # "The feet keep coming together" cannot be triaged without it -- a narrow
     # stance in sim means the policy chose it, and a wide one means the hardware
     # is doing something the policy did not ask for.
+    # Trunk height, overall and while actually walking.  base_height is a -20
+    # reward against a 0.55 m target, so sim should hold it -- but nothing has
+    # ever recorded what it holds, and "the torso sinks as it walks forward" is
+    # the third real-robot symptom in a row that sim cannot see.  Splitting by
+    # speed is the point: a policy that stands at target and sags while moving
+    # looks fine in any pooled statistic.
+    base_h_hist = np.zeros(120, dtype=np.int64)       # 0..1.2 m, 1 cm bins
+    base_h_walk_hist = np.zeros(120, dtype=np.int64)  # 같은 축, 이동 중만
+    base_h_max_m = 1.2
     stance_hist = np.zeros(100, dtype=np.int64)       # 0..0.5 m, 5 mm bins
     stance_hist_max_m = 0.5
     has_stance = hasattr(env, "get_feet_offset")
@@ -1366,6 +1375,23 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
         stability_counts["valid"] += int(valid_phase.sum().item())
         stability_counts["accel"] += int(accel_phase.sum().item())
         stability_counts["cruise"] += int(cruise_phase.sum().item())
+
+        # ---- trunk height, split by whether it is walking -----------------
+        if hasattr(env, "base_pos") and hasattr(env, "terrain"):
+            bh = (env.base_pos[:, 2]
+                  - env.terrain.terrain_heights(env.base_pos)).detach()
+            alive_h = (~done) & speed_valid
+            if bool(alive_h.any()):
+                hv = bh[alive_h].cpu().numpy()
+                np.add.at(base_h_hist, np.clip(
+                    (hv / base_h_max_m * len(base_h_hist)).astype(int),
+                    0, len(base_h_hist) - 1), 1)
+                wm = alive_h & (cur_speed > 0.5)
+                if bool(wm.any()):
+                    wv = bh[wm].cpu().numpy()
+                    np.add.at(base_h_walk_hist, np.clip(
+                        (wv / base_h_max_m * len(base_h_walk_hist)).astype(int),
+                        0, len(base_h_walk_hist) - 1), 1)
 
         # ---- support state / load share -----------------------------------
         if ss_run is not None:
@@ -1897,6 +1923,9 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     out["total_steps"] = total_steps
     out["instrumented"] = instrumented
     out["overlay_states"] = overlay_states
+    out["base_h_hist"] = base_h_hist
+    out["base_h_walk_hist"] = base_h_walk_hist
+    out["base_h_max_m"] = base_h_max_m
     out["stance_hist"] = stance_hist
     out["stance_hist_max_m"] = stance_hist_max_m
     out["support_steps"] = support_steps
@@ -2449,6 +2478,34 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
         }
     else:
         results["swing_apex_m"] = None
+
+    # ---- trunk height ----------------------------------------------------
+    bh_all = roll.get("base_h_hist")
+    bh_walk = roll.get("base_h_walk_hist")
+    bh_max = float(roll.get("base_h_max_m", 1.2))
+    if bh_all is not None and int(np.sum(bh_all)) > 0:
+        bh_edges = np.arange(len(bh_all)) * (bh_max / len(bh_all))
+
+        def _bh(hist, p):
+            tot = float(np.sum(hist))
+            if tot <= 0:
+                return float("nan")
+            cdf = np.cumsum(hist) / tot
+            i = int(np.searchsorted(cdf, p / 100.0))
+            return float(bh_edges[min(i, len(bh_edges) - 1)])
+
+        results["trunk_height_m"] = {
+            "target": float((cfg.get("rewards", {}) or {}).get(
+                "base_height_target", float("nan"))),
+            "terminate_height": float((cfg.get("rewards", {}) or {}).get(
+                "terminate_height", float("nan"))),
+            "median": _bh(bh_all, 50), "p10": _bh(bh_all, 10),
+            "walking_median": _bh(bh_walk, 50) if bh_walk is not None else float("nan"),
+            "walking_p10": _bh(bh_walk, 10) if bh_walk is not None else float("nan"),
+            "n_walking": int(np.sum(bh_walk)) if bh_walk is not None else 0,
+        }
+    else:
+        results["trunk_height_m"] = None
 
     # ---- support / load share --------------------------------------------
     sup = roll.get("support_steps")
