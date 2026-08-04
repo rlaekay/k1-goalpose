@@ -949,6 +949,18 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     ss_hist = np.zeros(150, dtype=np.int64)           # 0..3 s, 20 ms bins
     ss_hist_max_s = 3.0
     load_asym_hist = np.zeros(100, dtype=np.int64)    # 0..1
+    # Stance width -- the ABSOLUTE lateral distance between the feet, so it can be
+    # compared against a tape measure on the real robot.  get_feet_offset returns
+    # the deviation from rewards.feet_distance_ref, which is added back here.
+    # Nothing rewards this: feet_offset_x and feet_offset_y are both scale 0, so
+    # whatever width the policy uses is emergent and has never been looked at.
+    # "The feet keep coming together" cannot be triaged without it -- a narrow
+    # stance in sim means the policy chose it, and a wide one means the hardware
+    # is doing something the policy did not ask for.
+    stance_hist = np.zeros(100, dtype=np.int64)       # 0..0.5 m, 5 mm bins
+    stance_hist_max_m = 0.5
+    has_stance = hasattr(env, "get_feet_offset")
+    stance_ref = float((env.cfg.get("rewards", {}) or {}).get("feet_distance_ref", 0.0))
     # Swing apex height, per foot.  A foot only trips on what its LOWEST corner
     # fails to clear, and on a plane feet_swing stops paying once that corner is
     # 1 cm up -- so nothing in training asks for more and nothing in eval has
@@ -1383,6 +1395,12 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
                     np.add.at(load_asym_hist, np.clip(
                         (asym.detach().cpu().numpy() * len(load_asym_hist)).astype(int),
                         0, len(load_asym_hist) - 1), 1)
+                if has_stance and bool(both.any()):
+                    _, fy = env.get_feet_offset()
+                    w = (fy[both] + stance_ref).abs().detach().cpu().numpy()
+                    np.add.at(stance_hist, np.clip(
+                        (w / stance_hist_max_m * len(stance_hist)).astype(int),
+                        0, len(stance_hist) - 1), 1)
 
         # ---- swing apex ---------------------------------------------------
         if swing_apex is not None and prev_feet_contact is not None:
@@ -1879,6 +1897,8 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     out["total_steps"] = total_steps
     out["instrumented"] = instrumented
     out["overlay_states"] = overlay_states
+    out["stance_hist"] = stance_hist
+    out["stance_hist_max_m"] = stance_hist_max_m
     out["support_steps"] = support_steps
     out["ss_hist"] = ss_hist
     out["ss_hist_max_s"] = ss_hist_max_s
@@ -2438,6 +2458,11 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
         ss_max = float(roll.get("ss_hist_max_s", 3.0))
         ss_edges = np.arange(len(ssh)) * (ss_max / len(ssh))
         ss_cdf = np.cumsum(ssh) / max(float(np.sum(ssh)), 1.0)
+        stw = roll.get("stance_hist")
+        stw_max = float(roll.get("stance_hist_max_m", 0.5))
+        stw_edges = np.arange(len(stw)) * (stw_max / len(stw)) if stw is not None else None
+        stw_cdf = (np.cumsum(stw) / max(float(np.sum(stw)), 1.0)
+                   if stw is not None else None)
         la = roll.get("load_asym_hist")
         la_edges = np.arange(len(la)) / float(len(la))
         la_cdf = np.cumsum(la) / max(float(np.sum(la)), 1.0)
@@ -2464,6 +2489,15 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
                 "median": _p(la_edges, la_cdf, 50),
                 "p90": _p(la_edges, la_cdf, 90),
             } if float(np.sum(la)) > 0 else None,
+            # 절대 좌우 발 간격. 자로 잰 값과 직접 비교된다. 기준 feet_distance_ref.
+            "stance_width_m": {
+                "n": int(np.sum(stw)),
+                "p10": _p(stw_edges, stw_cdf, 10),
+                "median": _p(stw_edges, stw_cdf, 50),
+                "p90": _p(stw_edges, stw_cdf, 90),
+                "reference": float((cfg.get("rewards", {}) or {}).get(
+                    "feet_distance_ref", float("nan"))),
+            } if stw is not None and float(np.sum(stw)) > 0 else None,
         }
     else:
         results["foot_support"] = None

@@ -131,6 +131,12 @@ def show(path):
         if ss:
             print("    단일지지 구간  median %.2f s  p90 %.2f s  p99 %.2f s  (%d회)"
                   % (ss["median"], ss["p90"], ss["p99"], ss["n"]))
+        sw = fs.get("stance_width_m")
+        if sw:
+            print("    발 간격(양발 접지 중)  p10 %.1f cm  median %.1f cm  p90 %.1f cm"
+                  " | 기준 %.1f cm"
+                  % (100 * sw["p10"], 100 * sw["median"], 100 * sw["p90"],
+                     100 * sw["reference"]))
         la = fs.get("load_asymmetry")
         if la:
             print("    하중 비대칭 |L-R|/(L+R)  median %.2f  p90 %.2f  (%d 표본)"
