@@ -10,6 +10,7 @@ checkpoint actually installed (I2a_dr `model_150`, task `K1/Goal_Pose_V7`).
 
 | Item | Training | Deploy | |
 |---|---|---|---|
+| gait phase | `fmod(gait_process + dt*freq, 1)`, an integrator, never reset per env (`goal_pose.py:621`) | was `fmod(time_now*freq, 1)` | **fixed** |
 | obs layout | `3 grav + 3 angvel + 10 cmd + 2 clock + 12 dofpos + 12 dofvel + 12 act` | same | ok |
 | V7 obs override | `goal_pose_v7.py:746` calls `super()` then only writes `extras["v7"]` | n/a | ok |
 | leg slice | `_obs_dofs` is identity unless `arm_script_on`; this run has `arm_script.enabled: false` and the armsdown URDF, so 12 DOFs | `[10:22]` of 22 | ok |
@@ -22,6 +23,35 @@ checkpoint actually installed (I2a_dr `model_150`, task `K1/Goal_Pose_V7`).
 observation and action paths but are `apply_randomization` around zero, i.e.
 domain randomisation for quantities that are physically real on hardware.
 Deploy correctly has no counterpart.
+
+## Defect found: the gait phase was a closed form, not an integrator
+
+Training integrates the phase and never resets it per env; a zero frequency
+therefore *freezes* the phase where it stood. The wrapper computed
+`fmod(time_now * gait_frequency, 1)` instead. The two agree exactly while the
+frequency is constant, which is why this survived — but the arrival gate added
+in the previous fix makes the frequency change, and there they diverge:
+
+| | closed form | integrator |
+|---|---|---|
+| phase while stopped | snaps to 0 | frozen where it arrived |
+| `(cos, sin)` step at arrival | mean 1.272, max 1.996 | 0 |
+| `(cos, sin)` step at departure | mean 1.272, max 1.996 | one ordinary step |
+
+For scale, one ordinary 50 Hz walking step moves that pair by 0.251 and the
+largest possible move is 2.0. So the clock teleported by about five ordinary
+steps on average, up to eight, at both arrival and departure — in the same frame
+that `commands[3]` drops 2.0 → 0. Swept over 2250 arrival/stop timings.
+
+The gating fix introduced this. It would have shown up on the next hardware run
+as a disturbance exactly at the goal and again on departure, which is precisely
+where we would have been looking for policy problems.
+
+Fixed in `advance_gait_clock`, which also measures elapsed time rather than
+assuming the nominal interval (so 2 Hz is 2 Hz in wall clock under jitter) and
+clamps it (so an 8 s GetUp pause cannot wind the phase forward by 8 s).
+Regression test: `htwk-gym/deploy/tests/test_gait_clock.py`, 6 cases, including
+one that asserts the old closed form would fail the others.
 
 ## Confirms the arrival-gating fix
 
@@ -48,6 +78,14 @@ Two differences from the V7 baseline worth knowing when reading behaviour:
   default pose near the goal, so posture at arrival is whatever the other terms
   produce.
 - `base_height_target: 0.55` (baseline `0.52`), still at `-20.0` scale.
+
+## Method note
+
+Both gait-clock defects were of one shape: a deploy-side reimplementation that
+matched training in the common case and diverged in a corner, with a comment
+asserting the divergence was intended. The remaining wrapper arithmetic was
+re-derived from the training source rather than read for plausibility, which is
+what turned up the second one.
 
 ## Not answerable without hardware
 

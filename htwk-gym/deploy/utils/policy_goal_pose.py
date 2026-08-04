@@ -27,9 +27,22 @@ class GoalPosePolicy:
         30:42  dof_vel[legs]               * norm.dof_vel
         42:54  previous action
 
-    NOTE: E0 does NOT gate the gait clock / commands by gait_frequency the way
-    utils/policy.py does for ParameterWalk. The env always writes the goal
-    command and the gait clock, so we replicate that here (constant gait_freq).
+    Two things about the gait clock that this wrapper got wrong once each, so
+    they are written down rather than left to be rediscovered:
+
+    - ``gait_frequency`` IS gated. Training samples it as 0.0 for stand goals
+      ("No More Marching"), so holding a walking frequency at the goal is off
+      distribution, and ``feet_swing`` is itself gated on ``gait_frequency > 0``
+      -- a non-zero clock at the goal sits on a stepping incentive. The caller
+      owns that gate; see deploy_goal_pose._update_arrival_gait.
+    - ``gait_process`` is an INTEGRATOR, not ``fmod(t * freq, 1)``
+      (goal_pose.py:621). The difference is invisible at constant frequency but
+      not at the gate: integrating freezes the phase while stopped and resumes
+      from it, whereas the closed form teleports to 0 on arrival and to an
+      arbitrary phase on departure.
+
+    Unlike utils/policy.py for ParameterWalk, the clock channels are NOT zeroed
+    when the frequency is zero: goal_pose.py:802 writes raw cos/sin.
     """
 
     def __init__(self, cfg):
@@ -68,10 +81,11 @@ class GoalPosePolicy:
 
         self.gait_frequency = float(c["gait_frequency"])
         self.gait_process = 0.0
+        self._last_time = None
 
         self.num_obs = int(c["num_observations"])
         self.num_act = int(c["num_actions"])
-        self.leg_start = int(c.get("leg_dof_start", 11))
+        self.leg_start = int(c.get("leg_dof_start", 10))  # 10, not 11: this K1 has no waist
         self.action_scale = float(c["control"]["action_scale"])
         self.clip_actions = float(norm["clip_actions"])
         self.policy_interval = self.cfg["common"]["dt"] * c["control"]["decimation"]
@@ -119,10 +133,32 @@ class GoalPosePolicy:
     def _wrap_pi(a):
         return (a + np.pi) % (2.0 * np.pi) - np.pi
 
+    def advance_gait_clock(self, time_now):
+        """Integrate the gait phase, as goal_pose.py:621 does.
+
+        Must be an integrator, not ``fmod(time_now * gait_frequency, 1)``. The
+        two agree while the frequency is constant, so the closed form survived a
+        long time, but the caller now gates the frequency to 0 at the goal and
+        there they diverge badly: integrating freezes the phase and resumes from
+        it, while the closed form teleports to 0 on arrival and to an arbitrary
+        phase on departure -- a (cos, sin) step averaging 1.27 and reaching 1.996
+        out of a possible 2.0, against 0.251 for one ordinary 50 Hz walking step.
+
+        Elapsed time is measured rather than assumed, so 2 Hz is 2 Hz in wall
+        clock under loop jitter, and clamped so a long stall (fall recovery, a
+        blocked publish) cannot wind the phase forward by the whole gap.
+        """
+        if self._last_time is None:
+            dt = self.policy_interval
+        else:
+            dt = min(max(time_now - self._last_time, 0.0), 4.0 * self.policy_interval)
+        self._last_time = time_now
+        self.gait_process = float(np.fmod(self.gait_process + dt * self.gait_frequency, 1.0))
+        return self.gait_process
+
     def inference(self, time_now, dof_pos, dof_vel, base_ang_vel, projected_gravity,
                   goal_rel_x, goal_rel_y, heading_error):
-        # Gait clock advances continuously at a constant frequency (no gating).
-        self.gait_process = np.fmod(time_now * self.gait_frequency, 1.0)
+        self.advance_gait_clock(time_now)
 
         # Goal command, robot-local frame, clamped to the E0-trained goal range.
         self.commands[0] = float(np.clip(goal_rel_x, -self.goal_x_clamp, self.goal_x_clamp))
