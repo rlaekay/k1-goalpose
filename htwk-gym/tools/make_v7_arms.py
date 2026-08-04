@@ -432,6 +432,46 @@ I3B_ARMS = {
 }
 
 
+# ---- L batch: the first run longer than a screening -------------------------
+# Every round so far has been 200 iterations from E0's warm start, which is a
+# screening budget: it answers "is this lever going the right way", not "where
+# does it converge". Two things now make a long run worth its cost.
+#
+# First, the H batch's 12000-iteration collapse has identified causes that are
+# fixed -- 3-1's asset contamination and 8-10's base_com +/-0.1 fiction -- so
+# "long runs degrade here" is a claim that deserves retesting rather than
+# inheriting.
+#
+# Second, cadence coupling cannot be judged at 200. It changes the gait's
+# defining parameter, and I1c was warm-started from a fixed-2 Hz policy and
+# asked to relearn stride timing in 200 iterations. Its falls regression is
+# exactly the re-adaptation transient watch_eval's own docstring warns about:
+# I1b was over the line at 125 and 150 and clean at 175. 12000 iterations is the
+# first budget where "cadence hurts" and "cadence had not finished landing" are
+# distinguishable.
+#
+# base_height_target goes back to 0.52. The leg is 0.4607 m from hip to sole and
+# the trunk sits 0.062 above the hip, so 0.5227 m is the tallest this robot can
+# stand -- 0.55 is unreachable and its -20 penalty can never be satisfied, which
+# leaves a permanent "stand taller" pull with no saturation point. This is a
+# defect correction, not a lever, so it is in BOTH arms. It also restores the
+# assumption cadence_coupling was sized under: max_stride_m 0.28 is documented as
+# "~0.55 x leg length (base_height_target 0.52)".
+#
+# save_interval 250 instead of 25: 12000 iterations would otherwise write 480
+# checkpoints, and the selector samples a tail of 12 regardless.
+_L_BASE = merge(_I3_BASE, {
+    "rewards.scales.feet_offset_y": -10.0,     # R3b adopted (8-32)
+    "rewards.base_height_target": 0.52,        # 도달 가능한 최대. 8-33
+    "runner.save_interval": 250,
+})
+
+L_ARMS = {
+    "L1_long": merge(_L_BASE),
+    "L2_cadence": merge(_L_BASE, {"commands.cadence_coupling.enabled": True}),
+}
+
+
 ARMS_ON_E0 = {"I0a_repro", "I0b_foot", "I0c_h055", "I0d_h058",
               "I1a_base", "I1b_force", "I1c_cadence", "I1d_both",
               "I2a_dr", "I2b_terrain", "G1_speed", "G2_robust", "G3_full"}
@@ -451,7 +491,7 @@ def set_dotted(cfg, dotted, value):
 # raised KeyError before it ever reached the per-arm is_v8 branch below --
 # G4 has never successfully generated a config, let alone run its smoke test.
 ALL_ARMS = dict(**ARMS, **F_ARMS, **I_ARMS, **I1_ARMS, **I2_ARMS, **I3_ARMS,
-                **I3A_ARMS, **I3B_ARMS, **V8_ARMS)
+                **I3A_ARMS, **I3B_ARMS, **L_ARMS, **V8_ARMS)
 
 # GPU 0 / GPU 1 split. F-batch: F1+F2 share GPU 0 (lighter, no disturbance),
 # F3 gets GPU 1 to itself (disturbance + higher flicker rate is the heavier one).
@@ -476,6 +516,8 @@ GPU_OF = {
     "I3_rough": "cuda:0",
     "I3a_jointcal10": "cuda:0",
     "I3b_stance10": "cuda:0",
+    "L1_long": "cuda:0",
+    "L2_cadence": "cuda:1",
     "I3b_stance30": "cuda:1",
     "I3a_jointcal3": "cuda:1",
 }
