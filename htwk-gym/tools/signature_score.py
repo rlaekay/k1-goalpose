@@ -44,8 +44,34 @@ TARGET = {
     # (obs[30:42])이므로 정책이 이 4.5배를 직접 본다.
     "dq_ankR_L": 7.03, "dq_ankR_R": 8.87,
     "dq_hipP_L": 1.88, "dq_hipP_R": 2.10,
+    # 정책 출력의 주 진동수. 실기는 roll 액션이 3.30 Hz로 발진한다 -- 명령
+    # 케이던스 2.0 Hz도, MuJoCo의 4 Hz(두 걸음)도 아닌 값이다. 순수 지연 tau의
+    # 폐루프 한계주기가 대략 1/(4 tau)이므로 3.3 Hz는 tau ~ 75 ms를 시사한다.
+    # 그리고 실기 고관절 pitch는 0.30-1.35 Hz로 명령(2.0)보다 느리다 -- 발진과
+    # 보행 정지가 같이 일어난다.
+    "f_act_hipR_L": 3.30, "f_act_hipP_R": 0.30,
+    # 추종률: 명령 대비 실제 도달. 실기 median 0.61, MuJoCo 기본 0.93.
+    "track_median": 0.61,
 }
 DEG = 180.0 / math.pi
+
+
+def _dom_freq(x, dt, lo=0.25, hi=12.0, step=0.05):
+    """주 진동수. 표본이 적어(실기 91) FFT보다 느린 DFT 스캔이 안전하다."""
+    n = len(x)
+    mu = sum(x) / n
+    y = [v - mu for v in x]
+    best, bf = -1.0, lo
+    f = lo
+    while f <= hi:
+        w = 2 * math.pi * f * dt
+        re = sum(y[i] * math.cos(w * i) for i in range(n))
+        im = sum(y[i] * math.sin(w * i) for i in range(n))
+        a = math.hypot(re, im)
+        if a > best:
+            best, bf = a, f
+        f += step
+    return bf
 
 
 def measure(path, overlap_pct=None):
@@ -66,6 +92,17 @@ def measure(path, overlap_pct=None):
         "dq_ankR_L": rms(c("dq5")), "dq_ankR_R": rms(c("dq11")),
         "dq_hipP_L": rms(c("dq0")), "dq_hipP_R": rms(c("dq6")),
     }
+    dt = float(rows[1]["t_s"]) - float(rows[0]["t_s"]) or 0.02
+    m["f_act_hipR_L"] = _dom_freq(c("act1"), dt)
+    m["f_act_hipP_R"] = _dom_freq(c("act6"), dt)
+    DEF = [-0.2, 0.0, 0.0, 0.4, -0.25, 0.0] * 2
+    tr = []
+    for i in range(12):
+        t = [DEF[i] + float(r["act%d" % i]) for r in rows]
+        q = [float(r["q%d" % i]) for r in rows]
+        rt = max(t) - min(t)
+        tr.append((max(q) - min(q)) / rt if rt > 0 else 0.0)
+    m["track_median"] = sorted(tr)[6]
     if overlap_pct is not None:
         m["foot_overlap_pct"] = overlap_pct
     return m
