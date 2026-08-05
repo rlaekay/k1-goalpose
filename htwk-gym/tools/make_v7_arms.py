@@ -499,6 +499,56 @@ L_ARMS = {
 }
 
 
+# ---- M 배치: L에서 교란된 것을 풀고, 처음부터 학습을 처음으로 시도한다 ---------
+#
+# M1 — L 배치의 교란 해소. _L_BASE는 stance10 대비 **두 가지**를 동시에 바꿨다:
+#   (a) asset.file -> footfix urdf,  (b) base_height_target 0.55 -> 0.52.
+# 그래서 §8-35의 "발 관성 교정이 대가를 치른다"는 (a) 때문인지 (b) 때문인지 갈리지
+# 않는다. M1은 (a)만 바꾼다. stance10과의 차이가 발 관성 하나가 된다.
+#
+# M2 — 외력이 부족했는가. 지금 학습 외란은 collision 40-100 N / interval 8-14 s이고,
+# eval의 held-out은 50-120 N / 4-8 s다. 12배 노출에서도 판별력이 없었다(§8-37,
+# p=0.15). 두 해석이 남는다: "정책이 정말 강인하다" 또는 "이 크기가 애초에 이 로봇을
+# 흔들지 못한다". 후자면 더 큰 외력에서 갈려야 한다. 18.71 kg에 200 N을 0.15 s 주면
+# 충격량 30 N*s -> Δv 1.6 m/s로, 순항속도(1.48)를 넘겨 세우는 크기다.
+# 방향도 같이 넓힌다: 지금은 크기만 랜덤이고 방향은 코드가 정한다(사용자 지적).
+#
+# M3/M4 — 처음부터 학습. 지금까지 모든 arm이 warm start였고, 그래서 봉우리가 1250
+# 부근에서 서고 그 뒤로 흐른다. 이건 "학습"이 아니라 "미세조정"의 모양이다.
+# Booster 공식 T1.yaml은 num_envs 4096 / max_iterations 10000으로 **처음부터** 돈다.
+# L3(phase-free)가 1000에서 무너진 것도, 클럭을 따르도록 학습된 정책에게 클럭을 무시
+# 하라고 1000 iteration 준 것이라 재적응이 끝날 리가 없었다. 위상 자유가 가능한지는
+# 처음부터 돌려야 답이 나온다. M3는 같은 예산의 위상 기반 대조군이다 -- 둘 다 나쁘면
+# 원인은 위상이 아니라 from-scratch 예산이다.
+_M_BASE = merge(_I3_STANCE_BASE, {"rewards.scales.feet_offset_y": -10.0})
+
+_PHASEFREE = {
+    "rewards.scales.feet_swing": 0.0,
+    "rewards.scales.feet_air_time": 175.0,
+}
+
+M_ARMS = {
+    "M1_footfix": merge(_M_BASE, {
+        "asset.file": "resources/K1/K1_locomotion_armsdown_footfix.urdf",
+    }),
+    "M2_forcewide": merge(_M_BASE, {
+        "randomization.disturbance.interval_s": [3.0, 8.0],
+        "randomization.disturbance.collision.force_n": [40.0, 200.0],
+        "randomization.disturbance.collision.torque_nm": [3.0, 35.0],
+        "randomization.disturbance.collision.duration_s": [0.05, 0.15],
+        "randomization.disturbance.support.force_n": [3.0, 20.0],
+        "randomization.push_force.range": [0.0, 30.0],
+        "randomization.push_torque.range": [0.0, 4.0],
+    }),
+    "M3_scratch_phase": merge(_M_BASE),
+    "M4_scratch_phasefree": merge(_M_BASE, _PHASEFREE),
+}
+
+# M3/M4는 checkpoint 없이 돈다. utils/runner.py:167 `if not checkpoint: return`이
+# 그 경로이므로 train 명령에서 --checkpoint를 빼면 된다. SCRATCH_ARMS가 그 표식이다.
+SCRATCH_ARMS = {"M3_scratch_phase", "M4_scratch_phasefree"}
+
+
 ARMS_ON_E0 = {"I0a_repro", "I0b_foot", "I0c_h055", "I0d_h058",
               "I1a_base", "I1b_force", "I1c_cadence", "I1d_both",
               "I2a_dr", "I2b_terrain", "G1_speed", "G2_robust", "G3_full"}
@@ -518,7 +568,7 @@ def set_dotted(cfg, dotted, value):
 # raised KeyError before it ever reached the per-arm is_v8 branch below --
 # G4 has never successfully generated a config, let alone run its smoke test.
 ALL_ARMS = dict(**ARMS, **F_ARMS, **I_ARMS, **I1_ARMS, **I2_ARMS, **I3_ARMS,
-                **I3A_ARMS, **I3B_ARMS, **L_ARMS, **V8_ARMS)
+                **I3A_ARMS, **I3B_ARMS, **L_ARMS, **M_ARMS, **V8_ARMS)
 
 # GPU 0 / GPU 1 split. F-batch: F1+F2 share GPU 0 (lighter, no disturbance),
 # F3 gets GPU 1 to itself (disturbance + higher flicker rate is the heavier one).
@@ -549,6 +599,10 @@ GPU_OF = {
     "L4_settle": "cuda:1",
     "I3b_stance30": "cuda:1",
     "I3a_jointcal3": "cuda:1",
+    "M1_footfix": "cuda:0",
+    "M2_forcewide": "cuda:1",
+    "M3_scratch_phase": "cuda:0",
+    "M4_scratch_phasefree": "cuda:1",
 }
 
 
@@ -607,10 +661,17 @@ def main():
         ckpt = args.checkpoint or default_checkpoint(arm)
         print("# --- {} ({} overrides) -> {} ---".format(arm, len(patch) or "no", dev))
         task = "K1/Goal_Pose_V8" if is_v8 else "K1/Goal_Pose_V7"
+        # SCRATCH_ARMS는 warm start를 하지 않는다. utils/runner.py:167이
+        # `if not cfg["basic"]["checkpoint"]: return` 이므로 인자를 아예 빼면
+        # 처음부터 학습한다. --checkpoint를 빈 문자열로 주는 것이 아니다 --
+        # argparse가 그걸 문자열로 받아 config를 덮어쓰기 때문에 경로가 ""가 되고
+        # 그 뒤 torch.load가 아니라 falsy 검사에 걸려 조용히 통과할 뿐, 의도가
+        # 코드에 드러나지 않는다. 인자를 생략하는 쪽이 읽는 사람에게 정직하다.
+        ckpt_arg = "" if arm in SCRATCH_ARMS else "--checkpoint {} ".format(ckpt)
         print("python train_v7.py --task={task} --config {cfg} --headless True "
-              "--checkpoint {ckpt} --num_envs {ne} --max_iterations {mi} "
+              "{ckpt}--num_envs {ne} --max_iterations {mi} "
               "--sim_device {dev} --rl_device {dev}\n".format(
-                  task=task, cfg=path, ckpt=ckpt, ne=args.num_envs,
+                  task=task, cfg=path, ckpt=ckpt_arg, ne=args.num_envs,
                   mi=args.max_iterations, dev=dev))
 
 
