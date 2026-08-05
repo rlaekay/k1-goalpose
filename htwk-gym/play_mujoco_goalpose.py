@@ -137,6 +137,11 @@ def main():
                     help="mjcf=벤더/배포 값(45/30/30/45/20/20), urdf=학습 값(30/20/20/40/20/15)")
     ap.add_argument("--goal-hold", action="store_true",
                     help="목표를 로컬 2 m 앞에 고정한다(forward_hold). 도착하지 않으므로 계속 걷는다")
+    ap.add_argument("--stand", action="store_true",
+                    help="배포의 도착 상태를 그대로 재현한다: 목표 (0,0,0) + gait_frequency 0. "
+                         "이 조건은 학습에 있다 -- goal_categories.stand 10 %, 목표 거리 정확히 0, "
+                         "_reward_stand_posture 보상, 그리고 stand 목표는 클럭을 얼린다. "
+                         "deploy_goal_pose._update_arrival_gait가 실기에서 같은 상태를 만든다.")
     ap.add_argument("--foot-inertia", choices=["mjcf", "urdf"], default="mjcf",
                     help="발 관성을 어느 자산에서 가져올지. 같은 벤더의 두 파일이 다르다 -- "
                          "MJCF는 주모멘트 (0.000197, 0.000741, 0.000790)로 물리적으로 유효하고, "
@@ -182,6 +187,12 @@ def main():
     print("정책: %s" % cfg["policy"]["policy_path"])
 
     policy = GoalPosePolicy(cfg)          # 하드웨어에서 검증된 관측 규약 그대로
+    if args.stand:
+        # 배포가 도착에서 하는 것과 같다(deploy_goal_pose._update_arrival_gait).
+        # 클럭을 얼리지 않으면 정책은 제자리 행진을 한다 -- 학습에서 stand 목표는
+        # gait_frequency가 0이고, 0이 아닌 클럭은 feet_swing의 스텝 유인 위에 앉는다.
+        policy.gait_frequency = 0.0
+        print("stand 모드: gait_frequency = 0 (배포의 도착 상태와 동일)")
     dt = float(cfg["common"]["dt"])       # 0.002
     decim = int(cfg["policy"]["control"]["decimation"])  # 10 -> 50 Hz
     kp = np.array(cfg["common"]["stiffness"], dtype=np.float64)
@@ -293,7 +304,11 @@ def main():
         obs_dq = dq + (rng.normal(0.0, args.dofvel_noise, nj) if args.dofvel_noise > 0 else 0.0)
 
         if it % decim == 0:
-            if args.goal_hold:
+            if args.stand:
+                # 배포의 도착 상태. _update_arrival_gait가 stop_radius 안에서
+                # gait_frequency를 0으로 내리고, 정책은 그 조건을 학습에서 봤다.
+                grx, gry, herr = 0.0, 0.0, 0.0
+            elif args.goal_hold:
                 grx, gry, herr = 2.0, 0.0, 0.0    # 로컬 2 m 앞 고정 -> 도달하지 않는다
             else:
                 dx, dy = goal[0] - px, goal[1] - py
