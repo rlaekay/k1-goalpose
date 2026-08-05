@@ -546,6 +546,31 @@ _PHASEFREE = {
 # 사용자가 실기에서 본 "발이 중심을 못 잡고 왔다갔다"가 그 모양이다.
 _FOOTFIX2 = {"asset.file": "resources/K1/K1_locomotion_armsdown_footfix2.urdf"}
 
+# ⛔⛔ footfix2도 틀렸다. 로봇에 직접 붙어 실물 URDF를 읽고 확정했다
+# (~/Workspace/test_deploy/tasks/scratch_curriculum/assets/K1_locomotion.urdf):
+#
+#   | | 실물 | 우리 학습 | footfix(원본) | footfix2 |
+#   | 총 질량 | 19.6660 | 18.7142 | 18.9328 | 18.7142 |
+#   | 발 질량 | 0.49400 | 0.38305 | 0.49400 ✅ | 0.38305 |
+#   | 발 ixx/iyy/izz | 0.000261/0.001170/0.001213 | 0.002020/0.007410/0.000785 | 동일 ✅ | 0.000202/0.000741/0.000785 |
+#
+# 즉 실물은 **더 무거운 다른 리비전**이고, 내 "10배 소수점 오타" 추론은 낡은 MJCF를
+# 기준으로 삼아 틀렸다. footfix(원본)의 발이 실물이었다 -- 내가 그걸 "다른 리비전"이라며
+# 폐기한 것이 오판이었다.
+#
+# 그리고 차이가 발뿐이 아니다:
+#   * 링크 22개 전부 실물이 무겁다 (+0.952 kg, +5.1 %)
+#   * Hip_Pitch 원점 z가 15 mm 낮다
+#   * 팔 자세가 다르다 -- 실물 어깨 ±1.35 rad(77°), 우리 armsdown ±1.5708(90°).
+#     배포가 실제로 잡는 값은 ±1.3이라 실물 쪽이 맞다. 3-1이 다시 나온 것이다.
+#
+# 그래서 발만 이식하지 않고 **자산을 통째로 바꾼다.** K1_robot_boxfoot.urdf는
+# 실물 URDF 그대로에 발 충돌만 우리 상자(0.16 x 0.07 x 0.032 @ 0.014,0,-0.008)로
+# 되돌린 것이다 -- 실물 URDF는 발 충돌이 메시인데, 그 메시는 발목 하우징까지 포함해
+# 두께가 5.2 cm다. 실제 접촉면은 3.2 cm 상자이고 벤더 MJCF도 같은 상자를 쓴다.
+# 검증: 총 19.6660 kg, 관성 위반 0건, 충돌 기하 구성은 기존 학습 자산과 동일.
+_ROBOT_ASSET = {"asset.file": "resources/K1/K1_robot_boxfoot.urdf"}
+
 M_ARMS = {
     "M1_footfix": merge(_M_BASE, {
         "asset.file": "resources/K1/K1_locomotion_armsdown_footfix.urdf",
@@ -564,8 +589,12 @@ M_ARMS = {
     # from-scratch 두 arm은 footfix2 위에서 돈다. 발 오타는 레버가 아니라 결함이고,
     # 물리적으로 불가능한 로봇으로 5.7시간을 처음부터 학습시킬 이유가 없다.
     # 둘 다 같은 발을 신으므로 M3 대 M4(위상 대 위상없음) 비교는 그대로 성립한다.
-    "M3_scratch_phase": merge(_M_BASE, _FOOTFIX2),
-    "M4_scratch_phasefree": merge(_M_BASE, _FOOTFIX2, _PHASEFREE),
+    # 실물 자산 위에서 처음부터. 이전 M3/M4는 footfix2(틀린 리비전)로 돌다가
+    # 575 / 2175 iteration에서 중단했다.
+    "M3_scratch_phase": merge(_M_BASE, _ROBOT_ASSET),
+    "M4_scratch_phasefree": merge(_M_BASE, _ROBOT_ASSET, _PHASEFREE),
+    # 실물 자산 + warm start. stance10과의 차이가 "자산" 하나다.
+    "M7_robotasset": merge(_M_BASE, _ROBOT_ASSET),
 }
 
 # M3/M4는 checkpoint 없이 돈다. utils/runner.py:167 `if not checkpoint: return`이
@@ -628,6 +657,7 @@ GPU_OF = {
     "M3_scratch_phase": "cuda:0",
     "M4_scratch_phasefree": "cuda:1",
     "M5_footfix2": "cuda:0",
+    "M7_robotasset": "cuda:0",
 }
 
 
