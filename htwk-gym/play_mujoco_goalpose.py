@@ -194,6 +194,9 @@ def main():
                          " (deploy_goal_pose.py:1273, 500 Hz에서 y=0.8y+0.2x)."
                          " 학습 sim에는 이 필터가 없다 -- tau 8.9 ms, fc 17.8 Hz,"
                          " 정책 1 tick(20 ms) 뒤 도달률 89.3 %.")
+    ap.add_argument("--dump-csv", default=None,
+                    help="실기 deploy --log-timing과 **동일한 컬럼**으로 매 정책 tick을 "
+                         "남긴다. 가설 없이 두 로그를 같은 축에 겹쳐 보기 위한 것이다.")
     ap.add_argument("--out", default="logs/mujoco/result.json")
     args = ap.parse_args()
 
@@ -314,7 +317,19 @@ def main():
     # 실기와 같은 지표를 낸다: 관절별 |tau| 분위수와 부호전환 횟수.
     tau_hist = [[] for _ in range(nj)]
     hiproll_hist = []
+    dump_fp = None
+    if args.dump_csv:
+        os.makedirs(os.path.dirname(args.dump_csv) or ".", exist_ok=True)
+        dump_fp = open(args.dump_csv, "w", buffering=1)
+        dump_fp.write(",".join(
+            ["t_s", "low_state_age_s", "tick_dt_s", "tilt_deg", "roll", "pitch",
+             "gx", "gy", "gz", "walking", "gait_freq", "gait_process",
+             "goal_x", "goal_y", "heading_err"]
+            + ["q%d" % i for i in range(12)] + ["dq%d" % i for i in range(12)]
+            + ["tau%d" % i for i in range(12)] + ["act%d" % i for i in range(12)]) + "\n")
     tau_prev = np.zeros(nj)
+    applied_prev = np.zeros(nj)
+    tilt_rad_prev = 0.0
     tau_flips = np.zeros(nj, dtype=int)
     nsteps = int(args.duration / dt)
     targets = np.copy(default_q)
@@ -369,6 +384,14 @@ def main():
                 t, (q + joint_bias).astype(np.float32), obs_dq.astype(np.float32),
                 obs_w.astype(np.float32), obs_g.astype(np.float32),
                 grx, gry, herr)
+            if dump_fp is not None:
+                rr = math.atan2(R[2, 1], R[2, 2]); pp = math.asin(-max(-1.0, min(1.0, R[2, 0])))
+                head = [t, 0.001, period_s, math.degrees(tilt_rad_prev), rr, pp,
+                        ang_vel[0], ang_vel[1], ang_vel[2],
+                        1.0, policy.gait_frequency, policy.gait_process, grx, gry, herr]
+                body = (list(q[10:22]) + list(dq[10:22])
+                        + list(applied_prev[10:22]) + list(policy.actions[:12]))
+                dump_fp.write(",".join("%.5g" % float(v) for v in head + body) + "\n")
 
         # 필터는 정책 tick이 아니라 발행 루프(=물리 스텝)마다 돈다. 배포가 그렇다.
         if args.deploy_filter:
@@ -381,6 +404,7 @@ def main():
         # MuJoCo의 actuator forcerange가 여전히 자르므로, 클램프를 정말 풀려면
         # 모델 쪽 한계도 같이 올려야 한다. 아래 model.actuator_forcerange에서 처리.
         data.ctrl[:] = applied
+        applied_prev = applied.copy()
         hiproll_hist.append((float(q[11]), float(q[17])))
         for k in range(nj):
             a = float(applied[k])
@@ -395,6 +419,7 @@ def main():
         # 낙상 판정은 **참값** proj_g로 한다. 정책이 속은 것과 실제로 기운 것을
         # 섞지 않기 위해서다. 이름을 tilt로 쓰면 위의 tilt() 함수를 덮어쓴다.
         tilt_rad = math.acos(np.clip(-proj_g[2], -1.0, 1.0))
+        tilt_rad_prev = tilt_rad
         fallen = tilt_rad > fall_tilt
         if args.stand:
             # 서 있는 과제에는 도착도 구간도 없다. 재는 것은 두 가지다 --
