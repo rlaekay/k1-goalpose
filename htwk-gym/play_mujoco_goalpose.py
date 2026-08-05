@@ -96,6 +96,11 @@ def main():
                     help="mjcf=벤더/배포 값(45/30/30/45/20/20), urdf=학습 값(30/20/20/40/20/15)")
     ap.add_argument("--goal-hold", action="store_true",
                     help="목표를 로컬 2 m 앞에 고정한다(forward_hold). 도착하지 않으므로 계속 걷는다")
+    ap.add_argument("--deploy-filter", action="store_true",
+                    help="배포의 관절 목표 저역통과 필터를 재현한다"
+                         " (deploy_goal_pose.py:1273, 500 Hz에서 y=0.8y+0.2x)."
+                         " 학습 sim에는 이 필터가 없다 -- tau 8.9 ms, fc 17.8 Hz,"
+                         " 정책 1 tick(20 ms) 뒤 도달률 89.3 %.")
     ap.add_argument("--out", default="logs/mujoco/result.json")
     args = ap.parse_args()
 
@@ -167,6 +172,11 @@ def main():
 
     nsteps = int(args.duration / dt)
     targets = np.copy(default_q)
+    # 배포는 정책의 목표를 그대로 보내지 않는다. 500 Hz 발행 루프가
+    # filtered = 0.8*filtered + 0.2*target 로 걸러서 보낸다(deploy_goal_pose.py:1273).
+    # 학습 sim에는 이 필터가 없으므로, 이 플래그가 켜진 실행과 꺼진 실행의 차이가
+    # 곧 "학습이 모르는 배포 지연"의 비용이다.
+    filtered = np.copy(default_q)
     t = 0.0
 
     for it in range(nsteps):
@@ -191,7 +201,13 @@ def main():
                 ang_vel.astype(np.float32), proj_g.astype(np.float32),
                 grx, gry, herr)
 
-        tau = kp * (targets - q) - kd * dq
+        # 필터는 정책 tick이 아니라 발행 루프(=물리 스텝)마다 돈다. 배포가 그렇다.
+        if args.deploy_filter:
+            filtered[:] = filtered * 0.8 + targets * 0.2
+            cmd_q = filtered
+        else:
+            cmd_q = targets
+        tau = kp * (cmd_q - q) - kd * dq
         data.ctrl[:] = np.clip(tau, -lim, lim)
         mujoco.mj_step(model, data)
         t += dt
@@ -222,6 +238,10 @@ def main():
             data.qpos[7:7 + nj] = default_q
             data.qvel[:] = 0.0
             mujoco.mj_forward(model, data)
+            # 필터도 같이 리셋한다. 안 하면 리셋된 로봇이 넘어지기 직전의 목표를
+            # 물려받아, 스폰 직후 몇 십 ms를 엉뚱한 자세로 시작한다.
+            filtered[:] = default_q
+            targets = np.copy(default_q)
 
         if renderer is not None and it % frame_every == 0:
             cam = mujoco.MjvCamera()
