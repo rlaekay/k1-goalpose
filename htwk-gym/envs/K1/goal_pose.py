@@ -565,6 +565,15 @@ class GoalPose(BaseTask):
         self.goal_obs_bias[env_ids, 0:2] = apply_randomization(torch.zeros(len(env_ids), 2, device=self.device), bias_pos_cfg)
         self.goal_obs_bias[env_ids, 2] = apply_randomization(torch.zeros(len(env_ids), device=self.device), bias_head_cfg)
         self.goal_obs_hold_counter[env_ids] = 0
+        # 관측 지연은 그 로봇의 성질이지 매 스텝 흔들리는 값이 아니다. 에피소드마다
+        # 다시 뽑되 에피소드 안에서는 고정한다. 히스토리도 같이 지워야 한다 --
+        # 안 지우면 리셋된 env가 넘어지기 직전의 관측을 물려받는다(swing_apex를
+        # done에서 리셋하지 않았던 것과 같은 부류의 실수다).
+        cfg = self.cfg["noise"].get("obs_delay_steps")
+        if cfg and int(cfg[1]) > 0 and hasattr(self, "_obs_delay"):
+            self._obs_delay[env_ids] = torch.randint(
+                int(cfg[0]), int(cfg[1]) + 1, (len(env_ids),), device=self.device)
+            self._obs_hist[:, env_ids] = self.obs_buf[env_ids]
 
     def _update_goal_state(self):
         """Recompute the goal position/heading relative to the robot's current local
@@ -858,7 +867,47 @@ class GoalPose(BaseTask):
             ),
             dim=-1,
         )
+        self._apply_obs_delay()
         self.extras["privileged_obs"] = self.privileged_obs_buf
+
+    def _apply_obs_delay(self):
+        """관측을 per-env로 지연시킨다. 학습이 유일하게 모델링하지 않던 축이다.
+
+        왜: `delay_steps`(goal_pose.py의 step)는 **액션** 쪽 0-18 ms 순수지연이고,
+        관측 쪽 지연은 0이다. 실기 대조에서 이 축만 증상을 재현했다 --
+        2026-08-05 MuJoCo signature 탐색에서 obs 지연 20 ms가
+
+            signature 점수  7.86(기본) -> 1.34   (최솟값)
+            다리 교차       2.3%(기본) -> 9.2%   (실기 9.9%)
+
+        로 실기의 "다리가 모이면서 발끼리 부딪혀 넘어짐"을 재현했다. 다른 어떤
+        레버도(IMU 바이어스, 마찰, 발 관성, 토크 상한, 정책 주기, 관절 영점)
+        교차를 재현하지 못했다 -- IMU 바이어스는 점수는 좋았지만 교차를 0.4%로
+        **줄였다.**
+
+        실기 `low_state_age`는 median 1 ms지만 그것은 **전송 구간만**이다.
+        센서 -> IMU 필터 -> SDK 발행 구간은 안 잡히고, 상보/칼만 필터의 실효
+        지연은 통상 10-40 ms다. 즉 1 ms 측정은 이 가설을 배제하지 못한다.
+
+        구현: obs_buf의 링 버퍼. per-env 지연은 리셋마다 뽑아 고정한다 --
+        실제 파이프라인 지연은 매 스텝 흔들리는 값이 아니라 그 로봇의 성질이다.
+        기본은 [0, 0]이라 키가 없거나 0이면 정확한 no-op이고 기존 arm은 무관하다.
+        """
+        cfg = self.cfg["noise"].get("obs_delay_steps")
+        if not cfg or int(cfg[1]) <= 0:
+            return
+        max_d = int(cfg[1])
+        if not hasattr(self, "_obs_hist") or self._obs_hist.shape[0] != max_d + 1:
+            # (지연+1, envs, obs) 링 버퍼. 처음에는 현재 관측으로 채운다 --
+            # 0으로 채우면 에피소드 시작마다 정책이 "중력 0"을 보게 된다.
+            self._obs_hist = self.obs_buf.unsqueeze(0).repeat(max_d + 1, 1, 1).clone()
+            self._obs_ptr = 0
+            self._obs_delay = torch.randint(int(cfg[0]), max_d + 1,
+                                            (self.num_envs,), device=self.device)
+        self._obs_ptr = (self._obs_ptr + 1) % (max_d + 1)
+        self._obs_hist[self._obs_ptr] = self.obs_buf
+        idx = (self._obs_ptr - self._obs_delay) % (max_d + 1)
+        self.obs_buf = self._obs_hist[idx, torch.arange(self.num_envs, device=self.device)]
 
     # ------------ reward functions----------------
     def _reward_survival(self):

@@ -320,6 +320,13 @@ noise:
     heading_rad: 0.5
                                 # randint per env); [0,0] = refresh every step (50Hz, v1 behavior).
                                 # Camera is ~20fps per K1 manual vs 50Hz control -> try [2,3].
+  # 관측 지연(제어 스텝 수). 학습이 유일하게 모델링하지 않던 축이다 --
+  # step()의 delay_steps는 **액션** 쪽 0-18 ms이고 관측 쪽은 0이다.
+  # 2026-08-05 MuJoCo signature 탐색에서 obs 지연 20 ms만이 실기의 "다리가
+  # 모이면서 발끼리 부딪혀 넘어짐"을 재현했다(교차 2.3% -> 9.2%, 실기 9.9%).
+  # 1 step = 20 ms. [0,0] = 정확한 no-op.
+  obs_delay_steps: [0, 0]
+
   gravity:
     range: [0., 0.01]
     operation: "additive"
