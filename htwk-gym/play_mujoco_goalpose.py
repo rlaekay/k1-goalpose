@@ -49,8 +49,20 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 import mujoco  # noqa: E402
 import yaml  # noqa: E402
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "deploy"))
-from utils.policy_goal_pose import GoalPosePolicy  # noqa: E402
+# `deploy/utils/`를 sys.path로 붙이면 안 된다 -- 저장소 루트에도 `utils/` 패키지가
+# 있어서(학습 쪽) `utils.policy_goal_pose`가 그쪽으로 해석돼 ModuleNotFoundError가 난다.
+# 파일 경로로 직접 적재해서 이름 충돌 자체를 없앤다.
+def _load_deploy_policy_class():
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "deploy", "utils", "policy_goal_pose.py")
+    spec = importlib.util.spec_from_file_location("_deploy_policy_goal_pose", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.GoalPosePolicy
+
+
+GoalPosePolicy = _load_deploy_policy_class()
 
 MJCF = "resources/K1/K1_serial.xml"
 DEPLOY_CFG = "deploy/configs/Goal_Pose_E0.yaml"
