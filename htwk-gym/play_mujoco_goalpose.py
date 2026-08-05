@@ -197,6 +197,13 @@ def main():
     ap.add_argument("--ankle-gain", type=float, default=1.0,
                     help="발목 4관절의 kp/kd를 이 배수로. 실기 대조에서 발목 pitch 토크가 "
                          "sim의 0.6-0.7배였다(궤적은 1.3배). 원인 미상이므로 결과만 흔든다.")
+    ap.add_argument("--filter-hz", type=float, default=None,
+                    help="배포 필터를 이 주기로만 적용한다(기본은 물리 스텝마다 = 500 Hz). "
+                         "deploy_goal_pose.py:1273의 filtered=0.8*filtered+0.2*target은 "
+                         "500 Hz 발행을 가정하고 고른 계수인데, _publish_cmd는 파이썬 루프에 "
+                         "time.sleep(0.001)이라 실제로는 훨씬 느릴 수 있다. 루프가 50 Hz면 "
+                         "차단주파수가 17.8 -> 1.78 Hz로 내려가 2 Hz 보행을 0.66으로 깎는다. "
+                         "실기 추종률 median이 0.61이고 MuJoCo는 0.93이다.")
     ap.add_argument("--leg-gain", type=float, default=1.0,
                     help="다리 12관절 전체의 kp/kd 배수. 실기의 명령 대비 실제 도달 비율"
                          "(추종률)이 median 0.61인데 MuJoCo는 0.93이다 -- 특히 HipP/Knee가"
@@ -359,6 +366,7 @@ def main():
 
     period_s = (args.period_ms / 1000.0) if args.period_ms else (dt * decim)
     next_infer = 0.0
+    next_filt = 0.0
     # 실기와 같은 지표를 낸다: 관절별 |tau| 분위수와 부호전환 횟수.
     tau_hist = [[] for _ in range(nj)]
     hiproll_hist = []
@@ -440,7 +448,12 @@ def main():
 
         # 필터는 정책 tick이 아니라 발행 루프(=물리 스텝)마다 돈다. 배포가 그렇다.
         if args.deploy_filter:
-            filtered[:] = filtered * 0.8 + targets * 0.2
+            # --filter-hz 가 주어지면 그 주기로만 갱신한다. 물리 스텝마다 돌리는 것이
+            # 500 Hz 발행에 해당하고, 느린 루프를 흉내내려면 갱신을 띄엄띄엄 해야 한다.
+            if args.filter_hz is None or t >= next_filt - 1e-9:
+                if args.filter_hz is not None:
+                    next_filt = t + 1.0 / args.filter_hz
+                filtered[:] = filtered * 0.8 + targets * 0.2
             cmd_q = filtered
         else:
             cmd_q = targets
