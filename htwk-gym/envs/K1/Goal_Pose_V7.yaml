@@ -511,6 +511,12 @@ rewards:
     feet_pitch: -0.1
     feet_offset_x: -0.        # disabled at milestone 2 (was velocity-scaled by old vx/vy command; see MASTERPLAN log)
     feet_offset_y: -0.        # disabled at milestone 2
+    # 좌우 발이 서로를 넘어서는 것에 대한 안전 제약. feet_offset_y가 평균 보폭을
+    # 맞추는 것과 달리 이것은 꼬리만 벌한다 -- 정상 보폭에서는 정확히 0이다.
+    # 실기 로그 재생 결과 좌우 발이 9.9 % 구간에서 겹치고 p1이 -16.35 cm인데
+    # (MuJoCo 2.3 % / -0.41) sim은 그 교차를 벌하지 않는다: MuJoCo에서 -20.6 cm
+    # 이상 겹치면 발-발 접촉이 0건으로 그냥 통과한다. 0 = 꺼짐(기존 arm 무영향).
+    feet_cross: -0.
     feet_air_time: 0.       # 위상 없는 대체물. L3에서만 켠다 (8-34)
     feet_swing: 3.
     # --- modular goal-reward alternatives, swap in by setting nonzero scales ---
@@ -541,6 +547,8 @@ rewards:
   feet_air_time_target: 0.10
   feet_air_time_clip: 0.30
   feet_distance_ref: 0.18
+  # 이 값보다 두 발이 가까워지면 기하학적으로 겹친다. 발 너비 0.07 m.
+  feet_min_gap: 0.07
   final_window_s: 0.0          # v3 Rudin timed gate; 0 = off
 
   # Goal-pose reward shaping (MASTERPLAN §성공 기준: median <=5cm/10cm p90, heading <=10deg)

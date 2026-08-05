@@ -614,6 +614,16 @@ M_ARMS = {
     # 1.3배였다 -- 각도는 크고 토크는 작다, 즉 발목이 지면을 못 민다. 원인은
     # 미확정이므로(평행 링크 가설은 교차결합 지표가 지지하지 않았다) 메커니즘을
     # 특정하지 않고 결과만 흔든다. 0.6이 실측 하단, 1.3은 반대쪽 여유다.
+    # 다리 교차 페널티. 실기 증언 "다리가 모이면서 발끼리 부딪혀서 넘어져"가
+    # 데이터에 있다 -- 좌우 발 겹침 9.9 % / p1 -16.35 cm (MuJoCo 2.3 % / -0.41).
+    # 그리고 sim은 그것을 벌하지 않는다: 깊게 겹치면 접촉이 0건으로 통과한다.
+    # 스케일은 constellation(최대 3.5) 대비 의미 있으면서 정상 보폭을 안 건드리는
+    # 크기로 잡았다 -- 페널티는 min_gap 아래로 파고든 미터 단위 깊이이므로
+    # 3 cm 겹침 = 0.03 * 20 = 0.6 이다.
+    "MA_feetcross": merge(_M_BASE, _ROBOT_ASSET, {"rewards.scales.feet_cross": -20.0}),
+    # 관측 지연 랜덤화. signature 탐색에서 다리 교차를 재현한 유일한 축이다
+    # (2.3 % -> 9.2 %, 실기 9.9 %). 1 step = 20 ms.
+    "MB_obsdelay": merge(_M_BASE, _ROBOT_ASSET, {"noise.obs_delay_steps": [0, 2]}),
     "M9_anklegain": merge(_M_BASE, _ROBOT_ASSET, {
         "randomization.ankle_gain": {
             "range": [0.6, 1.3], "operation": "scaling", "distribution": "uniform"},
@@ -683,6 +693,8 @@ GPU_OF = {
     "M7_robotasset": "cuda:0",
     "M8_jointcal2": "cuda:1",
     "M9_anklegain": "cuda:0",
+    "MA_feetcross": "cuda:1",
+    "MB_obsdelay": "cuda:0",
 }
 
 

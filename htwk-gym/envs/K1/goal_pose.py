@@ -1131,6 +1131,31 @@ class GoalPose(BaseTask):
         vel_scale = torch.clamp((1.0 - torch.abs(lateral_vel) / max_lateral_vel) ** 2, min=0.0, max=1.0)
         return y_reward * vel_scale
 
+    def _reward_feet_cross(self):
+        """좌우 발이 서로를 넘어서는 것을 벌한다. 안전 제약이지 자세 목표가 아니다.
+
+        왜 `feet_offset_y`로 부족한가: 그것은 **명목 보폭**을 추종하는 보상이라
+        평균을 맞추고, 순간적으로 다리가 교차하는 것은 벌하지 않는다. 실기 증언은
+        "다리가 모이면서 발끼리 부딪혀서 넘어져"이고, 실기 로그를 MuJoCo 운동학에
+        재생하니 좌우 발이 **9.9 % 구간에서 겹치고 p1이 −16.35 cm**다(MuJoCo 2.3 %,
+        p1 −0.41 cm). 평균 보폭은 정상인데 꼬리가 교차한다.
+
+        ⛔ 그리고 sim은 그 교차를 벌하지 않는다. 2026-08-06 확인: MuJoCo에서 좌우
+        발을 인위적으로 겹치면 −4.7 cm에서 접촉 6건, −12.8 cm에서 2건, **−20.6 cm
+        이상에서 0건**이다 -- 깊게 교차하면 그냥 통과한다. 실기의 p1(−16.4 cm)은
+        접촉이 거의 사라지는 구간이다. 즉 정책은 교차를 피할 이유를 학습한 적이 없고,
+        sim에서는 공짜인 행동이 실기에서는 넘어지는 원인이 된다.
+
+        `get_feet_offset`의 y는 이미 `feet_distance_ref`를 뺀 상대 오프셋이므로,
+        절대 간격은 `|y + ref|`다. 그것이 두 발 반폭의 합(발 너비)보다 좁아지면
+        기하학적으로 겹친다. 그 아래로 파고든 만큼만 벌한다 -- 정상 보폭 구간에서는
+        정확히 0이라 기존 보상과 충돌하지 않는다.
+        """
+        _, feet_y_offset = self.get_feet_offset()
+        gap = torch.abs(feet_y_offset + self.cfg["rewards"]["feet_distance_ref"])
+        min_gap = self.cfg["rewards"].get("feet_min_gap", 0.07)   # 발 너비 = 0.07 m
+        return torch.clip(min_gap - gap, min=0.0)
+
     def _reward_feet_air_time(self):
         """Reward the swing duration that actually occurred, at touchdown.
 
