@@ -278,6 +278,8 @@ def main():
     # 학습 sim에는 이 필터가 없으므로, 이 플래그가 켜진 실행과 꺼진 실행의 차이가
     # 곧 "학습이 모르는 배포 지연"의 비용이다.
     filtered = np.copy(default_q)
+    stand_tilt, stand_drift = [], []
+    px0 = py0 = 0.0          # stand 모드의 기준점: 첫 스텝의 위치
     t = 0.0
 
     for it in range(nsteps):
@@ -288,6 +290,8 @@ def main():
         ang_vel = data.qvel[3:6].copy()           # free joint: 각속도는 body frame
         px, py = data.qpos[0], data.qpos[1]
         yaw = math.atan2(R[1, 0], R[0, 0])
+        if it == 0:
+            px0, py0 = px, py
 
         # 감지 열화는 정책이 읽는 값에만 건다. 물리와 낙상 판정은 참값을 쓴다 --
         # 그래야 "정책이 속아서 넘어졌다"와 "실제로 기울었다"가 섞이지 않는다.
@@ -336,7 +340,14 @@ def main():
         # 섞지 않기 위해서다. 이름을 tilt로 쓰면 위의 tilt() 함수를 덮어쓴다.
         tilt_rad = math.acos(np.clip(-proj_g[2], -1.0, 1.0))
         fallen = tilt_rad > fall_tilt
-        if not args.goal_hold:
+        if args.stand:
+            # 서 있는 과제에는 도착도 구간도 없다. 재는 것은 두 가지다 --
+            # 넘어지는가, 그리고 제자리에 있는가(표류).
+            stand_tilt.append(math.degrees(tilt_rad))
+            stand_drift.append(math.hypot(px - px0, py - py0))
+            if fallen:
+                falls += 1
+        elif not args.goal_hold:
             dist = math.hypot(goal[0] - px, goal[1] - py)
             reached = dist < stop_r and abs(wrap_pi(goal[2] - yaw)) < stop_h
             timeout = (t - seg_t0) > 8.0
@@ -392,6 +403,16 @@ def main():
         # goal_hold에는 구간이 없다. 연속보행에서는 분당 낙상이 비교 단위다.
         "falls_per_min": round(falls / (args.duration / 60.0), 3),
     }
+    if args.stand:
+        res["mode"] = "stand"
+        res.pop("segments", None)
+        if stand_tilt:
+            res["tilt_deg"] = {"median": float(np.median(stand_tilt)),
+                               "p99": float(np.percentile(stand_tilt, 99)),
+                               "max": float(np.max(stand_tilt))}
+            res["drift_m"] = {"median": float(np.median(stand_drift)),
+                              "final": float(stand_drift[-1]),
+                              "max": float(np.max(stand_drift))}
     if arrivals:
         d = np.array([a[0] for a in arrivals])
         h = np.array([a[1] for a in arrivals])
