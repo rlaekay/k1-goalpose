@@ -197,6 +197,13 @@ def main():
     ap.add_argument("--ankle-gain", type=float, default=1.0,
                     help="발목 4관절의 kp/kd를 이 배수로. 실기 대조에서 발목 pitch 토크가 "
                          "sim의 0.6-0.7배였다(궤적은 1.3배). 원인 미상이므로 결과만 흔든다.")
+    ap.add_argument("--leg-gain", type=float, default=1.0,
+                    help="다리 12관절 전체의 kp/kd 배수. 실기의 명령 대비 실제 도달 비율"
+                         "(추종률)이 median 0.61인데 MuJoCo는 0.93이다 -- 특히 HipP/Knee가"
+                         " 실기 0.57-0.76 대 MuJoCo 0.98-1.01이다. 전역 구동 부족이"
+                         " 정책을 off-distribution으로 밀어내는지 본다: 정책은"
+                         " dof_pos-default를 관측하므로 '덜 움직였다'를 보고 더 크게"
+                         " 명령하며, 그 액션이 obs[42:54]로 되먹임된다.")
     ap.add_argument("--ankle-damp", type=float, default=1.0,
                     help="발목 4관절의 **kd만** 이 배수로. 실기 대조에서 발목 roll의 "
                          "관절속도 rms가 sim의 2.9-4.5배인데 토크는 1.1-1.3배로 정상이다. "
@@ -241,6 +248,10 @@ def main():
         for i in (14, 15, 20, 21):
             kp[i] *= args.ankle_gain; kd[i] *= args.ankle_gain
         print("발목 이득 x%.2f" % args.ankle_gain)
+    if args.leg_gain != 1.0:
+        for i in range(10, 22):
+            kp[i] *= args.leg_gain; kd[i] *= args.leg_gain
+        print("다리 전역 이득 x%.2f" % args.leg_gain)
     if args.ankle_damp != 1.0:
         for i in (14, 15, 20, 21):
             kd[i] *= args.ankle_damp
