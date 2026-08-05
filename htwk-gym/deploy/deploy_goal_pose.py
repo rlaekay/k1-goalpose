@@ -395,9 +395,26 @@ class FallMonitor:
 class Controller:
     def __init__(self, cfg_file, goal_source_mode="ros", initial_goal=None,
                  goal_topic=None, debug_topic=None,
-                 hold_prepare=False, prepare_settle_log_s=1.0) -> None:
+                 hold_prepare=False, prepare_settle_log_s=1.0,
+                 log_timing=None) -> None:
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
+
+        # 관측 지연 계측. policy_debug에도 low_state_age_sec가 실리지만
+        # _publish_policy_debug의 첫 줄이 goal_source_mode != "ros"면 즉시 반환이라
+        # fixed 모드에서는 아무것도 안 나온다 -- 지금까지의 실기 시험이 전부 fixed였다.
+        # 이 CSV는 goal source와 무관하게 남는다. 걷지 않아도 된다: 서 있기만 해도
+        # 루프는 50 Hz로 돌고 LowState는 계속 들어온다.
+        self._timing_fp = None
+        self._timing_t0 = 0.0
+        self._timing_last_tick = 0.0
+        if log_timing:
+            self._timing_fp = open(log_timing, "w", buffering=1, encoding="utf-8")
+            self._timing_fp.write(
+                "t_s,low_state_age_s,tick_dt_s,tilt_deg,walking,gait_freq,"
+                "goal_x,goal_y,heading_err\n")
+            self._timing_t0 = time.monotonic()
+            self.logger.info("[timing] logging to %s", log_timing)
 
         # Mode-transition instrumentation/behaviour knobs. See --hold-prepare.
         self.hold_prepare = bool(hold_prepare)
@@ -641,6 +658,13 @@ class Controller:
                 self.low_cmd_publisher.CloseChannel()
             if hasattr(self, "low_state_subscriber"):
                 self.low_state_subscriber.CloseChannel()
+            if self._timing_fp is not None:
+                try:
+                    self._timing_fp.close()
+                    self.logger.info("[timing] log closed")
+                except Exception:
+                    pass
+                self._timing_fp = None
             _restore_terminal()
 
     def _log_joint_deviation(self, tag, target_q):
@@ -1185,7 +1209,26 @@ class Controller:
             return
         self.dof_target[:] = dof_target
         self._publish_policy_debug(low_state_age, goal_status)
+        self._log_timing_row(low_state_age, goal_rel_x, goal_rel_y, heading_error)
         time.sleep(0.001)
+
+    def _log_timing_row(self, low_state_age, gx, gy, herr):
+        """관측 지연 한 줄. MuJoCo 스윕(§8-40)에서 이 값만 여유가 0이었다 --
+        10 ms 무사, 20 ms에서 흔들리고, 30-35 ms면 2-3 걸음마다 넘어진다.
+        실기가 그 구간에 있는지가 질문이고, 걷지 않아도 답이 나온다."""
+        if self._timing_fp is None:
+            return
+        now = time.monotonic()
+        dt_tick = (now - self._timing_last_tick) if self._timing_last_tick else 0.0
+        self._timing_last_tick = now
+        try:
+            self._timing_fp.write("%.4f,%.6f,%.6f,%.2f,%d,%.2f,%.3f,%.3f,%.4f\n" % (
+                now - self._timing_t0, low_state_age, dt_tick,
+                float(np.degrees(self._latest_tilt)), int(self._walking),
+                float(self.policy.gait_frequency), gx, gy, herr))
+        except Exception:
+            # 계측이 로봇을 멈추게 하면 안 된다.
+            self._timing_fp = None
 
     def _update_arrival_gait(self, goal_rel_x, goal_rel_y, heading_error):
         """Zero the gait clock once the goal is reached, with hysteresis.
@@ -1320,6 +1363,11 @@ if __name__ == "__main__":
                         help="After CUSTOM entry, hold and log ankle target-vs-measured "
                              "for this many seconds before the gait prompt. Tells drift "
                              "(no position servo) apart from oscillation (under-damped).")
+    parser.add_argument("--log-timing", type=str, default=None,
+                        help="관측 지연을 이 CSV에 50 Hz로 남긴다 (goal source 무관). "
+                             "MuJoCo 스윕에서 관측 지연만 여유가 0이었다 -- 10 ms 무사, "
+                             "30-35 ms면 2-3 걸음마다 낙상. 걷지 않아도 된다: 서 있기만 "
+                             "해도 루프는 50 Hz로 돌고 LowState는 계속 들어온다.")
     parser.add_argument("--prepare-settle-log-s", type=float, default=1.0,
                         help="Seconds to log measured-vs-commanded joint error right "
                              "after entering CUSTOM (0 disables).")
@@ -1342,6 +1390,7 @@ if __name__ == "__main__":
         debug_topic=args.debug_topic,
         hold_prepare=args.hold_prepare,
         prepare_settle_log_s=args.prepare_settle_log_s,
+        log_timing=args.log_timing,
     ) as controller:
         time.sleep(2)  # wait for channels
         print("Initialization complete.")
