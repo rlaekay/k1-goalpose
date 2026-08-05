@@ -101,19 +101,22 @@ def main():
             cmd.motor_cmd[i].kd = float(kd[i])
         pub.Write(cmd)
 
-    print("CUSTOM 진입 -- 측정 자세에서 시작해 %.1f초에 걸쳐 기본자세로 옮긴다" % 2.0)
+    # ⛔ 기본자세(서 있는 자세)로 램프하지 않는다. 엎드린 로봇에게 그것을 명령하면
+    # 바닥을 밀며 요동친다. 이 시험에 필요한 것은 발목이 자유롭게 움직이는 것뿐이고,
+    # 액추에이터->관절 매핑은 기구학적 성질이라 어떤 자세에서 재도 같다.
+    # 그래서 **진입 시점의 측정 자세를 그대로 붙든다.**
+    print("CUSTOM 진입 -- 현재 자세를 그대로 붙든다 (기본자세로 옮기지 않는다)")
     client.ChangeMode(RobotMode.kCustom)
     time.sleep(1.2)
-    start = np.array(state["q"], dtype=np.float32)
-    ramp_t0 = time.time()
-    while time.time() - ramp_t0 < 2.0:
+    q0 = np.array(state["q"], dtype=np.float32)      # 기준 자세 = 지금 자세
+    print("  기준 자세 발목(도): LAP %.1f LAR %.1f RAP %.1f RAR %.1f" % tuple(
+        math.degrees(q0[i]) for i in (L_AP, L_AR, R_AP, R_AR)))
+    hold_t0 = time.time()
+    while time.time() - hold_t0 < 1.5:
         if os.path.exists(ABORT):
             print("[abort]"); break
-        a = (time.time() - ramp_t0) / 2.0
-        a = a * a * (3 - 2 * a)                      # smoothstep, 배포와 같은 램프
-        send(start * (1 - a) + q0 * a)
+        send(q0)
         time.sleep(dt)
-    time.sleep(0.5)
 
     rows = []
     amp = math.radians(args.amp_deg)
