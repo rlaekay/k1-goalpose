@@ -365,8 +365,14 @@ def main():
                    help="이 iteration을 넘는 체크포인트는 후보에서 제외한다. 라운드가 "
                         "200 iter 설계인데 한 arm만 더 오래 돌았을 때, 그 arm의 tail만 "
                         "뽑히면 비교가 '레버'가 아니라 '추가 학습'을 재게 된다.")
+    p.add_argument("--fast", action="store_true",
+                   help="20 s 한 단계로 끝낸다(--stages 20 --keep '' 와 같다). "
+                        "arm 사이를 가릴 때 쓴다 -- 아래 주석의 해상도 한계를 보라.")
     p.add_argument("--tail_frac", type=float, default=0.6,
-                   help="search the last X of the iteration range (early checkpoints are never best)")
+                   help="후보를 예산에 맞추기 위한 것일 뿐이다. 기본값 0.6이 "
+                        "'이른 체크포인트는 최적일 리 없다'는 뜻은 아니다 -- "
+                        "L1_long의 봉우리는 1250이었고 2542가 아니었다. "
+                        "체크포인트 수가 max_candidates 이하면 애초에 물지 않는다.")
     p.add_argument("--include", default="", help="comma-separated iterations to force into the candidate set")
     p.add_argument("--terrain", choices=["as_trained", "plane"], default=None,
                    help="지형만 덮어쓴다. 기본은 arm의 자기 config -- 그래서 I2b_terrain은 "
@@ -387,6 +393,22 @@ def main():
     p.add_argument("--out", help="output dir (default: <first run_dir>/eval/select_<timestamp>)")
     args = p.parse_args()
 
+    # --fast: 20 s 한 단계. 근거는 추정이 아니라 두 번의 실측이다 --
+    # 2026-08-05의 L1peak/L3peak 두 실행에서 20 s 단계의 1위가 120 s 단계의 1위와
+    # **둘 다 일치**했다(L1 it 1250, L3 it 500). 60 s와 120 s 단계는 240+240초의
+    # 롤아웃을 더 쓰고 승자를 바꾸지 못했다.
+    #
+    # ⛔ 해상도 한계 -- 이걸 모르고 쓰면 안 된다. 같은 체크포인트의 과제오차가
+    # 20 s와 120 s 사이에서 0.2-0.3 cm 움직인다(L1 @1250: 3.8 -> 3.9 -> 3.7).
+    # 따라서 20 s가 가릴 수 있는 것은 **약 0.4 cm 이상 벌어진 차이**뿐이다.
+    #   * arm 사이 비교는 대개 그보다 크다 (phase-free 5.1 vs 위상기반 3.8) -> --fast 적합
+    #   * 한 arm 안에서 체크포인트 고르기는 0.1-0.3 cm 다툼이라 못 가린다.
+    #     그런데 그 구간에서는 **어느 것을 골라도 같다**는 뜻이기도 하다.
+    #     고원 안에서 아무거나 집는 것과 3단계를 다 도는 것의 결과가 같다.
+    if args.fast:
+        if args.stages != "20,60,120" or args.keep != "5,2":
+            p.error("--fast는 --stages/--keep과 같이 쓸 수 없다 (그 둘을 정하는 것이 --fast다)")
+        args.stages, args.keep = "20", ""
     stages = [float(s) for s in args.stages.split(",") if s.strip()]
     keep = [int(k) for k in args.keep.split(",") if k.strip()]
     if not stages:
