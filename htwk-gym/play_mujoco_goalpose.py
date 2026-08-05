@@ -175,6 +175,20 @@ def main():
                     help="토크 클램프를 푼다. sim은 URDF effort로 하드 클램프하는데 실기는 "
                          "deploy가 tau=0으로 온보드 PD에 맡겨 막지 않는다. 실기 2.4초에서 "
                          "Hip_Roll이 표본의 7-8%에서 학습 한계 20 N*m을 넘고 max 34였다.")
+    # ---- 관절 영점 오차 ----------------------------------------------------
+    # 학습에서 randomization.joint_encoder_bias / joint_target_offset은 선언만 돼
+    # 있고 [0, 0]으로 꺼져 있다. 배포 후보(stance10)도 그 상태로 학습됐다.
+    # 실제 영점 드리프트는 둘 다 일으킨다 -- 정책이 **보는** 값과 PD가 **겨누는**
+    # 값이 함께 틀어진다. 그래서 같은 크기로 같이 넣는다(학습의 _jointcal과 동일).
+    #
+    # 실기 2.4초의 특징: Hip_Roll이 13.5도 벌어지고 안 돌아오며, 토크 p99가 sim의
+    # 1.6배인데 **부호전환 주파수는 sim과 같다.** 진동이 아니라 "계속 세게 미는데
+    # 안 돌아온다"의 모양이고, 영점이 틀어졌을 때 정확히 그렇게 된다.
+    ap.add_argument("--joint-bias-deg", type=float, default=0.0,
+                    help="12개 다리 관절 전부에 독립 균일 [-v,+v] 영점 오차 (도). "
+                         "encoder(정책이 보는 값)와 target(PD가 겨누는 값)에 같이 넣는다.")
+    ap.add_argument("--hiproll-bias-deg", type=float, default=0.0,
+                    help="Hip_Roll 두 개에만 영점 오차 (도). 실기 증상이 그 축이다.")
     ap.add_argument("--deploy-filter", action="store_true",
                     help="배포의 관절 목표 저역통과 필터를 재현한다"
                          " (deploy_goal_pose.py:1273, 500 Hz에서 y=0.8y+0.2x)."
@@ -283,10 +297,23 @@ def main():
         return (v * math.cos(rad) + np.cross(k, v) * math.sin(rad)
                 + k * np.dot(k, v) * (1 - math.cos(rad)))
 
+    # 영점 오차: 다리 12관절에 대해 한 번 뽑아 실행 내내 고정한다(드리프트는 상수다).
+    joint_bias = np.zeros(nj)
+    if args.joint_bias_deg > 0:
+        b = math.radians(args.joint_bias_deg)
+        joint_bias[10:22] = rng.uniform(-b, b, 12)
+    if args.hiproll_bias_deg != 0.0:
+        b = math.radians(args.hiproll_bias_deg)
+        joint_bias[11] = b           # Left_Hip_Roll
+        joint_bias[17] = b           # Right_Hip_Roll
+    if np.any(joint_bias):
+        print("관절 영점 오차(도): %s" % np.round(np.degrees(joint_bias[10:22]), 2))
+
     period_s = (args.period_ms / 1000.0) if args.period_ms else (dt * decim)
     next_infer = 0.0
     # 실기와 같은 지표를 낸다: 관절별 |tau| 분위수와 부호전환 횟수.
     tau_hist = [[] for _ in range(nj)]
+    hiproll_hist = []
     tau_prev = np.zeros(nj)
     tau_flips = np.zeros(nj, dtype=int)
     nsteps = int(args.duration / dt)
@@ -339,7 +366,7 @@ def main():
                 grx, gry = c * dx - s * dy, s * dx + c * dy
                 herr = wrap_pi(goal[2] - yaw)
             targets = policy.inference(
-                t, q.astype(np.float32), obs_dq.astype(np.float32),
+                t, (q + joint_bias).astype(np.float32), obs_dq.astype(np.float32),
                 obs_w.astype(np.float32), obs_g.astype(np.float32),
                 grx, gry, herr)
 
@@ -349,11 +376,12 @@ def main():
             cmd_q = filtered
         else:
             cmd_q = targets
-        tau = kp * (cmd_q - q) - kd * dq
+        tau = kp * ((cmd_q + joint_bias) - q) - kd * dq
         applied = tau if args.no_torque_clamp else np.clip(tau, -lim, lim)
         # MuJoCo의 actuator forcerange가 여전히 자르므로, 클램프를 정말 풀려면
         # 모델 쪽 한계도 같이 올려야 한다. 아래 model.actuator_forcerange에서 처리.
         data.ctrl[:] = applied
+        hiproll_hist.append((float(q[11]), float(q[17])))
         for k in range(nj):
             a = float(applied[k])
             tau_hist[k].append(abs(a))
@@ -449,6 +477,13 @@ def main():
             "flips_per_s": round(tau_flips[10+k]/max(args.duration,1e-9),1),
         }
     res["torque"] = tq
+    if hiproll_hist:
+        hl = np.array([h[0] for h in hiproll_hist]); hr = np.array([h[1] for h in hiproll_hist])
+        res["hip_roll_deg"] = {
+            "L_median": round(float(np.degrees(np.median(hl))), 2),
+            "R_median": round(float(np.degrees(np.median(hr))), 2),
+            "L_range": round(float(np.degrees(hl.max() - hl.min())), 1),
+            "R_range": round(float(np.degrees(hr.max() - hr.min())), 1)}
     if args.stand:
         res["mode"] = "stand"
         res.pop("segments", None)
