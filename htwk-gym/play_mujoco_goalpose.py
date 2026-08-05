@@ -1,0 +1,253 @@
+"""Isaac Gym에서 학습한 GoalPose 정책을 MuJoCo에서 돌린다 (sim-to-sim 교차검증).
+
+왜 필요한가
+-----------
+sim에서 낙상률 0.06 %인데 실기에서 세 걸음이다. 두 가지가 가능하다:
+
+  (a) 정책이 Isaac Gym 특유의 물리(접촉 모델, solver, 관성)를 이용하고 있다
+  (b) 갭이 물리가 아니라 다른 데(하드웨어 지연, 영점, 평행 발목)에 있다
+
+**다른 엔진에서 돌려보면 갈린다.** MuJoCo에서도 잘 걸으면 (a)가 배제되고 남은 용의자가
+줄어든다. MuJoCo에서 무너지면 Isaac에서만 되는 정책을 학습해 온 것이고, 그건 실기에
+올리기 전에 sim 쪽에서 고쳐야 하는 문제다. Booster도 같은 이유로 `play_mujoco.py`를
+파이프라인에 두고 Isaac -> MuJoCo -> 실기 순으로 검증한다.
+
+관측을 다시 유도하지 않는다
+---------------------------
+관측 54칸을 여기서 새로 조립하면 그게 틀렸을 때 "MuJoCo에서 못 걷는다"가 정책 탓인지
+내 조립 탓인지 갈리지 않는다. 그래서 **하드웨어에서 이미 검증된**
+`deploy/utils/policy_goal_pose.py::GoalPosePolicy`를 그대로 쓴다. 배포와 같은 코드가
+같은 체크포인트를 같은 규약으로 읽는다.
+
+자산에 대해 알고 쓰는 것
+------------------------
+* `K1_serial.xml`은 팔이 **자유 관절**이다(학습 URDF는 팔이 고정). 여기서는 배포와
+  똑같이 22관절 전부를 PD로 잡는다 -- 즉 이 실행은 학습 sim보다 **실기에 가깝다.**
+* MJCF의 다리 `forcerange`는 **45/30/30/45/20/20**이고 이는 deploy config의
+  `common.torque_limit`과 일치한다. 학습이 쓰는 URDF의 `effort`는
+  **30/20/20/40/20/15**로 더 낮다. 즉 이 스크립트를 기본값으로 돌리면 정책은
+  **학습 때보다 33-50 % 관대한 토크 상한**에서 걷는다. 그것 자체가 실기 조건이므로
+  기본값으로 두되, `--torque-limits urdf`로 학습 조건도 잴 수 있게 한다.
+  둘의 차이가 크면 "토크 상한이 sim2real 갭"이라는 가설이 그 자리에서 증명된다.
+
+사용:
+    python play_mujoco_goalpose.py --duration 180 --video mj.mp4
+    python play_mujoco_goalpose.py --torque-limits urdf   # 학습과 같은 상한
+"""
+
+import os
+import sys
+import json
+import math
+import argparse
+
+import numpy as np
+
+# 헤드리스 서버에서 오프스크린 렌더링. mujoco를 import 하기 전에 정해야 한다.
+os.environ.setdefault("MUJOCO_GL", "egl")
+
+import mujoco  # noqa: E402
+import yaml  # noqa: E402
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "deploy"))
+from utils.policy_goal_pose import GoalPosePolicy  # noqa: E402
+
+MJCF = "resources/K1/K1_serial.xml"
+DEPLOY_CFG = "deploy/configs/Goal_Pose_E0.yaml"
+
+# 학습이 실제로 쓰는 상한(K1_locomotion_armsdown.urdf의 effort). 다리 12개, 좌우 동일.
+URDF_LEG_EFFORT = [30.0, 20.0, 20.0, 40.0, 20.0, 15.0] * 2
+
+
+def quat_to_mat(q):
+    """MuJoCo qpos[3:7]은 (w, x, y, z)다."""
+    w, x, y, z = q
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def wrap_pi(a):
+    return (a + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--duration", type=float, default=180.0, help="초")
+    ap.add_argument("--video", default=None, help="mp4 경로 (생략하면 렌더링 안 함)")
+    ap.add_argument("--fps", type=int, default=30)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--policy", default=None, help="TorchScript 경로 (기본: deploy config)")
+    ap.add_argument("--torque-limits", choices=["mjcf", "urdf"], default="mjcf",
+                    help="mjcf=벤더/배포 값(45/30/30/45/20/20), urdf=학습 값(30/20/20/40/20/15)")
+    ap.add_argument("--goal-hold", action="store_true",
+                    help="목표를 로컬 2 m 앞에 고정한다(forward_hold). 도착하지 않으므로 계속 걷는다")
+    ap.add_argument("--out", default="logs/mujoco/result.json")
+    args = ap.parse_args()
+
+    rng = np.random.default_rng(args.seed)
+    cfg = yaml.safe_load(open(DEPLOY_CFG, encoding="utf-8"))
+    if args.policy:
+        cfg["policy"]["policy_path"] = args.policy
+    # 배포 설정은 로봇 위의 상대 경로를 담고 있다. 서버에서는 저장소 기준으로 푼다.
+    pp = cfg["policy"]["policy_path"]
+    if not os.path.isabs(pp):
+        cand = os.path.join("deploy", pp.lstrip("./"))
+        cfg["policy"]["policy_path"] = cand if os.path.exists(cand) else pp
+    print("정책: %s" % cfg["policy"]["policy_path"])
+
+    policy = GoalPosePolicy(cfg)          # 하드웨어에서 검증된 관측 규약 그대로
+    dt = float(cfg["common"]["dt"])       # 0.002
+    decim = int(cfg["policy"]["control"]["decimation"])  # 10 -> 50 Hz
+    kp = np.array(cfg["common"]["stiffness"], dtype=np.float64)
+    kd = np.array(cfg["common"]["damping"], dtype=np.float64)
+    default_q = np.array(cfg["common"]["default_qpos"], dtype=np.float64)
+    nj = default_q.size                   # 22
+
+    model = mujoco.MjModel.from_xml_path(MJCF)
+    model.opt.timestep = dt
+    data = mujoco.MjData(model)
+
+    assert model.nu == nj, "actuator %d != joints %d" % (model.nu, nj)
+
+    # 토크 상한. MJCF는 이미 벤더 값을 담고 있으므로 mjcf 모드에서는 건드리지 않는다.
+    lim = model.actuator_forcerange[:, 1].copy()
+    if args.torque_limits == "urdf":
+        lim[10:22] = URDF_LEG_EFFORT
+        print("토크 상한: 학습(URDF effort) %s" % lim[10:16])
+    else:
+        print("토크 상한: 벤더 MJCF/배포 %s" % lim[10:16])
+
+    # 초기 자세: 기본 관절각으로 세우고, 발이 지면에 닿을 높이에서 떨어뜨린다.
+    data.qpos[:] = 0.0
+    data.qpos[2] = 0.60
+    data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
+    data.qpos[7:7 + nj] = default_q
+    data.qvel[:] = 0.0
+    mujoco.mj_forward(model, data)
+
+    renderer = None
+    frames = []
+    if args.video:
+        renderer = mujoco.Renderer(model, height=480, width=640)
+    frame_every = max(1, int(round(1.0 / (args.fps * dt))))
+
+    # ---- 목표 관리 ---------------------------------------------------------
+    gx, gy = float(cfg["policy"]["goal_clamp"]["x_m"]), float(cfg["policy"]["goal_clamp"]["y_m"])
+
+    def new_goal(px, py, yaw):
+        """학습 범위 안에서 로컬 목표를 뽑아 월드로 옮긴다."""
+        lx = rng.uniform(-gx, gx)
+        ly = rng.uniform(-gy, gy)
+        lh = rng.uniform(-np.pi, np.pi)
+        c, s = math.cos(yaw), math.sin(yaw)
+        return px + c * lx - s * ly, py + s * lx + c * ly, wrap_pi(yaw + lh)
+
+    yaw0 = 0.0
+    goal = new_goal(0.0, 0.0, yaw0)
+    seg_t0 = 0.0
+    arrivals, falls, segments = [], 0, 0
+    fall_tilt = float(cfg["safety"]["fall_tilt_limit_rad"])
+    stop_r = float(cfg["deploy_goal"]["stop_radius_m"])
+    stop_h = float(cfg["deploy_goal"]["stop_heading_rad"])
+
+    nsteps = int(args.duration / dt)
+    targets = np.copy(default_q)
+    t = 0.0
+
+    for it in range(nsteps):
+        q = data.qpos[7:7 + nj].copy()
+        dq = data.qvel[6:6 + nj].copy()
+        R = quat_to_mat(data.qpos[3:7])
+        proj_g = R.T @ np.array([0.0, 0.0, -1.0])
+        ang_vel = data.qvel[3:6].copy()           # free joint: 각속도는 body frame
+        px, py = data.qpos[0], data.qpos[1]
+        yaw = math.atan2(R[1, 0], R[0, 0])
+
+        if it % decim == 0:
+            if args.goal_hold:
+                grx, gry, herr = 2.0, 0.0, 0.0    # 로컬 2 m 앞 고정 -> 도달하지 않는다
+            else:
+                dx, dy = goal[0] - px, goal[1] - py
+                c, s = math.cos(-yaw), math.sin(-yaw)
+                grx, gry = c * dx - s * dy, s * dx + c * dy
+                herr = wrap_pi(goal[2] - yaw)
+            targets = policy.inference(
+                t, q.astype(np.float32), dq.astype(np.float32),
+                ang_vel.astype(np.float32), proj_g.astype(np.float32),
+                grx, gry, herr)
+
+        tau = kp * (targets - q) - kd * dq
+        data.ctrl[:] = np.clip(tau, -lim, lim)
+        mujoco.mj_step(model, data)
+        t += dt
+
+        # 낙상: 배포와 같은 판정(중력 벡터와 직립 사이 각). raw roll/pitch가 아니다.
+        tilt = math.acos(np.clip(-proj_g[2], -1.0, 1.0))
+        fallen = tilt > fall_tilt
+        if not args.goal_hold:
+            dist = math.hypot(goal[0] - px, goal[1] - py)
+            reached = dist < stop_r and abs(wrap_pi(goal[2] - yaw)) < stop_h
+            timeout = (t - seg_t0) > 8.0
+            if reached or timeout or fallen:
+                segments += 1
+                if fallen:
+                    falls += 1
+                else:
+                    arrivals.append((dist, abs(wrap_pi(goal[2] - yaw))))
+                goal = new_goal(px, py, yaw)
+                seg_t0 = t
+        elif fallen:
+            falls += 1
+
+        if fallen:
+            # 넘어지면 다시 세운다. 그래야 3분 영상이 첫 낙상에서 끝나지 않는다.
+            data.qpos[:] = 0.0
+            data.qpos[2] = 0.60
+            data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
+            data.qpos[7:7 + nj] = default_q
+            data.qvel[:] = 0.0
+            mujoco.mj_forward(model, data)
+
+        if renderer is not None and it % frame_every == 0:
+            cam = mujoco.MjvCamera()
+            mujoco.mjv_defaultCamera(cam)
+            cam.lookat[:] = [data.qpos[0], data.qpos[1], 0.35]
+            cam.distance, cam.azimuth, cam.elevation = 3.0, 130.0, -15.0
+            renderer.update_scene(data, camera=cam)
+            frames.append(renderer.render())
+
+    # ---- 결과 --------------------------------------------------------------
+    res = {
+        "policy": cfg["policy"]["policy_path"],
+        "torque_limits": args.torque_limits,
+        "duration_s": args.duration,
+        "mode": "goal_hold" if args.goal_hold else "goal_reach",
+        "segments": segments,
+        "falls": falls,
+    }
+    if arrivals:
+        d = np.array([a[0] for a in arrivals])
+        h = np.array([a[1] for a in arrivals])
+        te = np.hypot(d, h) * 100.0
+        res.update({
+            "arrivals": len(arrivals),
+            "pos_err_cm_median": float(np.median(d) * 100),
+            "heading_err_deg_median": float(np.degrees(np.median(h))),
+            "task_err_cm_median": float(np.median(te)),
+        })
+    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
+    json.dump(res, open(args.out, "w"), indent=2)
+    print(json.dumps(res, indent=2, ensure_ascii=False))
+
+    if frames:
+        import imageio
+        imageio.mimsave(args.video, frames, fps=args.fps, macro_block_size=1)
+        print("영상: %s (%d 프레임)" % (args.video, len(frames)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
