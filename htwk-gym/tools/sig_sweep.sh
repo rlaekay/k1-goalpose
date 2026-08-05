@@ -7,7 +7,8 @@
 #
 # 목표 지표(실기, 만충 2.4초): Hip_Roll 폭 29.8/45.4도, roll 액션 0.910/1.313,
 # 발목 pitch 토크 rms 6.92/7.26(sim보다 낮다), 몸통 roll 폭 35.3도.
-set -u
+# set -u 를 쓰지 않는다 -- conda.sh가 LD_LIBRARY_PATH 등 미설정 변수를 참조해
+# 활성화 전에 죽는다. gpu_queue.sh 주석에 같은 전례를 적어두고 또 반복했다.
 cd "$(dirname "$0")/.."
 source /mnt/DATA/workspace/ws_eungkyu/miniconda3/etc/profile.d/conda.sh
 conda activate k1goalpose
