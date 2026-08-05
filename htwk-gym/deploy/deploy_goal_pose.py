@@ -400,6 +400,27 @@ class Controller:
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
 
+
+        # Mode-transition instrumentation/behaviour knobs. See --hold-prepare.
+        self.hold_prepare = bool(hold_prepare)
+        self.prepare_settle_log_s = float(prepare_settle_log_s)
+        self._custom_mode_entered_monotonic = 0.0
+        self._prepare_q = None
+        self._joint_layout_checked = False
+
+        # --- fall recovery ---------------------------------------------------
+        # RECOVER_NONE while the policy is driving; anything else means the
+        # policy is suspended and the recovery sequence owns the robot.
+        self._recovery_phase = "none"
+        self._recovery_reason = ""
+        self._recovery_t0 = 0.0
+        self._recovery_count = 0
+        self._fall_events = []
+        self._latest_rpy = np.zeros(3, dtype=np.float32)
+
+        with open(cfg_file, "r", encoding="utf-8") as f:
+            self.cfg = yaml.load(f.read(), Loader=yaml.FullLoader)
+
         # 관측 지연 계측. policy_debug에도 low_state_age_sec가 실리지만
         # _publish_policy_debug의 첫 줄이 goal_source_mode != "ros"면 즉시 반환이라
         # fixed 모드에서는 아무것도 안 나온다 -- 지금까지의 실기 시험이 전부 fixed였다.
@@ -421,31 +442,18 @@ class Controller:
         self._timing_last_tick = 0.0
         if log_timing:
             self._timing_fp = open(log_timing, "w", buffering=1, encoding="utf-8")
-            self._timing_fp.write(
-                "t_s,low_state_age_s,tick_dt_s,tilt_deg,walking,gait_freq,"
-                "goal_x,goal_y,heading_err\n")
+            ls = int(self.cfg["policy"].get("leg_dof_start", 10))
+            cols = (["t_s", "low_state_age_s", "tick_dt_s", "tilt_deg",
+                     "roll", "pitch", "gx", "gy", "gz",
+                     "walking", "gait_freq", "gait_process",
+                     "goal_x", "goal_y", "heading_err"]
+                    + ["q%d" % i for i in range(12)]
+                    + ["dq%d" % i for i in range(12)]
+                    + ["tau%d" % i for i in range(12)]
+                    + ["act%d" % i for i in range(12)])
+            self._timing_fp.write(",".join(cols) + "\n")
             self._timing_t0 = time.monotonic()
             self.logger.info("[timing] logging to %s", log_timing)
-
-        # Mode-transition instrumentation/behaviour knobs. See --hold-prepare.
-        self.hold_prepare = bool(hold_prepare)
-        self.prepare_settle_log_s = float(prepare_settle_log_s)
-        self._custom_mode_entered_monotonic = 0.0
-        self._prepare_q = None
-        self._joint_layout_checked = False
-
-        # --- fall recovery ---------------------------------------------------
-        # RECOVER_NONE while the policy is driving; anything else means the
-        # policy is suspended and the recovery sequence owns the robot.
-        self._recovery_phase = "none"
-        self._recovery_reason = ""
-        self._recovery_t0 = 0.0
-        self._recovery_count = 0
-        self._fall_events = []
-        self._latest_rpy = np.zeros(3, dtype=np.float32)
-
-        with open(cfg_file, "r", encoding="utf-8") as f:
-            self.cfg = yaml.load(f.read(), Loader=yaml.FullLoader)
 
         # Joint vector length for THIS robot, from the config rather than the
         # SDK's B1JointCnt. See _init_low_state_values / _verify_joint_layout.
@@ -528,6 +536,9 @@ class Controller:
         self.dof_target = np.zeros(n, dtype=np.float32)
         self.filtered_dof_target = np.zeros(n, dtype=np.float32)
         self.dof_pos_latest = np.zeros(n, dtype=np.float32)
+        # tau_est는 원래 안 받았다. 덜덜 떠는 것이 토크 포화인지 진동인지
+        # 가르려면 이게 있어야 한다.
+        self.dof_tau = np.zeros(n, dtype=np.float32)
 
     def _init_communication(self) -> None:
         try:
@@ -636,6 +647,7 @@ class Controller:
             for i, motor in enumerate(low_state_msg.motor_state_serial):
                 self.dof_pos[i] = motor.q
                 self.dof_vel[i] = motor.dq
+                self.dof_tau[i] = motor.tau_est
 
     def _send_cmd(self, cmd: LowCmd):
         self.low_cmd_publisher.Write(cmd)
@@ -1265,11 +1277,21 @@ class Controller:
         now = time.monotonic()
         dt_tick = (now - self._timing_last_tick) if self._timing_last_tick else 0.0
         self._timing_last_tick = now
+        ls = int(self.cfg["policy"].get("leg_dof_start", 10))
         try:
-            self._timing_fp.write("%.4f,%.6f,%.6f,%.2f,%d,%.2f,%.3f,%.3f,%.4f\n" % (
-                now - self._timing_t0, low_state_age, dt_tick,
-                float(np.degrees(self._latest_tilt)), int(self._walking),
-                float(self.policy.gait_frequency), gx, gy, herr))
+            head = [now - self._timing_t0, low_state_age, dt_tick,
+                    float(np.degrees(self._latest_tilt)),
+                    float(self._latest_rpy[0]), float(self._latest_rpy[1]),
+                    float(self.base_ang_vel[0]), float(self.base_ang_vel[1]),
+                    float(self.base_ang_vel[2]),
+                    float(self._walking), float(self.policy.gait_frequency),
+                    float(self.policy.gait_process), gx, gy, herr]
+            body = (list(self.dof_pos[ls:ls + 12])
+                    + list(self.dof_vel[ls:ls + 12])
+                    + list(self.dof_tau[ls:ls + 12])
+                    + list(self.policy.actions[:12]))
+            self._timing_fp.write(
+                ",".join("%.5g" % float(v) for v in head + body) + "\n")
         except Exception:
             # 계측이 로봇을 멈추게 하면 안 된다.
             self._timing_fp = None
