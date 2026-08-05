@@ -85,6 +85,47 @@ def wrap_pi(a):
     return (a + np.pi) % (2.0 * np.pi) - np.pi
 
 
+# 학습이 쓰는 K1_locomotion_armsdown.urdf의 발 <inertial>. 링크 프레임 기준 전체 텐서.
+# 주모멘트로 풀면 (0.000783, 0.002022, 0.007410)이고 삼각부등식을 2.64배 위반한다 --
+# 어떤 실제 강체도 가질 수 없는 값이다. 벤더 MJCF는 같은 발을 (0.000197, 0.000741,
+# 0.000790)으로 적어 두었다. 둘 다 벤더가 준 파일이고 서로 2.7-9.4배 다르다.
+URDF_FOOT = {
+    "mass": "0.3831",
+    # MJCF fullinertia 순서: ixx iyy izz ixy ixz iyz
+    "fullinertia": "0.00202 0.00741 0.000785 0.0 -0.000053 0.0",
+}
+
+
+def _write_urdf_foot_variant(src):
+    """발 관성만 학습 URDF 값으로 바꾼 MJCF를 옆에 쓴다.
+
+    meshdir이 상대경로("meshes/")라 같은 디렉토리에 써야 메시가 풀린다.
+    원본은 건드리지 않는다 -- 벤더 자산을 덮어쓰면 다음 사람이 무엇을 보고 있는지
+    알 수 없게 된다(3-1이 그렇게 일어났다).
+    """
+    import re as _re
+    txt = open(src, encoding="utf-8").read()
+    n = 0
+
+    def sub(m):
+        nonlocal n
+        n += 1
+        return ('<inertial pos="%s" mass="%s" fullinertia="%s"/>'
+                % (m.group("pos"), URDF_FOOT["mass"], URDF_FOOT["fullinertia"]))
+
+    # foot_link 바디 안의 inertial만 바꾼다. quat/diaginertia는 fullinertia와
+    # 공존할 수 없으므로 통째로 교체한다.
+    for side in ("left", "right"):
+        pat = (r'(?s)(<body name="%s_foot_link".*?)<inertial\s+pos="(?P<pos>[^"]+)"'
+               r'[^/]*?/>' % side)
+        txt = _re.sub(pat, lambda m: m.group(1) + sub(m), txt, count=1)
+    if n != 2:
+        raise SystemExit("발 inertial 치환 실패: %d/2 -- 자산 구조가 바뀌었다" % n)
+    dst = os.path.join(os.path.dirname(src), "_k1_serial_urdffoot.xml")
+    open(dst, "w", encoding="utf-8").write(txt)
+    return dst
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--duration", type=float, default=180.0, help="초")
@@ -96,6 +137,13 @@ def main():
                     help="mjcf=벤더/배포 값(45/30/30/45/20/20), urdf=학습 값(30/20/20/40/20/15)")
     ap.add_argument("--goal-hold", action="store_true",
                     help="목표를 로컬 2 m 앞에 고정한다(forward_hold). 도착하지 않으므로 계속 걷는다")
+    ap.add_argument("--foot-inertia", choices=["mjcf", "urdf"], default="mjcf",
+                    help="발 관성을 어느 자산에서 가져올지. 같은 벤더의 두 파일이 다르다 -- "
+                         "MJCF는 주모멘트 (0.000197, 0.000741, 0.000790)로 물리적으로 유효하고, "
+                         "학습이 쓰는 URDF는 (0.000783, 0.002022, 0.007410)로 삼각부등식을 "
+                         "2.64배 위반한다(2.7-9.4배 과대). 기본 mjcf로 돌리면 MuJoCo는 "
+                         "**학습과 다른 발**을 신는다. urdf를 주면 학습과 같아진다 -- "
+                         "MuJoCo가 그 텐서를 받아주기만 한다면.")
     ap.add_argument("--deploy-filter", action="store_true",
                     help="배포의 관절 목표 저역통과 필터를 재현한다"
                          " (deploy_goal_pose.py:1273, 500 Hz에서 y=0.8y+0.2x)."
@@ -123,7 +171,14 @@ def main():
     default_q = np.array(cfg["common"]["default_qpos"], dtype=np.float64)
     nj = default_q.size                   # 22
 
-    model = mujoco.MjModel.from_xml_path(MJCF)
+    mjcf_path = MJCF
+    if args.foot_inertia == "urdf":
+        mjcf_path = _write_urdf_foot_variant(MJCF)
+        print("발 관성: 학습 URDF 값을 강제 (%s)" % mjcf_path)
+    else:
+        print("발 관성: 벤더 MJCF 값 (학습 URDF와 다르다 -- 2.7-9.4배 작고 물리적으로 유효)")
+
+    model = mujoco.MjModel.from_xml_path(mjcf_path)
     model.opt.timestep = dt
     data = mujoco.MjData(model)
 
