@@ -94,8 +94,15 @@ def _dom_freq(x, dt, lo=0.25, hi=12.0, step=0.05):
     return bf
 
 
-def measure(path, overlap_pct=None):
-    rows = list(csv.DictReader(open(path)))
+# 실기 로그의 길이. 모든 지표를 **이 길이의 창**에서 재고 median을 쓴다.
+# ⛔ 왜: 폭(range)·표류(drift) 같은 지표는 창이 길수록 커지거나(폭) 상쇄된다(표류).
+# 실기는 2.4초 91표본인데 sim은 25-40초로 재고 있었다. 그 상태로는 lag40의 표류가
+# 전체 적합에서 2.8도로 나오지만 91표본 창에서는 median 12.8도로 실기 13.5도와
+# 거의 같다 -- 순위가 통째로 뒤집힌다.
+REAL_WINDOW = 91
+
+
+def _measure_window(rows):
     if not rows or "q1" not in rows[0]:
         return None
     def c(k): return [float(r[k]) for r in rows]
@@ -123,9 +130,24 @@ def measure(path, overlap_pct=None):
         rt = max(t) - min(t)
         tr.append((max(q) - min(q)) / rt if rt > 0 else 0.0)
     m["track_median"] = sorted(tr)[6]
-    if overlap_pct is not None:
-        m["foot_overlap_pct"] = overlap_pct
     return m
+
+
+def measure(path, overlap_pct=None):
+    """실기 창 길이로 잘라 지표별 median을 낸다."""
+    rows = list(csv.DictReader(open(path)))
+    if not rows or "q1" not in rows[0]:
+        return None
+    W = min(REAL_WINDOW, len(rows))
+    step = max(1, W // 8)
+    wins = [_measure_window(rows[i:i + W]) for i in range(0, max(1, len(rows) - W + 1), step)]
+    wins = [w for w in wins if w]
+    if not wins:
+        return None
+    out = {k: sorted(w[k] for w in wins)[len(wins) // 2] for k in wins[0]}
+    if overlap_pct is not None:
+        out["foot_overlap_pct"] = overlap_pct
+    return out
 
 
 def score(m):
