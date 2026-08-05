@@ -440,6 +440,21 @@ randomization:
     operation: "additive"
     distribution: "uniform"
 
+  # 발목 전용 이득 오차. env는 goal_pose.py에서 이 키를 읽는다. 여기 no-op으로
+  # 선언해 두는 것은 joint_encoder_bias와 같은 이유다 -- set_dotted가 base에 없는
+  # 경로를 거부하므로, 선언이 없으면 arm이 이 레버를 켤 수 없다.
+  #
+  # 왜 발목만: 2026-08-05 실기 2.4초와 MuJoCo를 같은 48채널로 겹쳐 보니 발목
+  # pitch 토크 rms가 실기에서 sim의 0.6-0.7배인데 관절 궤적은 1.3배였다.
+  # 각도는 크고 토크는 작다 = 발목이 지면을 못 민다. 원인은 미확정이라
+  # (평행 링크 가설은 교차결합 지표가 지지하지 않았다) 결과만 흔든다.
+  #
+  # range [1.0, 1.0] + scaling = 정확한 no-op이므로 기존 arm은 영향 없다.
+  ankle_gain:
+    range: [1.0, 1.0]
+    operation: "scaling"
+    distribution: "uniform"
+
   base_com:
     range: [-0.1, 0.1]
     operation: "additive"
