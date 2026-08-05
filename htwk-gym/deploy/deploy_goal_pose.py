@@ -430,6 +430,8 @@ class Controller:
         # 중단 파일. 키보드 리스너와 시그널 전달을 모두 우회하는 정지 경로다.
         # 기본값을 켜 둔다 -- 정지 수단이 옵션이면 필요한 순간에 꺼져 있다.
         self._parallel_torque = bool(parallel_torque)
+        self._pub_last = 0.0
+        self._pub_dt = []
         self._abort_file = abort_file or "/tmp/e0_abort"
         # 지난 실행이 남긴 파일이 있으면 시작하자마자 중단된다. 시작 시 지운다.
         if self._abort_file and os.path.exists(self._abort_file):
@@ -447,7 +449,7 @@ class Controller:
             ls = int(self.cfg["policy"].get("leg_dof_start", 10))
             cols = (["t_s", "low_state_age_s", "tick_dt_s", "tilt_deg",
                      "roll", "pitch", "gx", "gy", "gz",
-                     "walking", "gait_freq", "gait_process",
+                     "walking", "gait_freq", "gait_process", "pub_hz",
                      "goal_x", "goal_y", "heading_err"]
                     + ["q%d" % i for i in range(12)]
                     + ["dq%d" % i for i in range(12)]
@@ -1287,7 +1289,10 @@ class Controller:
                     float(self.base_ang_vel[0]), float(self.base_ang_vel[1]),
                     float(self.base_ang_vel[2]),
                     float(self._walking), float(self.policy.gait_frequency),
-                    float(self.policy.gait_process), gx, gy, herr]
+                    float(self.policy.gait_process),
+                    (1.0 / (sum(self._pub_dt) / len(self._pub_dt)))
+                    if self._pub_dt else 0.0,
+                    gx, gy, herr]
             body = (list(self.dof_pos[ls:ls + 12])
                     + list(self.dof_vel[ls:ls + 12])
                     + list(self.dof_tau[ls:ls + 12])
@@ -1381,6 +1386,22 @@ class Controller:
                 continue
             self.next_publish_time += self.cfg["common"]["dt"]
 
+            # ⛔ 이 필터의 계수(0.8/0.2)는 **500 Hz 발행을 가정**하고 고른 값이다.
+            # 이 루프는 파이썬이고 time.sleep(0.001)이라 실제 발행률이 그보다
+            # 훨씬 낮을 수 있다. 낮으면 차단주파수가 같이 내려가 보행 자체를 깎는다:
+            #   500 Hz -> fc 17.8 Hz, 2 Hz 보행 감쇠 0.99
+            #   100 Hz -> fc  3.6 Hz,               0.87
+            #    50 Hz -> fc  1.8 Hz,               0.66
+            # 2026-08-05 실기 로그의 추종률(명령 대비 실제 도달)이 median 0.61인데
+            # MuJoCo는 0.93이다. 발행률이 50 Hz 근처면 그 차이가 필터만으로 설명된다.
+            # 그래서 **실제 발행률을 잰다.** 추론 루프도 설계 20 ms인데 실측
+            # 25.3 ms였으므로, 이 루프가 설계대로 돈다고 가정하면 안 된다.
+            _pub_now = time.monotonic()
+            if self._pub_last:
+                self._pub_dt.append(_pub_now - self._pub_last)
+                if len(self._pub_dt) > 2000:
+                    self._pub_dt.pop(0)
+            self._pub_last = _pub_now
             self.filtered_dof_target = self.filtered_dof_target * 0.8 + self.dof_target * 0.2
 
             for i in range(self.joint_cnt):
