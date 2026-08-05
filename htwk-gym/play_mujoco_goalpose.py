@@ -167,6 +167,14 @@ def main():
     ap.add_argument("--sense-lag-ms", type=float, default=0.0,
                     help="obs[0:6]에 순수 지연 (ms). 학습은 액션 쪽 0-18 ms만 모델링하고 "
                          "관측 쪽 지연은 전혀 없다")
+    ap.add_argument("--period-ms", type=float, default=None,
+                    help="정책 주기(ms). 기본은 config의 dt*decimation = 20 ms(50 Hz). "
+                         "실기 실측은 median 25.3 ms / p99 48 ms였다 -- 학습이 본 적 없는 값이다. "
+                         "액션 유지 시간이 길어지면 위상 지연이 생기고, 그것이 고주파 진동을 만든다.")
+    ap.add_argument("--no-torque-clamp", action="store_true",
+                    help="토크 클램프를 푼다. sim은 URDF effort로 하드 클램프하는데 실기는 "
+                         "deploy가 tau=0으로 온보드 PD에 맡겨 막지 않는다. 실기 2.4초에서 "
+                         "Hip_Roll이 표본의 7-8%에서 학습 한계 20 N*m을 넘고 max 34였다.")
     ap.add_argument("--deploy-filter", action="store_true",
                     help="배포의 관절 목표 저역통과 필터를 재현한다"
                          " (deploy_goal_pose.py:1273, 500 Hz에서 y=0.8y+0.2x)."
@@ -215,6 +223,10 @@ def main():
 
     # 토크 상한. MJCF는 이미 벤더 값을 담고 있으므로 mjcf 모드에서는 건드리지 않는다.
     lim = model.actuator_forcerange[:, 1].copy()
+    if args.no_torque_clamp:
+        model.actuator_forcerange[:, 0] = -1e4
+        model.actuator_forcerange[:, 1] = 1e4
+        print('토크 클램프 해제: MuJoCo actuator 한계도 함께 품')
     if args.torque_limits == "urdf":
         lim[10:22] = URDF_LEG_EFFORT
         print("토크 상한: 학습(URDF effort) %s" % lim[10:16])
@@ -271,6 +283,12 @@ def main():
         return (v * math.cos(rad) + np.cross(k, v) * math.sin(rad)
                 + k * np.dot(k, v) * (1 - math.cos(rad)))
 
+    period_s = (args.period_ms / 1000.0) if args.period_ms else (dt * decim)
+    next_infer = 0.0
+    # 실기와 같은 지표를 낸다: 관절별 |tau| 분위수와 부호전환 횟수.
+    tau_hist = [[] for _ in range(nj)]
+    tau_prev = np.zeros(nj)
+    tau_flips = np.zeros(nj, dtype=int)
     nsteps = int(args.duration / dt)
     targets = np.copy(default_q)
     # 배포는 정책의 목표를 그대로 보내지 않는다. 500 Hz 발행 루프가
@@ -307,7 +325,8 @@ def main():
         obs_w = s_w + (rng.normal(0.0, args.gyro_noise, 3) if args.gyro_noise > 0 else 0.0)
         obs_dq = dq + (rng.normal(0.0, args.dofvel_noise, nj) if args.dofvel_noise > 0 else 0.0)
 
-        if it % decim == 0:
+        if t >= next_infer - 1e-9:
+            next_infer = t + period_s
             if args.stand:
                 # 배포의 도착 상태. _update_arrival_gait가 stop_radius 안에서
                 # gait_frequency를 0으로 내리고, 정책은 그 조건을 학습에서 봤다.
@@ -331,7 +350,16 @@ def main():
         else:
             cmd_q = targets
         tau = kp * (cmd_q - q) - kd * dq
-        data.ctrl[:] = np.clip(tau, -lim, lim)
+        applied = tau if args.no_torque_clamp else np.clip(tau, -lim, lim)
+        # MuJoCo의 actuator forcerange가 여전히 자르므로, 클램프를 정말 풀려면
+        # 모델 쪽 한계도 같이 올려야 한다. 아래 model.actuator_forcerange에서 처리.
+        data.ctrl[:] = applied
+        for k in range(nj):
+            a = float(applied[k])
+            tau_hist[k].append(abs(a))
+            if a * tau_prev[k] < 0:
+                tau_flips[k] += 1
+            tau_prev[k] = a
         mujoco.mj_step(model, data)
         t += dt
 
@@ -402,7 +430,25 @@ def main():
         "falls": falls,
         # goal_hold에는 구간이 없다. 연속보행에서는 분당 낙상이 비교 단위다.
         "falls_per_min": round(falls / (args.duration / 60.0), 3),
+        "period_ms": round(period_s * 1000.0, 2),
+        "torque_clamped": not args.no_torque_clamp,
     }
+    LEGN = ["L_HipP","L_HipR","L_HipY","L_Knee","L_AnkP","L_AnkR",
+            "R_HipP","R_HipR","R_HipY","R_Knee","R_AnkP","R_AnkR"]
+    URDF_LIM = [30,20,20,40,20,15]*2
+    tq = {}
+    for k in range(12):
+        v = tau_hist[10 + k]
+        if not v: continue
+        a = np.array(v)
+        tq[LEGN[k]] = {
+            "p50": round(float(np.percentile(a,50)),2),
+            "p99": round(float(np.percentile(a,99)),2),
+            "max": round(float(a.max()),2),
+            "over_limit_pct": round(100.0*float((a > URDF_LIM[k]).mean()),1),
+            "flips_per_s": round(tau_flips[10+k]/max(args.duration,1e-9),1),
+        }
+    res["torque"] = tq
     if args.stand:
         res["mode"] = "stand"
         res.pop("segments", None)
