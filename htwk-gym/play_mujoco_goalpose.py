@@ -197,6 +197,13 @@ def main():
     ap.add_argument("--ankle-gain", type=float, default=1.0,
                     help="발목 4관절의 kp/kd를 이 배수로. 실기 대조에서 발목 pitch 토크가 "
                          "sim의 0.6-0.7배였다(궤적은 1.3배). 원인 미상이므로 결과만 흔든다.")
+    ap.add_argument("--ankle-damp", type=float, default=1.0,
+                    help="발목 4관절의 **kd만** 이 배수로. 실기 대조에서 발목 roll의 "
+                         "관절속도 rms가 sim의 2.9-4.5배인데 토크는 1.1-1.3배로 정상이다. "
+                         "속도는 높고 저항은 없다 = 감쇠 부족의 모양이고, kp/kd를 함께 "
+                         "흔드는 --ankle-gain으로는 이 축을 분리할 수 없다.")
+    ap.add_argument("--ankle-roll-damp", type=float, default=1.0,
+                    help="Ankle_Roll 두 관절만 kd 배수. 신호가 roll에 편중돼 있다.")
     ap.add_argument("--hip-roll-gain", type=float, default=1.0,
                     help="Hip_Roll 두 관절의 kp/kd 배수.")
     ap.add_argument("--lat-friction", type=float, default=None,
@@ -234,6 +241,14 @@ def main():
         for i in (14, 15, 20, 21):
             kp[i] *= args.ankle_gain; kd[i] *= args.ankle_gain
         print("발목 이득 x%.2f" % args.ankle_gain)
+    if args.ankle_damp != 1.0:
+        for i in (14, 15, 20, 21):
+            kd[i] *= args.ankle_damp
+        print("발목 감쇠 x%.2f" % args.ankle_damp)
+    if args.ankle_roll_damp != 1.0:
+        for i in (15, 21):
+            kd[i] *= args.ankle_roll_damp
+        print("발목 roll 감쇠 x%.2f" % args.ankle_roll_damp)
     if args.hip_roll_gain != 1.0:
         for i in (11, 17):
             kp[i] *= args.hip_roll_gain; kd[i] *= args.hip_roll_gain

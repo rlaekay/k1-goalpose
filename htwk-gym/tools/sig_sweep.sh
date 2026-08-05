@@ -47,3 +47,9 @@ run urdffoot --foot-inertia urdf 2>/dev/null || true
 
 echo "### 점수"
 python3 tools/signature_score.py "$D"/*.csv 2>&1 | tail -40
+
+echo "### 2단계: 발목 감쇠 (실기 발목 roll 속도가 sim의 2.9-4.5배, 토크는 정상)"
+for d in 0.2 0.35 0.5 0.7; do run ankdamp$d --ankle-damp $d; done
+for d in 0.1 0.2 0.35 0.5; do run arolldamp$d --ankle-roll-damp $d; done
+echo "### 2단계 점수"
+python3 tools/signature_score.py logs/mujoco/sig/*.csv 2>&1 | tail -45
