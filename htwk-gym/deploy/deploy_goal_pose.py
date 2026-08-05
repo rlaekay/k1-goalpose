@@ -396,7 +396,7 @@ class Controller:
     def __init__(self, cfg_file, goal_source_mode="ros", initial_goal=None,
                  goal_topic=None, debug_topic=None,
                  hold_prepare=False, prepare_settle_log_s=1.0,
-                 log_timing=None) -> None:
+                 log_timing=None, abort_file=None) -> None:
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
 
@@ -405,6 +405,17 @@ class Controller:
         # fixed 모드에서는 아무것도 안 나온다 -- 지금까지의 실기 시험이 전부 fixed였다.
         # 이 CSV는 goal source와 무관하게 남는다. 걷지 않아도 된다: 서 있기만 해도
         # 루프는 50 Hz로 돌고 LowState는 계속 들어온다.
+        # 중단 파일. 키보드 리스너와 시그널 전달을 모두 우회하는 정지 경로다.
+        # 기본값을 켜 둔다 -- 정지 수단이 옵션이면 필요한 순간에 꺼져 있다.
+        self._abort_file = abort_file or "/tmp/e0_abort"
+        # 지난 실행이 남긴 파일이 있으면 시작하자마자 중단된다. 시작 시 지운다.
+        if self._abort_file and os.path.exists(self._abort_file):
+            try:
+                os.remove(self._abort_file)
+                self.logger.info("[abort] 지난 실행의 %s 를 지웠다", self._abort_file)
+            except OSError:
+                pass
+
         self._timing_fp = None
         self._timing_t0 = 0.0
         self._timing_last_tick = 0.0
@@ -684,12 +695,39 @@ class Controller:
             float(np.sqrt(np.mean(err ** 2))),
         )
 
+    def _abort_requested(self, where):
+        """중단 파일이 생겼는가.
+
+        ⛔ 왜 필요한가: `sshkeyboard.listen_keyboard`가 터미널을 잡고 있으면
+        Ctrl-C가 파이썬 시그널 핸들러에 닿지 않는다. 2026-08-05 실기에서 `r`
+        프롬프트 대기 중 로봇이 넘어졌는데 **Ctrl-C, SIGINT, SIGTERM이 전부
+        안 먹혀** SIGKILL로 죽여야 했고, 그러면 cleanup()의
+        ChangeMode(kDamping)에 도달하지 못한다 -- 즉 넘어진 로봇의 관절을
+        소프트웨어로 놓아줄 방법이 없었다.
+
+        파일 감시는 키보드 리스너도 시그널 전달도 거치지 않는다. 원격에서
+        `touch <abort_file>` 하나로 정상 종료 경로(DAMPING 전환 포함)를 탄다.
+        """
+        if not self._abort_file:
+            return False
+        if os.path.exists(self._abort_file):
+            self.logger.warning("[abort] %s 감지 -- %s 에서 중단하고 DAMPING으로 나간다",
+                                self._abort_file, where)
+            try:
+                os.remove(self._abort_file)
+            except OSError:
+                pass
+            return True
+        return False
+
     def start_custom_mode_conditionally(self):
         self._require_fresh_low_state("before waiting for CUSTOM mode")
         print(f"{self.remoteControlService.get_custom_mode_operation_hint()}")
         while True:
             if self.remoteControlService.start_custom_mode():
                 break
+            if self._abort_requested("CUSTOM prompt"):
+                raise KeyboardInterrupt("abort file")
             time.sleep(0.1)
 
         # Same path the recovery re-entry uses: verify the robot is standing,
@@ -1114,6 +1152,8 @@ class Controller:
         while True:
             if self.remoteControlService.start_rl_gait():
                 break
+            if self._abort_requested("RL-gait prompt"):
+                raise KeyboardInterrupt("abort file")
             # The publish thread has been streaming since CUSTOM entry, so the
             # robot is held properly for however long this prompt waits.
             time.sleep(0.1)
@@ -1146,6 +1186,10 @@ class Controller:
         if self.in_recovery():
             self._step_recovery()
             time.sleep(0.01)
+            return
+
+        if self._abort_requested("run loop"):
+            self.running = False
             return
 
         time_now = self.timer.get_time()
@@ -1363,6 +1407,12 @@ if __name__ == "__main__":
                         help="After CUSTOM entry, hold and log ankle target-vs-measured "
                              "for this many seconds before the gait prompt. Tells drift "
                              "(no position servo) apart from oscillation (under-damped).")
+    parser.add_argument("--abort-file", type=str, default="/tmp/e0_abort",
+                        help="이 파일이 생기면 즉시 중단하고 DAMPING으로 나간다. "
+                             "sshkeyboard가 터미널을 잡고 있으면 Ctrl-C/SIGINT/SIGTERM이 "
+                             "모두 안 먹는다(2026-08-05 실기에서 SIGKILL로 죽여야 했고, "
+                             "그러면 DAMPING 전환에 도달하지 못한다). "
+                             "원격에서 touch 한 번으로 정상 종료 경로를 탄다.")
     parser.add_argument("--log-timing", type=str, default=None,
                         help="관측 지연을 이 CSV에 50 Hz로 남긴다 (goal source 무관). "
                              "MuJoCo 스윕에서 관측 지연만 여유가 0이었다 -- 10 ms 무사, "
@@ -1391,6 +1441,7 @@ if __name__ == "__main__":
         hold_prepare=args.hold_prepare,
         prepare_settle_log_s=args.prepare_settle_log_s,
         log_timing=args.log_timing,
+        abort_file=args.abort_file,
     ) as controller:
         time.sleep(2)  # wait for channels
         print("Initialization complete.")
