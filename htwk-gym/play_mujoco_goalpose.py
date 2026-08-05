@@ -194,6 +194,13 @@ def main():
                          " (deploy_goal_pose.py:1273, 500 Hz에서 y=0.8y+0.2x)."
                          " 학습 sim에는 이 필터가 없다 -- tau 8.9 ms, fc 17.8 Hz,"
                          " 정책 1 tick(20 ms) 뒤 도달률 89.3 %.")
+    ap.add_argument("--ankle-gain", type=float, default=1.0,
+                    help="발목 4관절의 kp/kd를 이 배수로. 실기 대조에서 발목 pitch 토크가 "
+                         "sim의 0.6-0.7배였다(궤적은 1.3배). 원인 미상이므로 결과만 흔든다.")
+    ap.add_argument("--hip-roll-gain", type=float, default=1.0,
+                    help="Hip_Roll 두 관절의 kp/kd 배수.")
+    ap.add_argument("--lat-friction", type=float, default=None,
+                    help="지면 마찰계수(기본 MuJoCo 1.0). 횡방향 미끄러짐 가설용.")
     ap.add_argument("--dump-csv", default=None,
                     help="실기 deploy --log-timing과 **동일한 컬럼**으로 매 정책 tick을 "
                          "남긴다. 가설 없이 두 로그를 같은 축에 겹쳐 보기 위한 것이다.")
@@ -222,6 +229,15 @@ def main():
     decim = int(cfg["policy"]["control"]["decimation"])  # 10 -> 50 Hz
     kp = np.array(cfg["common"]["stiffness"], dtype=np.float64)
     kd = np.array(cfg["common"]["damping"], dtype=np.float64)
+    # 관절 인덱스: 다리 10..21 = [HipP,HipR,HipY,Knee,AnkP,AnkR] x 2
+    if args.ankle_gain != 1.0:
+        for i in (14, 15, 20, 21):
+            kp[i] *= args.ankle_gain; kd[i] *= args.ankle_gain
+        print("발목 이득 x%.2f" % args.ankle_gain)
+    if args.hip_roll_gain != 1.0:
+        for i in (11, 17):
+            kp[i] *= args.hip_roll_gain; kd[i] *= args.hip_roll_gain
+        print("Hip_Roll 이득 x%.2f" % args.hip_roll_gain)
     default_q = np.array(cfg["common"]["default_qpos"], dtype=np.float64)
     nj = default_q.size                   # 22
 
@@ -234,6 +250,9 @@ def main():
 
     model = mujoco.MjModel.from_xml_path(mjcf_path)
     model.opt.timestep = dt
+    if args.lat_friction is not None:
+        model.geom_friction[:, 0] = args.lat_friction
+        print("지면/전체 마찰 -> %.2f" % args.lat_friction)
     data = mujoco.MjData(model)
 
     assert model.nu == nj, "actuator %d != joints %d" % (model.nu, nj)
