@@ -610,6 +610,14 @@ M_ARMS = {
     # 아니다. 후자는 R4(실기 영점 실측)로만 닫힌다. 그래도 학습이 이 채널을
     # [0,0]으로 꺼둔 채 돌아온 것은 그 자체로 결함이다 -- 정책은 1도도 본 적이 없다.
     "M8_jointcal2": merge(_M_BASE, _ROBOT_ASSET, _jointcal(2.0)),
+    # 발목 이득 오차. 실기 대조에서 발목 pitch 토크가 sim의 0.6-0.7배인데 궤적은
+    # 1.3배였다 -- 각도는 크고 토크는 작다, 즉 발목이 지면을 못 민다. 원인은
+    # 미확정이므로(평행 링크 가설은 교차결합 지표가 지지하지 않았다) 메커니즘을
+    # 특정하지 않고 결과만 흔든다. 0.6이 실측 하단, 1.3은 반대쪽 여유다.
+    "M9_anklegain": merge(_M_BASE, _ROBOT_ASSET, {
+        "randomization.ankle_gain": {
+            "range": [0.6, 1.3], "operation": "scaling", "distribution": "uniform"},
+    }),
 }
 
 # M3/M4는 checkpoint 없이 돈다. utils/runner.py:167 `if not checkpoint: return`이
@@ -674,6 +682,7 @@ GPU_OF = {
     "M5_footfix2": "cuda:0",
     "M7_robotasset": "cuda:0",
     "M8_jointcal2": "cuda:1",
+    "M9_anklegain": "cuda:0",
 }
 
 

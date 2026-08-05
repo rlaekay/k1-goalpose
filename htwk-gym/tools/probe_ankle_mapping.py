@@ -44,7 +44,10 @@ from booster_robotics_sdk_python import (
     ChannelFactory, B1LocoClient, B1LowCmdPublisher, B1LowStateSubscriber,
     LowCmd, RobotMode)
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# LowCmd()는 비어서 나온다 -- motor_cmd 리스트를 직접 채워야 하고, cmd_type도
+# SERIAL로 놓아야 한다. 배포가 쓰는 init_Cmd_T1을 그대로 재사용한다(검증된 경로).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from utils.command import init_Cmd_T1
 ABORT = "/tmp/ankle_abort"
 L_AP, L_AR, R_AP, R_AR = 14, 15, 20, 21
 
@@ -92,6 +95,7 @@ def main():
         print("LowState 없음"); os._exit(1)
 
     cmd = LowCmd()
+    init_Cmd_T1(cmd, n)
     def send(q_target):
         for i in range(n):
             cmd.motor_cmd[i].q = float(q_target[i])

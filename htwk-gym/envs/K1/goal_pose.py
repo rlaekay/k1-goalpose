@@ -82,6 +82,36 @@ class GoalPose(BaseTask):
         self.dof_damping = apply_randomization(self.dof_damping, self.cfg["randomization"].get("dof_damping"))
         self.dof_friction = apply_randomization(self.dof_friction, self.cfg["randomization"].get("dof_friction"))
 
+        # ---- 발목 전용 이득 오차 ------------------------------------------
+        # 2026-08-05, 실기 2.4초와 MuJoCo를 같은 48채널로 겹쳐 보니 **발목만** 어긋난다:
+        # 발목 pitch 토크 rms가 실기에서 sim의 0.6-0.7배인데 관절 궤적은 1.3배 더 크다.
+        # 각도는 크고 토크는 작다 = 발목이 지면을 못 민다. 그리고 roll 축 궤적만
+        # 1.9-4.3배로 튀고(pitch/yaw는 0.6-1.3배) 정책의 roll 출력도 3배다.
+        #
+        # 원인은 미확정이다. 평행 링크를 의심했지만 (a) SDK가 관절->액추에이터 매핑을
+        # 이미 처리하고 있고(아니면 관절각 명령이 아예 안 먹는다), (b) 교차결합 지표는
+        # MuJoCo(평행 결합 없음)에서 오히려 더 크게 나와 그 가설을 지지하지 않는다.
+        # 백래시, 기어 마찰, 드라이버 게인 차이도 같은 증상을 만든다.
+        #
+        # 그래서 **메커니즘을 특정하지 않고 결과만 랜덤화한다**: 발목의 유효 이득이
+        # 명령의 몇 배인지를 env마다 흔든다. 원인이 무엇이든 "발목이 약할 수 있다"에
+        # 강인해지는 것이 목표다.
+        #
+        # 기본값은 없음(키가 없으면 no-op)이라 기존 arm은 전혀 영향받지 않는다.
+        ankle_gain = self.cfg["randomization"].get("ankle_gain")
+        if ankle_gain:
+            ankle_dofs = [i for i in range(self.num_dofs) if "Ankle" in self.dof_names[i]]
+            if not ankle_dofs:
+                raise ValueError("randomization.ankle_gain 이 켜졌는데 이름에 'Ankle'이 든 "
+                                 "관절이 없다 -- 자산이 바뀌었거나 키가 오타다")
+            scale = torch.ones(self.num_envs, len(ankle_dofs),
+                               dtype=torch.float, device=self.device)
+            scale = apply_randomization(scale, ankle_gain)
+            # 강성과 마찰 모두에 건다. 이득이 낮다는 것은 같은 명령에 토크가 덜
+            # 나온다는 뜻이고, 그건 강성 저하로 표현된다.
+            self.dof_stiffness[:, ankle_dofs] *= scale
+            self.dof_damping[:, ankle_dofs] *= scale
+
         body_names = self.gym.get_asset_rigid_body_names(robot_asset)
         # Keep the exact loaded ordering available to subclasses.  HBatch uses
         # it to distribute synthetic collision wrenches over trunk/arm/hip
