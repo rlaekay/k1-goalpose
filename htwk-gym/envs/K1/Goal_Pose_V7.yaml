@@ -549,6 +549,9 @@ rewards:
   feet_distance_ref: 0.18
   # 이 값보다 두 발이 가까워지면 기하학적으로 겹친다. 발 너비 0.07 m.
   feet_min_gap: 0.07
+  # 이 값보다 넓어지면 벌한다. 실기 stance10이 median 0.14 m로 MuJoCo(0.075)의
+  # 2배까지 벌리고 폭 56.9도로 흔들린다 -- 한쪽만 벌하면 반대로 밀려난다.
+  feet_max_gap: 0.26
   final_window_s: 0.0          # v3 Rudin timed gate; 0 = off
 
   # Goal-pose reward shaping (MASTERPLAN §성공 기준: median <=5cm/10cm p90, heading <=10deg)

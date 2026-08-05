@@ -1132,7 +1132,7 @@ class GoalPose(BaseTask):
         return y_reward * vel_scale
 
     def _reward_feet_cross(self):
-        """좌우 발이 서로를 넘어서는 것을 벌한다. 안전 제약이지 자세 목표가 아니다.
+        """좌우 발 간격이 안전 구간을 벗어나는 것을 벌한다(양쪽 다).
 
         왜 `feet_offset_y`로 부족한가: 그것은 **명목 보폭**을 추종하는 보상이라
         평균을 맞추고, 순간적으로 다리가 교차하는 것은 벌하지 않는다. 실기 증언은
@@ -1146,15 +1146,22 @@ class GoalPose(BaseTask):
         접촉이 거의 사라지는 구간이다. 즉 정책은 교차를 피할 이유를 학습한 적이 없고,
         sim에서는 공짜인 행동이 실기에서는 넘어지는 원인이 된다.
 
+        ⛔ 그리고 **양쪽을 벌해야 한다.** 2026-08-06 확인: 증상이 체크포인트마다
+        반대다. i2a는 "다리가 모이면서 발끼리 부딪혀" 넘어졌고, `feet_offset_y -10`을
+        넣은 stance10은 반대로 **너무 벌어진다** -- 좌우 발 간격 median이 실기
+        14.06 cm 대 MuJoCo 7.47 cm로 2배이고, 벌어짐(L-R)이 median +5.9도에 폭
+        56.9도(MuJoCo -0.4도 / 22.6도)다. 한쪽만 벌하면 반대쪽으로 밀려난다.
+
         `get_feet_offset`의 y는 이미 `feet_distance_ref`를 뺀 상대 오프셋이므로,
-        절대 간격은 `|y + ref|`다. 그것이 두 발 반폭의 합(발 너비)보다 좁아지면
-        기하학적으로 겹친다. 그 아래로 파고든 만큼만 벌한다 -- 정상 보폭 구간에서는
-        정확히 0이라 기존 보상과 충돌하지 않는다.
+        절대 간격은 `|y + ref|`다. 좁아지는 쪽은 발 너비(`feet_min_gap`)를, 넓어지는
+        쪽은 `feet_max_gap`을 넘은 만큼만 벌한다. 그 사이에서는 정확히 0이라 기존
+        보상과 충돌하지 않는다 -- 자세 목표가 아니라 **안전 구간 제약**이다.
         """
         _, feet_y_offset = self.get_feet_offset()
         gap = torch.abs(feet_y_offset + self.cfg["rewards"]["feet_distance_ref"])
-        min_gap = self.cfg["rewards"].get("feet_min_gap", 0.07)   # 발 너비 = 0.07 m
-        return torch.clip(min_gap - gap, min=0.0)
+        lo = self.cfg["rewards"].get("feet_min_gap", 0.07)   # 발 너비 = 0.07 m
+        hi = self.cfg["rewards"].get("feet_max_gap", 0.26)   # 실기 median 0.14 + 여유
+        return torch.clip(lo - gap, min=0.0) + torch.clip(gap - hi, min=0.0)
 
     def _reward_feet_air_time(self):
         """Reward the swing duration that actually occurred, at touchdown.
