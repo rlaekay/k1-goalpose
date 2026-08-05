@@ -317,8 +317,10 @@ def main():
         t += dt
 
         # 낙상: 배포와 같은 판정(중력 벡터와 직립 사이 각). raw roll/pitch가 아니다.
-        tilt = math.acos(np.clip(-proj_g[2], -1.0, 1.0))
-        fallen = tilt > fall_tilt
+        # 낙상 판정은 **참값** proj_g로 한다. 정책이 속은 것과 실제로 기운 것을
+        # 섞지 않기 위해서다. 이름을 tilt로 쓰면 위의 tilt() 함수를 덮어쓴다.
+        tilt_rad = math.acos(np.clip(-proj_g[2], -1.0, 1.0))
+        fallen = tilt_rad > fall_tilt
         if not args.goal_hold:
             dist = math.hypot(goal[0] - px, goal[1] - py)
             reached = dist < stop_r and abs(wrap_pi(goal[2] - yaw)) < stop_h
