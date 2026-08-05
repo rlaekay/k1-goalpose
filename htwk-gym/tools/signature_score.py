@@ -37,6 +37,13 @@ TARGET = {
     "ankP_tau_L": 6.92, "ankP_tau_R": 7.26,
     "trunk_roll_range": 35.3,
     "foot_overlap_pct": 9.9,
+    # 관절 속도. 단일 채널로는 가장 강한 판별자였다 -- 발목 roll의 dq rms가
+    # 실기 7.03/8.87 대 MuJoCo 2.42/1.99 (2.9-4.5배). 그런데 모든 pitch 관절은
+    # 오히려 실기가 느리다(0.42-0.76배). 속도가 roll에만 몰려 있다는 것이
+    # "몸 전체가 흔들린다"와 "roll 축만 이상하다"를 가른다. dq는 관측 채널
+    # (obs[30:42])이므로 정책이 이 4.5배를 직접 본다.
+    "dq_ankR_L": 7.03, "dq_ankR_R": 8.87,
+    "dq_hipP_L": 1.88, "dq_hipP_R": 2.10,
 }
 DEG = 180.0 / math.pi
 
@@ -56,6 +63,8 @@ def measure(path, overlap_pct=None):
         "ankP_tau_L": rms(c("tau4")),
         "ankP_tau_R": rms(c("tau10")),
         "trunk_roll_range": rng(c("roll")) * DEG,
+        "dq_ankR_L": rms(c("dq5")), "dq_ankR_R": rms(c("dq11")),
+        "dq_hipP_L": rms(c("dq0")), "dq_hipP_R": rms(c("dq6")),
     }
     if overlap_pct is not None:
         m["foot_overlap_pct"] = overlap_pct
