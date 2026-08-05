@@ -595,6 +595,21 @@ M_ARMS = {
     "M4_scratch_phasefree": merge(_M_BASE, _ROBOT_ASSET, _PHASEFREE),
     # 실물 자산 + warm start. stance10과의 차이가 "자산" 하나다.
     "M7_robotasset": merge(_M_BASE, _ROBOT_ASSET),
+    # 관절 영점 오차 ±2도. 폭이 추측이 아니라 MuJoCo 실측이다 --
+    # 2026-08-05 스윕: ±1도 낙상 0, ±2도 낙상 0(다만 오른 Hip_Roll이 이미 20 %
+    # 토크 포화), **±3도에서 낙상 12로 절벽**. 즉 ±2가 이 정책이 버티는 상한이다.
+    # 기존 I3a_jointcal3(±3도)은 절벽 바로 위 값이라 그 결과를 다시 봐야 한다.
+    #
+    # 왜 이 채널인가: 실기 2.4초에서 Hip_Roll이 13.5도 벌어지고 안 돌아오며
+    # 토크 p99가 sim의 1.6배인데 **부호전환 주파수는 sim과 같았다**(6.3 vs 6.5-8.1 Hz).
+    # 진동이 아니라 "계속 세게 미는데 안 돌아온다"의 모양이고, MuJoCo에서 Hip_Roll에
+    # -5도를 넣었을 때 그 모양이 재현됐다(roll median -20.2도, 토크 포화, 낙상 10).
+    # 부호도 맞는다 -- +5도는 낙상 0인데 -5도(다리가 모이는 방향)만 무너진다.
+    #
+    # ⚠️ 이것은 "영점 오차가 이 증상을 만들 수 있다"이지 "실기 영점이 틀어져 있다"가
+    # 아니다. 후자는 R4(실기 영점 실측)로만 닫힌다. 그래도 학습이 이 채널을
+    # [0,0]으로 꺼둔 채 돌아온 것은 그 자체로 결함이다 -- 정책은 1도도 본 적이 없다.
+    "M8_jointcal2": merge(_M_BASE, _ROBOT_ASSET, _jointcal(2.0)),
 }
 
 # M3/M4는 checkpoint 없이 돈다. utils/runner.py:167 `if not checkpoint: return`이
@@ -658,6 +673,7 @@ GPU_OF = {
     "M4_scratch_phasefree": "cuda:1",
     "M5_footfix2": "cuda:0",
     "M7_robotasset": "cuda:0",
+    "M8_jointcal2": "cuda:1",
 }
 
 
