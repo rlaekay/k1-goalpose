@@ -527,10 +527,31 @@ _PHASEFREE = {
     "rewards.scales.feet_air_time": 175.0,
 }
 
+# ⛔ M1_footfix가 쓰는 footfix urdf는 **틀린 수정**이었다. 벤더 MJCF와 대조해서
+# 알아낸 것:
+#
+#   벤더 MJCF(K1_serial.xml)의 발을 링크 프레임으로 환산  ixx 0.000202  iyy 0.000741
+#   학습 URDF(K1_locomotion_armsdown.urdf)의 발            ixx 0.002020  iyy 0.007410
+#
+# **ixx와 iyy만 정확히 10배이고 izz(0.000785)와 ixz(-0.000053)는 소수점까지 같다.**
+# 모델링 차이가 아니라 소수점 오타 두 개다. 그래서 텐서가 삼각부등식을 2.64배 위반하고,
+# MuJoCo는 이 로봇을 아예 거부한다("inertia must satisfy A + B >= C").
+#
+# 내가 만든 footfix.urdf는 질량 0.4940 kg짜리 **다른 리비전**의 발을 이식한 것이라
+# 질량부터 틀렸다(정답은 0.38305 그대로). footfix2는 두 항을 10으로 나누기만 한다 --
+# 결과가 벤더 MJCF 값과 전 자릿수 일치하고 총 질량이 18.7142로 보존된다.
+#
+# 발목에서의 의미: J가 10배 작아지면 wn = sqrt(kp/J)가 sqrt(10) = 3.16배 커진다.
+# 학습 13.1 Hz -> 실제 41.3 Hz. 정책은 3.16배 느린 발목에 맞춰 착지 타이밍을 배웠다.
+# 사용자가 실기에서 본 "발이 중심을 못 잡고 왔다갔다"가 그 모양이다.
+_FOOTFIX2 = {"asset.file": "resources/K1/K1_locomotion_armsdown_footfix2.urdf"}
+
 M_ARMS = {
     "M1_footfix": merge(_M_BASE, {
         "asset.file": "resources/K1/K1_locomotion_armsdown_footfix.urdf",
     }),
+    # 오타만 고친 발. stance10과의 차이가 이것 하나다.
+    "M5_footfix2": merge(_M_BASE, _FOOTFIX2),
     "M2_forcewide": merge(_M_BASE, {
         "randomization.disturbance.interval_s": [3.0, 8.0],
         "randomization.disturbance.collision.force_n": [40.0, 200.0],
@@ -540,8 +561,11 @@ M_ARMS = {
         "randomization.push_force.range": [0.0, 30.0],
         "randomization.push_torque.range": [0.0, 4.0],
     }),
-    "M3_scratch_phase": merge(_M_BASE),
-    "M4_scratch_phasefree": merge(_M_BASE, _PHASEFREE),
+    # from-scratch 두 arm은 footfix2 위에서 돈다. 발 오타는 레버가 아니라 결함이고,
+    # 물리적으로 불가능한 로봇으로 5.7시간을 처음부터 학습시킬 이유가 없다.
+    # 둘 다 같은 발을 신으므로 M3 대 M4(위상 대 위상없음) 비교는 그대로 성립한다.
+    "M3_scratch_phase": merge(_M_BASE, _FOOTFIX2),
+    "M4_scratch_phasefree": merge(_M_BASE, _FOOTFIX2, _PHASEFREE),
 }
 
 # M3/M4는 checkpoint 없이 돈다. utils/runner.py:167 `if not checkpoint: return`이
@@ -603,6 +627,7 @@ GPU_OF = {
     "M2_forcewide": "cuda:1",
     "M3_scratch_phase": "cuda:0",
     "M4_scratch_phasefree": "cuda:1",
+    "M5_footfix2": "cuda:0",
 }
 
 
