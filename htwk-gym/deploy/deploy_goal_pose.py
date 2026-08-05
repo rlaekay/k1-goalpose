@@ -20,6 +20,7 @@ guide's TorchScript smoke + a LowState replay before ground contact.
 import argparse
 import json
 import logging
+import math
 import os
 import shutil
 import signal
@@ -397,7 +398,8 @@ class Controller:
                  goal_topic=None, debug_topic=None,
                  hold_prepare=False, prepare_settle_log_s=1.0,
                  log_timing=None, abort_file=None,
-                 parallel_torque=False) -> None:
+                 parallel_torque=False, rate_fixed_filter=False,
+                 filter_tau_s=0.010) -> None:
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
 
@@ -432,6 +434,9 @@ class Controller:
         self._parallel_torque = bool(parallel_torque)
         self._pub_last = 0.0
         self._pub_dt = []
+        self._rate_fixed_filter = bool(rate_fixed_filter)
+        # 설계 의도: 500 Hz에서 계수 0.2 = 시정수 10 ms.
+        self._filter_tau_s = float(filter_tau_s)
         self._abort_file = abort_file or "/tmp/e0_abort"
         # 지난 실행이 남긴 파일이 있으면 시작하자마자 중단된다. 시작 시 지운다.
         if self._abort_file and os.path.exists(self._abort_file):
@@ -1397,12 +1402,32 @@ class Controller:
             # 그래서 **실제 발행률을 잰다.** 추론 루프도 설계 20 ms인데 실측
             # 25.3 ms였으므로, 이 루프가 설계대로 돈다고 가정하면 안 된다.
             _pub_now = time.monotonic()
+            _dt = (_pub_now - self._pub_last) if self._pub_last else self.cfg["common"]["dt"]
             if self._pub_last:
-                self._pub_dt.append(_pub_now - self._pub_last)
+                self._pub_dt.append(_dt)
                 if len(self._pub_dt) > 2000:
                     self._pub_dt.pop(0)
             self._pub_last = _pub_now
-            self.filtered_dof_target = self.filtered_dof_target * 0.8 + self.dof_target * 0.2
+
+            if self._rate_fixed_filter:
+                # ⛔ 근본 수정: 필터를 **루프 속도와 무관**하게 만든다.
+                #
+                # 고정 계수 0.2는 500 Hz 발행을 가정하고 고른 값이라 시정수 10 ms를
+                # 의도한 것이다. 루프가 느려지면 같은 계수가 훨씬 긴 시정수를 만들고,
+                # 그러면 필터가 보행 자체를 깎는다:
+                #     500 Hz -> tau  10 ms, 2 Hz 감쇠 0.99
+                #      50 Hz -> tau 100 ms,          0.66
+                # 2026-08-06 MuJoCo에서 이것을 재현했다 -- 필터를 50 Hz로 돌리면
+                # 추종률이 0.93 -> 0.64로 떨어지고(실기 0.61) 낙상이 0 -> 60/분이 된다.
+                #
+                # 실측 dt로 계수를 매번 다시 계산하면 시정수가 의도대로 고정된다.
+                # dt가 튀는 순간에도 alpha가 1을 넘지 않으므로 발산하지 않는다.
+                alpha = 1.0 - math.exp(-max(_dt, 1e-6) / self._filter_tau_s)
+                alpha = min(alpha, 1.0)
+                self.filtered_dof_target = (self.filtered_dof_target * (1.0 - alpha)
+                                            + self.dof_target * alpha)
+            else:
+                self.filtered_dof_target = self.filtered_dof_target * 0.8 + self.dof_target * 0.2
 
             for i in range(self.joint_cnt):
                 self.low_cmd.motor_cmd[i].q = self.filtered_dof_target[i]
@@ -1470,6 +1495,14 @@ if __name__ == "__main__":
                         help="After CUSTOM entry, hold and log ankle target-vs-measured "
                              "for this many seconds before the gait prompt. Tells drift "
                              "(no position servo) apart from oscillation (under-damped).")
+    parser.add_argument("--rate-fixed-filter", action="store_true",
+                        help="관절 목표 필터를 루프 속도와 무관하게 만든다. 고정 계수 0.2는 "
+                             "500 Hz 발행을 가정한 값이라 시정수 10 ms를 의도한 것인데, "
+                             "루프가 느리면 같은 계수가 훨씬 긴 시정수를 만들어 보행을 깎는다 "
+                             "(50 Hz면 2 Hz 신호가 0.66으로). 실측 dt로 계수를 매번 다시 "
+                             "계산해 시정수를 고정한다. 기본 꺼짐 -- 실기에서 A/B 하라.")
+    parser.add_argument("--filter-tau-ms", type=float, default=10.0,
+                        help="--rate-fixed-filter 의 목표 시정수(ms). 기본 10 = 설계 의도.")
     parser.add_argument("--parallel-torque", action="store_true",
                         help="발목 4관절(mech.parallel_mech_indexes)을 base_walk와 같은 "
                              "방식으로 보낸다: kp=0 + 관절공간 토크 피드포워드. "
@@ -1512,6 +1545,8 @@ if __name__ == "__main__":
         log_timing=args.log_timing,
         abort_file=args.abort_file,
         parallel_torque=args.parallel_torque,
+        rate_fixed_filter=args.rate_fixed_filter,
+        filter_tau_s=args.filter_tau_ms / 1000.0,
     ) as controller:
         time.sleep(2)  # wait for channels
         print("Initialization complete.")
