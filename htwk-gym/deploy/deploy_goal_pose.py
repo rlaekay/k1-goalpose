@@ -396,7 +396,8 @@ class Controller:
     def __init__(self, cfg_file, goal_source_mode="ros", initial_goal=None,
                  goal_topic=None, debug_topic=None,
                  hold_prepare=False, prepare_settle_log_s=1.0,
-                 log_timing=None, abort_file=None) -> None:
+                 log_timing=None, abort_file=None,
+                 parallel_torque=False) -> None:
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
 
@@ -428,6 +429,7 @@ class Controller:
         # 루프는 50 Hz로 돌고 LowState는 계속 들어온다.
         # 중단 파일. 키보드 리스너와 시그널 전달을 모두 우회하는 정지 경로다.
         # 기본값을 켜 둔다 -- 정지 수단이 옵션이면 필요한 순간에 꺼져 있다.
+        self._parallel_torque = bool(parallel_torque)
         self._abort_file = abort_file or "/tmp/e0_abort"
         # 지난 실행이 남긴 파일이 있으면 시작하자마자 중단된다. 시작 시 지운다.
         if self._abort_file and os.path.exists(self._abort_file):
@@ -1384,9 +1386,27 @@ class Controller:
             for i in range(self.joint_cnt):
                 self.low_cmd.motor_cmd[i].q = self.filtered_dof_target[i]
 
-            # No series-parallel conversion: the verified E1 wrapper commands
-            # every joint by position. codex's torque-feedforward variant gave a
-            # soft ankle that folded under load on this robot.
+            # 기본은 위치 제어다. 검증된 E1 wrapper가 22관절 전부를 위치로 명령했고,
+            # codex의 토크 피드포워드 변형은 이 로봇에서 **하중에 천천히 접히는
+            # 발목**을 만들었다. 그런데 2026-08-05 실기 대조에서 나온 증상이
+            # 정확히 그것이다 -- 발목 토크가 sim의 0.6-0.7배인데 궤적은 1.3배다.
+            # 즉 지금의 위치 제어도 같은 문제를 겪고 있을 수 있다는 뜻이라,
+            # 되돌려 비교할 수 있게 스위치로 남긴다. 기본은 꺼짐.
+            #
+            # 켜면 base_walk와 같은 처리를 한다(deploy_base_walk.py:181):
+            # P 항을 드라이버에서 소프트웨어로 옮기고(kp=0), 관절 공간에서 계산한
+            # 토크를 피드포워드로 보낸다. 이것은 액추에이터 공간 변환이 아니다 --
+            # 관절->액추에이터 매핑은 SDK가 처리한다(아니면 관절각 명령이 안 먹는다).
+            if self._parallel_torque:
+                mech = self.cfg.get("mech", {}).get("parallel_mech_indexes", [])
+                stiff = self.cfg["common"]["stiffness"]
+                tlim = self.cfg["common"]["torque_limit"]
+                for i in mech:
+                    self.low_cmd.motor_cmd[i].q = self.dof_pos_latest[i]
+                    self.low_cmd.motor_cmd[i].tau = float(np.clip(
+                        (self.filtered_dof_target[i] - self.dof_pos_latest[i]) * stiff[i],
+                        -tlim[i], tlim[i]))
+                    self.low_cmd.motor_cmd[i].kp = 0.0
 
             self._send_cmd(self.low_cmd)
             time.sleep(0.001)
@@ -1429,6 +1449,12 @@ if __name__ == "__main__":
                         help="After CUSTOM entry, hold and log ankle target-vs-measured "
                              "for this many seconds before the gait prompt. Tells drift "
                              "(no position servo) apart from oscillation (under-damped).")
+    parser.add_argument("--parallel-torque", action="store_true",
+                        help="발목 4관절(mech.parallel_mech_indexes)을 base_walk와 같은 "
+                             "방식으로 보낸다: kp=0 + 관절공간 토크 피드포워드. "
+                             "주석에 따르면 예전에 하중에 접히는 발목을 만들었는데, "
+                             "2026-08-05 대조에서 나온 증상이 정확히 그것이라 "
+                             "되돌려 비교할 수 있게 스위치로 둔다. 기본 꺼짐.")
     parser.add_argument("--abort-file", type=str, default="/tmp/e0_abort",
                         help="이 파일이 생기면 즉시 중단하고 DAMPING으로 나간다. "
                              "sshkeyboard가 터미널을 잡고 있으면 Ctrl-C/SIGINT/SIGTERM이 "
@@ -1464,6 +1490,7 @@ if __name__ == "__main__":
         prepare_settle_log_s=args.prepare_settle_log_s,
         log_timing=args.log_timing,
         abort_file=args.abort_file,
+        parallel_torque=args.parallel_torque,
     ) as controller:
         time.sleep(2)  # wait for channels
         print("Initialization complete.")

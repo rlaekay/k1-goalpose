@@ -59,6 +59,12 @@ def main():
     ap.add_argument("--amp-deg", type=float, default=3.0)
     ap.add_argument("--freq", type=float, default=0.5, help="Hz")
     ap.add_argument("--cycles", type=int, default=4)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="모드를 바꾸지 않고 명령 프레임만 만들어 검증한다. "
+                         "2026-08-05에 ChangeMode(kCustom)를 먼저 보내고 명령 구조를 "
+                         "나중에 만들었다가, LowCmd()가 비어 있어 첫 발행에서 죽었다. "
+                         "CUSTOM인데 명령이 없으니 로봇이 0 자세(무릎 폄)로 가서 "
+                         "바닥을 밀며 떨었다. 검증 전에 모드를 바꾸지 않는다.")
     ap.add_argument("--out", default="/tmp/ankle_map.csv")
     args = ap.parse_args()
 
@@ -96,6 +102,9 @@ def main():
 
     cmd = LowCmd()
     init_Cmd_T1(cmd, n)
+    if len(cmd.motor_cmd) < n:
+        print("⛔ motor_cmd 길이 %d < 관절 %d -- 발행 불가" % (len(cmd.motor_cmd), n))
+        os._exit(4)
     def send(q_target):
         for i in range(n):
             cmd.motor_cmd[i].q = float(q_target[i])
@@ -104,6 +113,21 @@ def main():
             cmd.motor_cmd[i].kp = float(kp[i])
             cmd.motor_cmd[i].kd = float(kd[i])
         pub.Write(cmd)
+
+    # ---- 발행 경로를 **모드 변경 전에** 검증한다 --------------------------
+    q_now = np.array(state["q"], dtype=np.float32)
+    try:
+        send(q_now)                      # CUSTOM이 아니면 무시되지만 구조는 검증된다
+    except Exception as e:
+        print("⛔ 첫 발행 실패:", type(e).__name__, e); os._exit(5)
+    print("발행 경로 OK (관절 %d, cmd_type SERIAL)" % n)
+    print("  현재 자세 발목(도): LAP %.1f LAR %.1f RAP %.1f RAR %.1f" % tuple(
+        math.degrees(q_now[i]) for i in (L_AP, L_AR, R_AP, R_AR)))
+    print("  스윕 대상: 발목 4개만 ±%.1f도. 나머지 %d관절은 현재 자세 고정." % (
+        args.amp_deg, n - 4))
+    if args.dry_run:
+        print("드라이런 -- 모드를 바꾸지 않고 끝낸다. 로봇은 움직이지 않았다.")
+        sys.stdout.flush(); os._exit(0)
 
     # ⛔ 기본자세(서 있는 자세)로 램프하지 않는다. 엎드린 로봇에게 그것을 명령하면
     # 바닥을 밀며 요동친다. 이 시험에 필요한 것은 발목이 자유롭게 움직이는 것뿐이고,
