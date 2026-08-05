@@ -49,11 +49,31 @@ TARGET = {
     # 폐루프 한계주기가 대략 1/(4 tau)이므로 3.3 Hz는 tau ~ 75 ms를 시사한다.
     # 그리고 실기 고관절 pitch는 0.30-1.35 Hz로 명령(2.0)보다 느리다 -- 발진과
     # 보행 정지가 같이 일어난다.
-    "f_act_hipR_L": 3.30, "f_act_hipP_R": 0.30,
+    # ⛔ f_act_hipP_R(0.30 Hz)은 뺐다. 2.4초 창의 주파수 분해능이 1/2.4 = 0.42 Hz라
+    # 스캔 하한(0.25) 아래는 못 가른다 -- 표류하는 신호는 무조건 하한에 몰린다.
+    # 즉 "0.30 Hz 진동"이 아니라 "주기가 없는 표류"였고, 주파수로 재면 안 된다.
+    # 그래서 표류는 표류로 잰다(아래 drift).
+    "f_act_hipR_L": 3.30,
+    # 창 전체에 걸친 선형 추세의 크기(도). 실기 R_Hip_Roll이 2.4초에 13.5도
+    # 밀려나고 안 돌아온다 -- 보행의 진동이 아니라 작동점 이탈이다.
+    "drift_hipR_R": 13.5,
     # 추종률: 명령 대비 실제 도달. 실기 median 0.61, MuJoCo 기본 0.93.
     "track_median": 0.61,
 }
 DEG = 180.0 / math.pi
+
+
+def _drift(y):
+    """창 전체의 선형 추세 크기(끝-시작, 최소자승). 표류는 주파수로 재면 안 된다 --
+    짧은 창에서는 DFT가 스캔 하한에 몰릴 뿐이다."""
+    n = len(y)
+    xm = (n - 1) / 2.0
+    ym = sum(y) / n
+    den = sum((i - xm) ** 2 for i in range(n))
+    if den <= 0:
+        return 0.0
+    slope = sum((i - xm) * (y[i] - ym) for i in range(n)) / den
+    return abs(slope * (n - 1))
 
 
 def _dom_freq(x, dt, lo=0.25, hi=12.0, step=0.05):
@@ -94,7 +114,7 @@ def measure(path, overlap_pct=None):
     }
     dt = float(rows[1]["t_s"]) - float(rows[0]["t_s"]) or 0.02
     m["f_act_hipR_L"] = _dom_freq(c("act1"), dt)
-    m["f_act_hipP_R"] = _dom_freq(c("act6"), dt)
+    m["drift_hipR_R"] = _drift(c("q7")) * DEG
     DEF = [-0.2, 0.0, 0.0, 0.4, -0.25, 0.0] * 2
     tr = []
     for i in range(12):
