@@ -144,6 +144,24 @@ def main():
                          "2.64배 위반한다(2.7-9.4배 과대). 기본 mjcf로 돌리면 MuJoCo는 "
                          "**학습과 다른 발**을 신는다. urdf를 주면 학습과 같아진다 -- "
                          "MuJoCo가 그 텐서를 받아주기만 한다면.")
+    # ---- 감지 열화 ---------------------------------------------------------
+    # 두 시뮬레이터 모두 obs[0:6](projected_gravity, base_ang_vel)을 **정확히** 준다.
+    # 실기에서는 그게 IMU와 상태추정에서 온다. 균형에 가장 중요한 6채널인데 한 번도
+    # 열화시켜 본 적이 없다. 강체 동역학은 MuJoCo가 이미 용의선상에서 지웠으므로
+    # (엔진/접촉/발관성/팔자유도를 다 바꿔도 낙상 0) 남은 것이 여기다.
+    ap.add_argument("--imu-noise-deg", type=float, default=0.0,
+                    help="중력벡터에 매 스텝 가우시안 기울기 잡음 (std, 도)")
+    ap.add_argument("--imu-bias-deg", type=float, default=0.0,
+                    help="중력벡터에 실행 내내 고정된 기울기 바이어스 (도). "
+                         "학습의 noise.gravity는 평균 0이라 바이어스를 본 적이 없다")
+    ap.add_argument("--gyro-noise", type=float, default=0.0,
+                    help="base_ang_vel 가우시안 잡음 (std, rad/s)")
+    ap.add_argument("--dofvel-noise", type=float, default=0.0,
+                    help="dof_vel 가우시안 잡음 (std, rad/s). 실기의 dof_vel은 "
+                         "인코더 미분이라 sim의 0.1보다 훨씬 거칠 수 있다")
+    ap.add_argument("--sense-lag-ms", type=float, default=0.0,
+                    help="obs[0:6]에 순수 지연 (ms). 학습은 액션 쪽 0-18 ms만 모델링하고 "
+                         "관측 쪽 지연은 전혀 없다")
     ap.add_argument("--deploy-filter", action="store_true",
                     help="배포의 관절 목표 저역통과 필터를 재현한다"
                          " (deploy_goal_pose.py:1273, 500 Hz에서 y=0.8y+0.2x)."
@@ -225,6 +243,23 @@ def main():
     stop_r = float(cfg["deploy_goal"]["stop_radius_m"])
     stop_h = float(cfg["deploy_goal"]["stop_heading_rad"])
 
+    # 감지 열화 상태. 바이어스는 실행 내내 고정된 축을 중심으로 한 기울기다 --
+    # IMU 정렬 오차나 추정기 드리프트가 그 모양이고, 학습의 noise.gravity는 평균 0의
+    # 매 스텝 잡음이라 이 형태를 한 번도 본 적이 없다.
+    bias_axis = rng.normal(size=3)
+    bias_axis /= np.linalg.norm(bias_axis)
+    bias_rad = math.radians(args.imu_bias_deg)
+    lag_steps = int(round(args.sense_lag_ms / 1000.0 / dt))
+    sense_buf = []          # (proj_g, ang_vel) 물리 스텝마다 append
+
+    def tilt(v, rad, axis):
+        """v를 axis 둘레로 rad만큼 회전 (Rodrigues)."""
+        if rad == 0.0:
+            return v
+        k = axis
+        return (v * math.cos(rad) + np.cross(k, v) * math.sin(rad)
+                + k * np.dot(k, v) * (1 - math.cos(rad)))
+
     nsteps = int(args.duration / dt)
     targets = np.copy(default_q)
     # 배포는 정책의 목표를 그대로 보내지 않는다. 500 Hz 발행 루프가
@@ -243,6 +278,20 @@ def main():
         px, py = data.qpos[0], data.qpos[1]
         yaw = math.atan2(R[1, 0], R[0, 0])
 
+        # 감지 열화는 정책이 읽는 값에만 건다. 물리와 낙상 판정은 참값을 쓴다 --
+        # 그래야 "정책이 속아서 넘어졌다"와 "실제로 기울었다"가 섞이지 않는다.
+        sense_buf.append((proj_g.copy(), ang_vel.copy()))
+        if len(sense_buf) > lag_steps + 1:
+            sense_buf.pop(0)
+        s_g, s_w = sense_buf[0] if lag_steps > 0 else (proj_g, ang_vel)
+        obs_g = tilt(s_g, bias_rad, bias_axis)
+        if args.imu_noise_deg > 0.0:
+            n_ax = rng.normal(size=3)
+            n_ax /= max(np.linalg.norm(n_ax), 1e-9)
+            obs_g = tilt(obs_g, math.radians(rng.normal(0.0, args.imu_noise_deg)), n_ax)
+        obs_w = s_w + (rng.normal(0.0, args.gyro_noise, 3) if args.gyro_noise > 0 else 0.0)
+        obs_dq = dq + (rng.normal(0.0, args.dofvel_noise, nj) if args.dofvel_noise > 0 else 0.0)
+
         if it % decim == 0:
             if args.goal_hold:
                 grx, gry, herr = 2.0, 0.0, 0.0    # 로컬 2 m 앞 고정 -> 도달하지 않는다
@@ -252,8 +301,8 @@ def main():
                 grx, gry = c * dx - s * dy, s * dx + c * dy
                 herr = wrap_pi(goal[2] - yaw)
             targets = policy.inference(
-                t, q.astype(np.float32), dq.astype(np.float32),
-                ang_vel.astype(np.float32), proj_g.astype(np.float32),
+                t, q.astype(np.float32), obs_dq.astype(np.float32),
+                obs_w.astype(np.float32), obs_g.astype(np.float32),
                 grx, gry, herr)
 
         # 필터는 정책 tick이 아니라 발행 루프(=물리 스텝)마다 돈다. 배포가 그렇다.
@@ -310,10 +359,21 @@ def main():
     res = {
         "policy": cfg["policy"]["policy_path"],
         "torque_limits": args.torque_limits,
+        "foot_inertia": args.foot_inertia,
+        "deploy_filter": bool(args.deploy_filter),
+        "sense": {
+            "imu_noise_deg": args.imu_noise_deg,
+            "imu_bias_deg": args.imu_bias_deg,
+            "gyro_noise": args.gyro_noise,
+            "dofvel_noise": args.dofvel_noise,
+            "sense_lag_ms": args.sense_lag_ms,
+        },
         "duration_s": args.duration,
         "mode": "goal_hold" if args.goal_hold else "goal_reach",
         "segments": segments,
         "falls": falls,
+        # goal_hold에는 구간이 없다. 연속보행에서는 분당 낙상이 비교 단위다.
+        "falls_per_min": round(falls / (args.duration / 60.0), 3),
     }
     if arrivals:
         d = np.array([a[0] for a in arrivals])
