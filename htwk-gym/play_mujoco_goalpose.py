@@ -197,6 +197,10 @@ def main():
     ap.add_argument("--ankle-gain", type=float, default=1.0,
                     help="발목 4관절의 kp/kd를 이 배수로. 실기 대조에서 발목 pitch 토크가 "
                          "sim의 0.6-0.7배였다(궤적은 1.3배). 원인 미상이므로 결과만 흔든다.")
+    ap.add_argument("--fix-filter", action="store_true",
+                    help="--filter-hz 로 느린 루프를 흉내내되, 계수를 실측 dt에서 다시 "
+                         "계산해 시정수를 10 ms로 고정한다(deploy의 --rate-fixed-filter와 "
+                         "같은 수정). 이것이 증상을 없애면 그 수정이 옳다는 증거다.")
     ap.add_argument("--contact-stiff", type=float, default=None,
                     help="접촉 solref의 시간상수(초). 작을수록 딱딱하다. MuJoCo 기본 0.02. "
                          "실기 발목 roll은 평균 -5 W로 **역구동**된다(MuJoCo -0.55/+1.17). "
@@ -468,9 +472,15 @@ def main():
             # --filter-hz 가 주어지면 그 주기로만 갱신한다. 물리 스텝마다 돌리는 것이
             # 500 Hz 발행에 해당하고, 느린 루프를 흉내내려면 갱신을 띄엄띄엄 해야 한다.
             if args.filter_hz is None or t >= next_filt - 1e-9:
+                step = dt if args.filter_hz is None else 1.0 / args.filter_hz
                 if args.filter_hz is not None:
-                    next_filt = t + 1.0 / args.filter_hz
-                filtered[:] = filtered * 0.8 + targets * 0.2
+                    next_filt = t + step
+                if args.fix_filter:
+                    # 실측 주기로 계수를 다시 계산 -> 시정수 10 ms 고정
+                    a = min(1.0, 1.0 - math.exp(-step / 0.010))
+                else:
+                    a = 0.2
+                filtered[:] = filtered * (1.0 - a) + targets * a
             cmd_q = filtered
         else:
             cmd_q = targets
