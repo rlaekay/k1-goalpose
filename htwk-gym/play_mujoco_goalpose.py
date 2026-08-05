@@ -197,6 +197,13 @@ def main():
     ap.add_argument("--ankle-gain", type=float, default=1.0,
                     help="발목 4관절의 kp/kd를 이 배수로. 실기 대조에서 발목 pitch 토크가 "
                          "sim의 0.6-0.7배였다(궤적은 1.3배). 원인 미상이므로 결과만 흔든다.")
+    ap.add_argument("--contact-stiff", type=float, default=None,
+                    help="접촉 solref의 시간상수(초). 작을수록 딱딱하다. MuJoCo 기본 0.02. "
+                         "실기 발목 roll은 평균 -5 W로 **역구동**된다(MuJoCo -0.55/+1.17). "
+                         "모터가 미는 게 아니라 지면이 발목을 흔들고 모터가 저항한다. "
+                         "무른 접촉이면 그 충격이 안 생긴다.")
+    ap.add_argument("--foot-slip", type=float, default=None,
+                    help="발 geom의 미끄럼 마찰만 따로. 착지 순간의 횡방향 반응을 본다.")
     ap.add_argument("--filter-hz", type=float, default=None,
                     help="배포 필터를 이 주기로만 적용한다(기본은 물리 스텝마다 = 500 Hz). "
                          "deploy_goal_pose.py:1273의 filtered=0.8*filtered+0.2*target은 "
@@ -283,6 +290,16 @@ def main():
 
     model = mujoco.MjModel.from_xml_path(mjcf_path)
     model.opt.timestep = dt
+    if args.contact_stiff is not None:
+        model.geom_solref[:, 0] = args.contact_stiff
+        print("접촉 시간상수 -> %.4f s (기본 0.02, 작을수록 딱딱)" % args.contact_stiff)
+    if args.foot_slip is not None:
+        for side in ("left", "right"):
+            b = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "%s_foot_link" % side)
+            for g in range(model.ngeom):
+                if model.geom_bodyid[g] == b:
+                    model.geom_friction[g, 0] = args.foot_slip
+        print("발 마찰 -> %.2f" % args.foot_slip)
     if args.lat_friction is not None:
         model.geom_friction[:, 0] = args.lat_friction
         print("지면/전체 마찰 -> %.2f" % args.lat_friction)
