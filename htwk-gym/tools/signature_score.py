@@ -30,7 +30,33 @@ import csv
 import math
 import os
 
-# 실기 기준(목표). 2026-08-05 만충 배터리 2.4초 로그에서 계산됨.
+# ⛔⛔ 2026-08-06 정정: 실기 로그 2.4초 중 **뒤 1.4초가 붕괴 구간**이다
+# (tilt가 t=17.17초에 10도를 넘고 그 뒤 21-22도까지 간다. 발목 순간 파워가
+# -285 W까지 튀는 순간이 전부 17.54-17.97초 0.43초에 몰려 있다).
+#
+# 붕괴 전(34표본 0.94초) 대 붕괴 후 대 MuJoCo:
+#     발목 roll 속도   2.38 / 8.69 / 2.42   <- 붕괴 전에는 sim과 **같다**
+#     발목 파워        +0.39 / -8.14 / -0.55 <- 붕괴 전에는 역구동이 아니다
+#     Hip_Roll 폭      6.91 / 29.77 / 6.90  <- 붕괴 전에는 sim과 **같다**
+#     추종률           0.86 / 0.61 / 0.93
+#
+# 즉 이전 TARGET의 거의 전부가 **결과(붕괴)를 재고 있었다.** 원인을 찾으려면
+# 붕괴 전 창만 봐야 한다. 거기서 sim과 다른 것은 셋뿐이다:
+#     고관절 pitch 속도 1.78 대 4.48 (0.40배)
+#     발목 pitch 토크   6.22 대 10.48 (0.59배)
+#     몸통 roll 폭      15.66 대 8.95 (1.75배)
+# 셋 다 "덜 힘차게, 더 흔들리며 걷는다"이고 추종률 0.86과 방향이 같다.
+#
+# ⚠️ 붕괴 전 창은 34표본(0.94초)뿐이라 분산이 크다. 비교는 sim도 같은 길이로 한다.
+TARGET_PRE = {
+    "dq_hipP_L": 1.78, "dq_hipP_R": 1.93,
+    "ankP_tau_L": 6.22, "ankP_tau_R": 6.55,
+    "trunk_roll_range": 15.66,
+    "track_median": 0.86,
+    "hipR_range_L": 6.91, "dq_ankR_L": 2.38,
+}
+
+# (구) 전체 창 기준 -- 붕괴를 포함한다. 재현 확인용으로만 남긴다.
 TARGET = {
     "hipR_range_L": 29.8, "hipR_range_R": 45.4,
     "act_roll_L": 0.910, "act_roll_R": 1.313,
@@ -100,6 +126,8 @@ def _dom_freq(x, dt, lo=0.25, hi=12.0, step=0.05):
 # 전체 적합에서 2.8도로 나오지만 91표본 창에서는 median 12.8도로 실기 13.5도와
 # 거의 같다 -- 순위가 통째로 뒤집힌다.
 REAL_WINDOW = 91
+# 붕괴 전 창 길이. --pre 로 이 길이와 TARGET_PRE 를 쓴다.
+PRE_WINDOW = 34
 
 
 def _measure_window(rows):
@@ -150,11 +178,11 @@ def measure(path, overlap_pct=None):
     return out
 
 
-def score(m):
+def score(m, target=None):
     """로그비 제곱합. 지표별 기여도도 같이 낸다."""
     parts = {}
     tot = 0.0
-    for k, t in TARGET.items():
+    for k, t in (target or TARGET).items():
         if k not in m:
             continue
         v = max(m[k], 1e-6)
@@ -165,15 +193,22 @@ def score(m):
 
 
 def main():
-    if len(sys.argv) < 2:
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    pre = "--pre" in sys.argv
+    if not args:
         print(__doc__); return 1
+    global REAL_WINDOW
+    tgt = TARGET_PRE if pre else TARGET
+    if pre:
+        REAL_WINDOW = PRE_WINDOW
+        print("[붕괴 전 창 %d표본 / TARGET_PRE 기준]" % PRE_WINDOW)
     print("%-34s %8s | %s" % ("실행", "점수", "가장 어긋난 지표 3개"))
     results = []
-    for p in sys.argv[1:]:
+    for p in args:
         m = measure(p)
         if m is None:
             print("%-34s   (관절 채널 없음)" % os.path.basename(p)); continue
-        s, parts = score(m)
+        s, parts = score(m, tgt)
         worst = sorted(parts.items(), key=lambda kv: -kv[1][2])[:3]
         results.append((s, p, parts))
         print("%-34s %8.3f | %s" % (
