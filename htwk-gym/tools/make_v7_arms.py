@@ -685,6 +685,20 @@ N_ARMS = {
     # N1 + (속도 x 곡률) 그리드 커리큘럼. N1과의 차이가 스케줄러 하나다.
     "N2_pathgrid": merge(_N_BASE, _PATH_ON,
                          {"commands.path.speed_grid.enabled": True}),
+    # N1 + 다리 교차 페널티. N1과의 차이가 이것 하나다.
+    #
+    # 왜 path arm 위에 얹는가: 실기 증언("다리가 모이면서 발끼리 부딪혀서 넘어져")이
+    # 데이터에 있다 -- 좌우 발 겹침 실기 9.9% / p1 -16.35 cm 대 MuJoCo 2.3% / -0.41.
+    # 그리고 sim은 그것을 벌하지 않는다: 깊게 겹치면 접촉이 0건으로 통과한다.
+    # 그 증상은 **걸을 때** 나오는 것이라 waypoint 과제(요구 속도 median 0.12 m/s,
+    # 42%가 사실상 서 있기)에서는 발현될 기회 자체가 적다. MA_feetcross가 그 과제
+    # 위에서 돌았고, 그래서 이 항이 실제로 무엇을 하는지 아직 측정된 적이 없다.
+    # path를 켜야 비로소 이 페널티가 의미를 갖는 상황이 만들어진다.
+    #
+    # 스케일 -20은 MA_feetcross와 같다. 페널티가 min_gap 아래로 파고든 미터 단위
+    # 깊이이므로 3 cm 겹침 = 0.03 * 20 = 0.6이고, constellation(최대 3.5) 대비
+    # 의미 있으면서 정상 보폭(gap 0.07-0.26 m 밴드)은 건드리지 않는다.
+    "N3_pathcross": merge(_N_BASE, _PATH_ON, {"rewards.scales.feet_cross": -20.0}),
 }
 
 # M3/M4는 checkpoint 없이 돈다. utils/runner.py:167 `if not checkpoint: return`이
@@ -759,6 +773,7 @@ GPU_OF = {
     "N0_ctrl": "cuda:0",
     "N1_path": "cuda:1",
     "N2_pathgrid": "cuda:0",
+    "N3_pathcross": "cuda:0",
 }
 
 
