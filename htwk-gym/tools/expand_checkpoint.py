@@ -98,22 +98,35 @@ def main():
         old.load_state_dict(orig, strict=False)
         new.load_state_dict(model, strict=False)
         old.eval(); new.eval()
+        # float64 로 검사한다. 수술은 **대수적 항등**이므로 정확히 0 이 나와야
+        # 하는데, float32 에서는 0 이 안 나올 수 있다: critic 의 0 이 아닌 가중치가
+        # 입력 벡터의 양 끝(obs 앞부분과 밀려난 privileged)으로 갈라져서 GEMM 의
+        # 누산 순서가 달라지고, 4개 층을 지나며 그 반올림이 커진다. actor 는
+        # 가중치가 앞쪽에 연속이라 float32 에서도 정확히 0 이 나온다.
+        # 즉 float32 의 잔차는 로직이 아니라 결합법칙 문제이고, float64 로 재면
+        # 그 둘이 갈린다 -- 이건 추측이 아니라 검사다.
+        old = old.double(); new = new.double()
         n = 64
-        o_old = torch.randn(n, args.old_obs)
+        o_old = torch.randn(n, args.old_obs, dtype=torch.float64)
         # 새 채널에는 아무 값이나 넣는다. 0 을 넣으면 '0 열이라 같다'를 확인하는 게
         # 아니라 '입력이 0이라 같다'를 확인하게 된다 -- 검사가 아무것도 안 한다.
-        o_new = torch.cat([o_old, torch.randn(n, args.new_obs - args.old_obs)], dim=-1)
+        o_new = torch.cat(
+            [o_old, torch.randn(n, args.new_obs - args.old_obs, dtype=torch.float64)], dim=-1)
         with torch.no_grad():
             a_old = old.actor(o_old)
             a_new = new.actor(o_new)
-            p_old = torch.randn(n, args.old_priv)
-            p_new = torch.cat([p_old, torch.randn(n, new_priv - args.old_priv)], dim=-1)
+            p_old = torch.randn(n, args.old_priv, dtype=torch.float64)
+            p_new = torch.cat(
+                [p_old, torch.randn(n, new_priv - args.old_priv, dtype=torch.float64)], dim=-1)
             v_old = old.critic(torch.cat([o_old, p_old], dim=-1))
             v_new = new.critic(torch.cat([o_new, p_new], dim=-1))
         da = (a_old - a_new).abs().max().item()
         dv = (v_old - v_new).abs().max().item()
-        print("검증: actor 최대차 {:.3e}   critic 최대차 {:.3e}".format(da, dv))
-        if da > 1e-6 or dv > 1e-6:
+        # float64 에서 대수적 항등의 잔차는 반올림 단위(~1e-16)에 층수와 폭을 곱한
+        # 정도다. 1e-10 은 그보다 한참 위이고 실제 로직 오류(가중치 한 열이라도
+        # 잘못 놓이면 O(1) 이 튄다)보다는 한참 아래라, 둘을 확실히 가른다.
+        print("검증(float64): actor 최대차 {:.3e}   critic 최대차 {:.3e}".format(da, dv))
+        if da > 1e-10 or dv > 1e-10:
             raise SystemExit("⛔ 항등이 깨졌다. 저장하지 않는다.")
         print("검증 통과 -- 새 채널에 난수를 넣어도 출력이 옛 정책과 같다.")
 
