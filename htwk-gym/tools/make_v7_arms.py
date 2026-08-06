@@ -748,6 +748,22 @@ N_OBS_ARMS = {
         "env.num_privileged_obs": 17,
     }),
 }
+# N1 + 관측 지연만. N4_hist와 달리 관측 폭을 건드리지 않으므로(54 유지) 배포된
+# 정책에서 warm start가 되고, N1과 정확히 한 레버 차이라 비교가 성립한다.
+#
+# 왜 N4_hist를 그냥 못 쓰는가: 이력 5프레임이 num_observations를 54 -> 270으로
+# 바꾼다. PyTorch의 load_state_dict는 strict=False여도 **크기 불일치는 그대로
+# RuntimeError**를 낸다(서버에서 확인). 즉 N4는 --checkpoint를 못 붙이고 scratch
+# 6000 iteration이 되며, 그러면 "지연 랜덤화가 좋아졌다"와 "scratch가 좋아졌다"가
+# 안 갈린다 -- N0_ctrl을 둔 이유와 같은 부류의 오염이다.
+#
+# 8-42가 obs 지연 20 ms만이 실기의 다리 교차를 재현했다고 기록했는데(2.3 -> 9.2 %,
+# 실기 9.9 %), 배포된 정책도 지금 도는 N0/N1도 이 축이 [0,0]으로 꺼져 있다.
+N_DELAY_ARMS = {
+    "N8_pathdelay": merge(_N_BASE, _PATH_ON, {"noise.obs_delay_steps": [0, 2]}),
+}
+N_ARMS.update(N_DELAY_ARMS)
+
 N_ARMS.update(N_OBS_ARMS)
 
 
@@ -759,9 +775,9 @@ N_ARMS.update(N_OBS_ARMS)
 # 우리가 학습시킨 것은 영점 드리프트가 아니라 "두 개의 무관한 고장이 동시에"였다.
 #
 # 두 arm 은 그 결함 수정과 구조화를 **따로** 잰다:
-#   N8_zeroiid    상관 수정만. 모드는 iid 하나라 기존 균일 분포와 모양이 같고,
+#   NZ_zeroiid    상관 수정만. 모드는 iid 하나라 기존 균일 분포와 모양이 같고,
 #                 달라지는 것은 target_offset = −encoder_bias 라는 상관뿐이다.
-#   N9_zerostruct N8 과의 차이가 **모드 혼합 하나**. 실기 증상을 재현한 anti_mirror
+#   N9_zerostruct NZ 과의 차이가 **모드 혼합 하나**. 실기 증상을 재현한 anti_mirror
 #                 를 포함해 고장의 모양을 물리적으로 있을 법한 것들로 바꾼다.
 # 둘 다 N1_path 위에 얹는다 -- 영점 오차의 대가는 걸을 때 나온다.
 #
@@ -787,13 +803,46 @@ _ZERO_STRUCT["randomization.joint_zero"]["modes"] = {
 }
 
 N_ZERO_ARMS = {
-    "N8_zeroiid": merge(_N_BASE, _PATH_ON, _ZERO_ON),
+    "NZ_zeroiid": merge(_N_BASE, _PATH_ON, _ZERO_ON),
     "N9_zerostruct": merge(_N_BASE, _PATH_ON, _ZERO_STRUCT),
 }
 N_ARMS.update(N_ZERO_ARMS)
 
+
+# ---- NA: 이력 + 영점 오차를 함께 (2026-08-07, 사용자 요청) --------------------
+#
+# 이 조합은 편의가 아니라 **둘이 서로를 필요로 하기 때문에** 존재한다.
+#
+# 영점 오차는 관측에 없다. 정책은 자기가 어느 방향으로 얼마나 틀어졌는지 볼 수 없다.
+# 그래서 기억 없는 단일 프레임 정책이 배울 수 있는 것은 "모든 오차에 대해 무난한
+# 보수적 자세" 뿐이고, §8-17 이 보수성은 속도를 깎는다고 이미 기록했다.
+# 반대로 이력만 주고 영점 오차를 안 주면, 이력이 식별할 대상이 없다 -- 관측 지연
+# (N4 가 같이 켜는 [0,2])만 남는다.
+#
+# 둘을 같이 주면 비로소 RMA(Rapid Motor Adaptation) 계열이 하는 일이 가능해진다:
+# 지속적이고 계통적인 추종 오차 신호에서 자기 영점을 **온라인으로 식별해서 상쇄**한다.
+# 그래서 이 arm 의 가설은 "N4 와 N8 의 이득이 더해진다"가 아니라
+# **"N4 와 N8 은 따로 하면 둘 다 별로인데 같이 하면 된다"** 이다 -- 상호작용 셀이고,
+# 그래서 단일 레버 규칙의 의도된 예외다(F2_grid, I1d_both 와 같은 부류).
+#
+# 판정 기준을 미리 적어 둔다(사후에 고르지 않기 위해):
+#   NA > max(N4, N8) 이면 상호작용이 실재한다.
+#   NA ≈ max(N4, N8) 이면 둘 중 하나가 혼자 다 한 것이다.
+#   NA < min(N4, N8) 이면 두 축이 서로 방해한다 -- 그 경우 예산 부족을 먼저 의심한다
+#   (6000 iteration 에 새 관측과 새 고장을 동시에 적응시키는 것이므로).
+NA_ARMS = {
+    "NA_histzero": merge(_N_BASE, _PATH_ON, _ZERO_ON, {
+        "observation.history_steps": 5,
+        "noise.obs_delay_steps": [0, 2],
+        "env.num_observations": 270,
+    }),
+}
+N_ARMS.update(NA_ARMS)
+
 # 수술이 필요한 arm과 그 목표 폭. 큐 작업 스크립트가 이 표를 읽어 체크포인트를 넓힌다.
 OBS_SURGERY = {
+    # NA_histzero 도 이력 5프레임이라 N4 와 같은 폭이다.
+    "NA_histzero": {"new_obs": 270, "new_priv": 14},
     "N4_hist":   {"new_obs": 270, "new_priv": 14},
     "N5_tau":    {"new_obs": 66,  "new_priv": 14},
     "N6_foot":   {"new_obs": 56,  "new_priv": 14},
@@ -875,7 +924,8 @@ GPU_OF = {
     "N3_pathcross": "cuda:0",
     "N4_hist": "cuda:0", "N5_tau": "cuda:1",
     "N6_foot": "cuda:0", "N7_critic": "cuda:1",
-    "N8_zeroiid": "cuda:1", "N9_zerostruct": "cuda:0",
+    "NZ_zeroiid": "cuda:1", "N9_zerostruct": "cuda:0",
+    "NA_histzero": "cuda:1",
 }
 
 
