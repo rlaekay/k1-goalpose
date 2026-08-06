@@ -17,6 +17,24 @@
 >   `pub_hz` 측정**(R6). 밤새 고친 방법론 오류 넷도 같이 있다.
 > - **[DEPLOY_REQUESTS_FROM_TRAINING.md](DEPLOY_REQUESTS_FROM_TRAINING.md)** — 학습이
 >   못 닫고 로봇에서만 닫히는 측정 요청. R1·R5는 이미 답이 나와 종결됐다.
+> - **[ibatch.md §8-44](ibatch.md)** (2026-08-07) — ⛔ **근본 원인 확정: 우리 과제가
+>   보행을 요구한 적이 없다.** 배포 정책과 M 배치 전부가 `path: 0.0` 위에서 돌았고,
+>   그 과제의 요구 속도는 median 0.119 m/s / 몸통속도 median 0.03 m/s다. 평가가
+>   학습과 같은 과제라 **지표가 보행을 잰 적이 없다**. N 배치(path 복원)가 돌고 있고,
+>   평가에 `--goal_pattern forward_hold` 축이 새로 들어갔다.
+>
+> ### 서버 자율 운전 — 켜져 있는 것들
+>
+> GPU가 13.8시간 놀았던 사고(§8-44) 이후 감시를 코드로 옮겼다. 서버에서 상시 실행:
+>
+> - `tools/idle_watch.sh` → `queue/idle_state.json` (30초마다, 세 신호 교차확인)
+> - `tools/autopilot.sh` → 유휴 30분이면 `queue/plan/gpu<N>/`에서 다음 작업 승격
+> - `tools/gpu_queue.sh 0` / `1` → 카드당 워커 하나
+>
+> 상태는 **`ssh a6000 'bash /mnt/DATA/workspace/ws_eungkyu/k1-goalpose/htwk-gym/tools/round_status.sh'`**
+> 한 번으로 읽는다. 셋 중 하나라도 죽어 있으면 다시 띄워라 —
+> `setsid nohup bash tools/<name>.sh < /dev/null > queue/<name>.log 2>&1 &`.
+> ⚠️ `pkill -f "<name>.sh"`는 **자기 ssh 세션을 죽인다**(명령줄에 그 문자열이 있다).
 >
 > 인계 문서를 새로 만들면 **여기에 한 줄 추가**한다. 그러지 않으면 다음 세션이 못 본다.
 
