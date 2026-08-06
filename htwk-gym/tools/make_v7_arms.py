@@ -750,6 +750,48 @@ N_OBS_ARMS = {
 }
 N_ARMS.update(N_OBS_ARMS)
 
+
+# ---- 관절 영점 오차 (2026-08-07) --------------------------------------------
+#
+# ⛔ 먼저 결함: 기존 joint_encoder_bias / joint_target_offset 은 **독립적으로** 뽑힌다.
+# 실기의 엔코더 영점 오차 b 는 encoder_bias = +b 이면서 target_offset = −b 일 때만
+# 정확히 재현된다(goal_pose.py::_resample_joint_zero 의 유도). 그래서 지금까지
+# 우리가 학습시킨 것은 영점 드리프트가 아니라 "두 개의 무관한 고장이 동시에"였다.
+#
+# 두 arm 은 그 결함 수정과 구조화를 **따로** 잰다:
+#   N8_zeroiid    상관 수정만. 모드는 iid 하나라 기존 균일 분포와 모양이 같고,
+#                 달라지는 것은 target_offset = −encoder_bias 라는 상관뿐이다.
+#   N9_zerostruct N8 과의 차이가 **모드 혼합 하나**. 실기 증상을 재현한 anti_mirror
+#                 를 포함해 고장의 모양을 물리적으로 있을 법한 것들로 바꾼다.
+# 둘 다 N1_path 위에 얹는다 -- 영점 오차의 대가는 걸을 때 나온다.
+#
+# 커리큘럼은 둘 다 켠다(레버가 아니라 이 축의 전제다). ±3° 가 이미 절벽이었으므로
+# 고정 크기로 ±10° 를 주면 학습이 아예 안 선다 -- config 가 인용한 Margolis 의
+# "커리큘럼 없이는 느리게도 못 걷는다"가 정확히 그 경우다. 그리고 전역 스칼라가
+# 아니라 **env 마다** 올리고 내린다: 우리 config 자신이 speed_curriculum 을 두고
+# "4096 env 의 신호를 전부 버리는 단일 전역 float" 이라고 적어 뒀다.
+_ZERO_ON = {
+    "randomization.joint_zero": {
+        "enabled": True, "max_deg": 10.0, "curriculum": True,
+        "init_level": 0.1, "min_level": 0.0, "step": 0.05,
+        "modes": {"iid": 1.0, "single": 0.0, "leg_common": 0.0,
+                  "anti_mirror": 0.0, "mirror": 0.0},
+        "joint_weight": [1.0, 0.5, 1.0, 1.0, 0.7, 0.7,
+                         1.0, 0.5, 1.0, 1.0, 0.7, 0.7],
+    },
+}
+_ZERO_STRUCT = copy.deepcopy(_ZERO_ON)
+_ZERO_STRUCT["randomization.joint_zero"]["modes"] = {
+    "iid": 0.20, "single": 0.30, "leg_common": 0.20,
+    "anti_mirror": 0.20, "mirror": 0.10,
+}
+
+N_ZERO_ARMS = {
+    "N8_zeroiid": merge(_N_BASE, _PATH_ON, _ZERO_ON),
+    "N9_zerostruct": merge(_N_BASE, _PATH_ON, _ZERO_STRUCT),
+}
+N_ARMS.update(N_ZERO_ARMS)
+
 # 수술이 필요한 arm과 그 목표 폭. 큐 작업 스크립트가 이 표를 읽어 체크포인트를 넓힌다.
 OBS_SURGERY = {
     "N4_hist":   {"new_obs": 270, "new_priv": 14},
@@ -833,6 +875,7 @@ GPU_OF = {
     "N3_pathcross": "cuda:0",
     "N4_hist": "cuda:0", "N5_tau": "cuda:1",
     "N6_foot": "cuda:0", "N7_critic": "cuda:1",
+    "N8_zeroiid": "cuda:1", "N9_zerostruct": "cuda:0",
 }
 
 

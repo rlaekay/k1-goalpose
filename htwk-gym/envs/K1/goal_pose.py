@@ -1,4 +1,5 @@
 import os
+import math
 
 from isaacgym import gymtorch, gymapi
 from isaacgym.torch_utils import (
@@ -391,14 +392,17 @@ class GoalPose(BaseTask):
         self._reset_root_states(env_ids)
 
         self.last_dof_targets[env_ids] = self.dof_pos[env_ids]
-        self.joint_encoder_bias[env_ids] = apply_randomization(
-            torch.zeros(len(env_ids), self.num_dofs, device=self.device),
-            self.cfg["randomization"].get("joint_encoder_bias"),
-        )
-        self.joint_target_offset[env_ids] = apply_randomization(
-            torch.zeros(len(env_ids), self.num_dofs, device=self.device),
-            self.cfg["randomization"].get("joint_target_offset"),
-        )
+        if (self.cfg["randomization"].get("joint_zero") or {}).get("enabled"):
+            self._resample_joint_zero(env_ids)
+        else:
+            self.joint_encoder_bias[env_ids] = apply_randomization(
+                torch.zeros(len(env_ids), self.num_dofs, device=self.device),
+                self.cfg["randomization"].get("joint_encoder_bias"),
+            )
+            self.joint_target_offset[env_ids] = apply_randomization(
+                torch.zeros(len(env_ids), self.num_dofs, device=self.device),
+                self.cfg["randomization"].get("joint_target_offset"),
+            )
         self.last_root_vel[env_ids] = self.root_states[env_ids, 7:13]
         self.episode_length_buf[env_ids] = 0
         self.filtered_lin_vel[env_ids] = 0.0
@@ -409,6 +413,152 @@ class GoalPose(BaseTask):
 
         self.delay_steps[env_ids] = torch.randint(0, self.cfg["control"]["decimation"], (len(env_ids),), device=self.device)
         self.extras["time_outs"] = self.time_out_buf
+
+    # ---- 관절 영점 오차 --------------------------------------------------
+    #
+    # ⛔ 먼저 결함 하나. 기존 `joint_encoder_bias` / `joint_target_offset` 는
+    # **독립적으로** 뽑힌다(각각 별도의 torch.rand_like). config 주석은 "실제 영점
+    # 드리프트는 둘 다 일으키므로 같이 켠다"고 말하지만, 코드가 하는 일은 그게 아니다.
+    #
+    # 실기에서 관절 j 의 엔코더 영점이 b 만큼 틀어졌을 때 무슨 일이 일어나는지 쓰면:
+    #     측정값        q_meas = q + b
+    #     정책 관측     q_meas - q_default = q + b - q_default
+    #     온보드 PD     tau = kp*(target_cmd - q_meas) = kp*(target_cmd - q - b)
+    #     따라서 평형   q_eq = target_cmd - b = q_default + scale*a - b
+    # sim 은(goal_pose.py:643 이 **참값** dof_pos 로 PD 를 돈다)
+    #     관측          dof_pos + joint_encoder_bias - default   (:866)
+    #     평형          q_eq = default + scale*a + joint_target_offset  (:628)
+    # 두 식이 같아지려면 **joint_encoder_bias = +b 이고 joint_target_offset = −b** 여야 한다.
+    # 근사가 아니라 정확한 등가다. 독립으로 뽑으면 그 조합은 사실상 나오지 않는다.
+    #
+    # 즉 지금까지 우리가 학습시킨 것은 "엔코더가 X 만큼, 구동기가 무관한 Y 만큼
+    # 동시에 틀어진 두 개의 서로 다른 고장"이고, **영점 드리프트는 한 번도 아니었다.**
+    # 그리고 둘은 질적으로 다르다: 상관된(영점) 경우에는 관측 좌표계 q̃ = q + b 에서
+    # q̃_eq = default + scale*a 가 되어 **관절 루프만 보면 완전히 정상**이다. 깨지는
+    # 것은 참 기구학에 붙은 것들뿐이다 -- IMU 는 참 자세를 보고, 접촉은 참 발 위치에서
+    # 일어나며, 실제 서 있는 자세가 정책이 믿는 자세와 다르다. 독립 draw 는 관절 루프
+    # 자체를 어긋나게 만들어서 훨씬 거칠고 덜 현실적이다.
+    # (그래서 MuJoCo 스윕이 ±3° 에서 절벽을 본 것도 이 거친 쪽 기준이다.)
+    _ZERO_MODES = ("iid", "single", "leg_common", "anti_mirror", "mirror")
+
+    def _resample_joint_zero(self, env_ids):
+        """구조화된 영점 오차를 env 마다 뽑는다.
+
+        왜 균일 iid 가 아닌가: 실제 영점 틀어짐은 22개 관절의 독립 추첨이 아니다.
+        원인마다 모양이 있다 --
+          * single      한 관절만 크게 (부딪힘, 벨트 슬립, 기어 백래시)
+          * leg_common  한 다리 전체가 상관되어 (잘못된 자세에서 재캘리브레이션)
+          * mirror      좌우 대칭 (캘리브레이션 루틴 자체의 계통 오차)
+          * anti_mirror 좌우 반대 ← **실기 증상을 재현한 모양이 이것이다.**
+                        Hip_Roll 에 −5° 를 넣으면 실기의 "다리가 모이며 부딪힘"이
+                        재현됐고 +5° 는 낙상 0 이었다(ibatch 8-43). 부호가 갈리는
+                        고장은 iid 균일에서 거의 뽑히지 않는다.
+          * iid         작은 독립 오차 (조립 공차)
+        독립 균일 ±10° 는 "모든 관절이 조금씩 아무 방향으로"인데, 물리적으로 가장
+        일어나기 어려운 모양이고 동시에 가장 파괴적이다 -- 다리 여섯 관절이면 발이
+        정책 예상에서 22 cm 어긋나 지지다각형(발 반길이 9.4 cm)을 넘는다.
+        """
+        z = self.cfg["randomization"]["joint_zero"]
+        n = len(env_ids)
+        dev = self.device
+        max_rad = math.radians(float(z.get("max_deg", 10.0)))
+
+        # --- per-env 커리큘럼 -------------------------------------------
+        # 전역 스칼라를 쓰지 않는다. 우리 config 자신이 speed_curriculum 을 두고
+        # "4096 env 의 모든 신호를 버리는 단일 전역 float 이라 legged_gym 의 지형
+        # 커리큘럼보다도 조악하다"고 적어 뒀다. env 마다 수준을 들고, 넘어지지 않고
+        # 버틴 env 는 올리고 넘어진 env 는 내린다. 그러면 함대 전체가 매 순간
+        # 쉬운 것부터 어려운 것까지 퍼져 있게 되고, 분포가 스스로 경계를 찾는다.
+        if not hasattr(self, "_zero_level"):
+            self._zero_level = torch.full((self.num_envs,), float(z.get("init_level", 0.1)),
+                                          device=dev)
+        if z.get("curriculum", True):
+            fell = getattr(self, "_terminated_by_fall", None)
+            if fell is not None:
+                step = float(z.get("step", 0.05))
+                d = torch.where(fell[env_ids], -step, step)
+                self._zero_level[env_ids] = (self._zero_level[env_ids] + d).clamp(
+                    float(z.get("min_level", 0.0)), 1.0)
+        level = self._zero_level[env_ids].unsqueeze(-1)
+
+        # --- 모드 추첨 ---------------------------------------------------
+        probs = z.get("modes") or {}
+        w = torch.tensor([float(probs.get(m, 0.0)) for m in self._ZERO_MODES], device=dev)
+        if float(w.sum()) <= 0:
+            w = torch.ones(len(self._ZERO_MODES), device=dev)
+        mode = torch.multinomial(w / w.sum(), n, replacement=True)
+
+        # 관절별 민감도 가중치. ±10° 가 Ankle_Roll 과 Hip_Yaw 에서 같은 의미가
+        # 아니다 -- 2026-08-05 MuJoCo 스윕에서 ±2° 에 이미 오른 Hip_Roll 이 토크
+        # 20 % 포화였다. 없으면 전부 1.0.
+        jw = z.get("joint_weight")
+        jw = (torch.tensor(jw, device=dev, dtype=torch.float)
+              if jw else torch.ones(self.num_dofs, device=dev))
+        if jw.numel() != self.num_dofs:
+            raise ValueError("joint_zero.joint_weight 는 관절 수({})만큼 필요하다: {}".format(
+                self.num_dofs, jw.numel()))
+
+        amp = max_rad * level * jw.unsqueeze(0)                 # [n, dofs]
+        u = (torch.rand(n, self.num_dofs, device=dev) * 2 - 1)  # [-1, 1]
+        b = torch.zeros(n, self.num_dofs, device=dev)
+
+        # leg_common / mirror / anti_mirror 는 "앞 절반 = 왼다리, 뒤 절반 = 오른다리이고
+        # i 와 i+half 가 같은 관절의 좌우 짝"을 가정한다. URDF 는 그 순서지만 Isaac 의
+        # DOF 순서가 URDF 와 같다는 보장은 없으므로 **가정하지 않고 검사한다** --
+        # 어긋나면 mirror 가 조용히 엉뚱한 관절을 짝지어서, 죽지 않고 그냥 이상한
+        # 고장을 학습하게 된다(가장 잡기 어려운 실패다).
+        half = self.num_dofs // 2
+        if not getattr(self, "_zero_layout_checked", False):
+            self._zero_layout_checked = True
+            names = list(getattr(self, "dof_names", []) or [])
+            if len(names) == self.num_dofs and self.num_dofs % 2 == 0:
+                bad = [(names[i], names[i + half]) for i in range(half)
+                       if names[i].replace("Left", "") != names[i + half].replace("Right", "")]
+                if bad:
+                    raise ValueError(
+                        "joint_zero 의 좌우 짝 가정이 깨졌다. i 와 i+{} 가 같은 관절의 "
+                        "좌우여야 하는데 어긋난 짝: {}".format(half, bad))
+            else:
+                raise ValueError(
+                    "joint_zero 는 좌우 대칭 관절 배치를 가정한다 "
+                    "(dof_names {}개, num_dofs {})".format(len(names), self.num_dofs))
+        m_iid = mode == 0
+        b[m_iid] = (u * amp)[m_iid]
+
+        # single: 한 관절만, 전부 진폭으로. 부분 손상은 크기가 작지 않다.
+        m_single = mode == 1
+        if bool(m_single.any()):
+            k = m_single.sum()
+            j = torch.randint(0, self.num_dofs, (k,), device=dev)
+            sgn = torch.where(torch.rand(k, device=dev) < 0.5, -1.0, 1.0)
+            sel = torch.zeros(k, self.num_dofs, device=dev)
+            sel[torch.arange(k, device=dev), j] = sgn
+            b[m_single] = sel * amp[m_single]
+
+        # leg_common: 한 다리 전체가 같은 방향
+        m_leg = mode == 2
+        if bool(m_leg.any()):
+            k = m_leg.sum()
+            side = (torch.rand(k, device=dev) < 0.5)
+            mask = torch.zeros(k, self.num_dofs, device=dev)
+            mask[side, :half] = 1.0
+            mask[~side, half:] = 1.0
+            s = (torch.rand(k, 1, device=dev) * 2 - 1)
+            b[m_leg] = mask * s * amp[m_leg]
+
+        # anti_mirror / mirror: 좌우 관절이 짝지어 반대/같은 부호
+        for mode_id, sign in ((3, -1.0), (4, 1.0)):
+            m = mode == mode_id
+            if not bool(m.any()):
+                continue
+            k = m.sum()
+            s = (torch.rand(k, half, device=dev) * 2 - 1)
+            pair = torch.cat((s, sign * s), dim=-1)
+            b[m] = pair * amp[m]
+
+        # ⭐ 여기가 핵심. 실기 영점 오차의 정확한 등가: 관측은 +b, PD 목표는 −b.
+        self.joint_encoder_bias[env_ids] = b
+        self.joint_target_offset[env_ids] = -b
 
     def _reset_dofs(self, env_ids):
         self.dof_pos[env_ids] = apply_randomization(self.default_dof_pos, self.cfg["randomization"].get("init_dof_pos"))
@@ -777,6 +927,10 @@ class GoalPose(BaseTask):
             self.cfg["rewards"]["episode_length_s"] / self.dt)
         segment_boundary = self.episode_length_buf == self.cmd_resample_time
         self.reset_buf = physical | episode_timeout
+        # 영점 커리큘럼이 읽는다. 리셋 시점에는 이 정보가 남아 있지 않으므로
+        # 여기서 붙들어 둔다 -- "넘어져서 끝났나, 시간이 다 돼서 끝났나"가
+        # 승급/강등의 유일한 기준이다.
+        self._terminated_by_fall = physical
         # Segment boundaries are marked for PPO bootstrapping without resetting
         # the simulator.  A physical fall on that same step must take priority;
         # otherwise eval hides the fall and PPO bootstraps through a terminal

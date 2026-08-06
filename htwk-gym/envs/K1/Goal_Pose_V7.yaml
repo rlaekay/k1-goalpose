@@ -481,6 +481,35 @@ randomization:
     operation: "additive"
     distribution: "uniform"
 
+  # ⛔ 위 두 키는 **독립적으로** 뽑힌다. "실제 영점 드리프트는 둘 다 일으키므로 같이
+  # 켠다"는 주석의 의도와 코드가 다르다. 실기의 엔코더 영점 오차 b 는
+  # encoder_bias = +b 이면서 target_offset = −b 일 때만 정확히 재현된다
+  # (goal_pose.py::_resample_joint_zero 의 유도 참조). 독립 draw 는 "엔코더가 X,
+  # 구동기가 무관한 Y 만큼 틀어진 두 개의 다른 고장"이고 훨씬 거칠다.
+  #
+  # joint_zero.enabled 를 켜면 위 두 키 대신 이 블록이 쓰인다(상호배타).
+  # 전부 기본 off 라 기존 arm 은 무관하다.
+  joint_zero:
+    enabled: false
+    max_deg: 10.0          # 커리큘럼 천장. level=1.0 일 때의 진폭.
+    curriculum: true       # env 마다 수준을 들고 성공하면 올리고 넘어지면 내린다.
+    init_level: 0.1        # 시작 = max_deg 의 10 % = ±1°
+    min_level: 0.0
+    step: 0.05
+    # 고장의 모양. 원인마다 상관구조가 다르고, iid 균일은 그중 물리적으로 가장
+    # 일어나기 어려우면서 동시에 가장 파괴적인 하나일 뿐이다.
+    modes:
+      iid: 0.20            # 조립 공차 (작은 독립 오차)
+      single: 0.30         # 한 관절만 크게 -- 부딪힘, 벨트 슬립, 백래시
+      leg_common: 0.20     # 한 다리 전체 -- 잘못된 자세에서 재캘리브레이션
+      anti_mirror: 0.20    # 좌우 반대 ← 실기 증상을 재현한 모양(ibatch 8-43)
+      mirror: 0.10         # 좌우 같은 방향 -- 캘리브레이션 루틴의 계통 오차
+    # 관절별 민감도. 비우면 전부 1.0. 순서는 URDF 관절 순서
+    # (왼 Hip_P/Hip_R/Hip_Y/Knee/Ankle_P/Ankle_R, 오른쪽 동일).
+    # Hip_Roll 이 낮은 근거: ±2° 에서 이미 토크 20 % 포화였다(2026-08-05 스윕).
+    joint_weight: [1.0, 0.5, 1.0, 1.0, 0.7, 0.7,
+                   1.0, 0.5, 1.0, 1.0, 0.7, 0.7]
+
   # 발목 전용 이득 오차. env는 goal_pose.py에서 이 키를 읽는다. 여기 no-op으로
   # 선언해 두는 것은 joint_encoder_bias와 같은 이유다 -- set_dotted가 base에 없는
   # 경로를 거부하므로, 선언이 없으면 arm이 이 레버를 켤 수 없다.
