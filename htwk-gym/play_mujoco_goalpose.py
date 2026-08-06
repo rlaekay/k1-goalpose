@@ -201,6 +201,12 @@ def main():
                     help="--filter-hz 로 느린 루프를 흉내내되, 계수를 실측 dt에서 다시 "
                          "계산해 시정수를 10 ms로 고정한다(deploy의 --rate-fixed-filter와 "
                          "같은 수정). 이것이 증상을 없애면 그 수정이 옳다는 증거다.")
+    ap.add_argument("--real-asset", action="store_true",
+                    help="로봇 실물 질량·관성으로 돌린다(K1_serial_realmass.xml). "
+                         "⛔ 기본 K1_serial.xml은 총 질량 18.7142 kg으로 **학습 자산과 같다** -- "
+                         "즉 지금까지의 Isaac 대 MuJoCo 교차검증은 같은 잘못된 로봇 두 개를 "
+                         "비교한 것이고 실기 실패가 재현될 리가 없었다. 실물은 19.666 kg, "
+                         "Ixx +14.2 %, Izz yaw +19.3 %, CoM -10.8 mm, 발 질량 +29 %.")
     ap.add_argument("--contact-stiff", type=float, default=None,
                     help="접촉 solref의 시간상수(초). 작을수록 딱딱하다. MuJoCo 기본 0.02. "
                          "실기 발목 roll은 평균 -5 W로 **역구동**된다(MuJoCo -0.55/+1.17). "
@@ -285,7 +291,9 @@ def main():
     default_q = np.array(cfg["common"]["default_qpos"], dtype=np.float64)
     nj = default_q.size                   # 22
 
-    mjcf_path = MJCF
+    mjcf_path = ("resources/K1/K1_serial_realmass.xml" if args.real_asset else MJCF)
+    if args.real_asset:
+        print("자산: 로봇 실물 (19.666 kg)")
     if args.foot_inertia == "urdf":
         mjcf_path = _write_urdf_foot_variant(MJCF)
         print("발 관성: 학습 URDF 값을 강제 (%s)" % mjcf_path)
