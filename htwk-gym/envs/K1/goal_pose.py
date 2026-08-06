@@ -574,6 +574,15 @@ class GoalPose(BaseTask):
             self._obs_delay[env_ids] = torch.randint(
                 int(cfg[0]), int(cfg[1]) + 1, (len(env_ids),), device=self.device)
             self._obs_hist[:, env_ids] = self.obs_buf[env_ids]
+        # 관측 이력도 같은 이유로 지운다. 지연 버퍼와 별개의 버퍼이므로 따로 지워야
+        # 한다 -- 안 지우면 리셋된 env가 넘어지기 직전 k 프레임을 이력으로 물려받고,
+        # 정책은 "방금 넘어졌다"는 과거를 보면서 새 에피소드를 시작한다.
+        # ⚠️ _obs_stack의 프레임 폭은 이력이 붙기 **전**의 폭이라, 여기서 쓰는
+        # self.obs_buf(이미 이력이 붙어 넓어진 것)를 그대로 넣으면 안 된다.
+        # 앞쪽 한 프레임만 잘라 쓴다.
+        if hasattr(self, "_obs_stack"):
+            w = self._obs_stack.shape[-1]
+            self._obs_stack[:, env_ids] = self.obs_buf[env_ids, :w]
 
     def _update_goal_state(self):
         """Recompute the goal position/heading relative to the robot's current local
@@ -854,7 +863,8 @@ class GoalPose(BaseTask):
                 ) * self.cfg["normalization"]["dof_pos"]),
                 self._obs_dofs(apply_randomization(self.dof_vel, self.cfg["noise"].get("dof_vel")) * self.cfg["normalization"]["dof_vel"]),
                 self.actions,
-            ),
+            )
+            + self._obs_extra_channels(),
             dim=-1,
         )
         self.privileged_obs_buf = torch.cat(
@@ -864,11 +874,119 @@ class GoalPose(BaseTask):
                 apply_randomization(self.base_pos[:, 2] - self.terrain.terrain_heights(self.base_pos), self.cfg["noise"].get("height")).unsqueeze(-1),
                 self.pushing_forces[:, 0, :] * self.cfg["normalization"]["push_force"],
                 self.pushing_torques[:, 0, :] * self.cfg["normalization"]["push_torque"],
-            ),
+            )
+            + self._privileged_extra_channels(),
             dim=-1,
         )
         self._apply_obs_delay()
+        self._apply_obs_history()
+        self._assert_obs_width()
         self.extras["privileged_obs"] = self.privileged_obs_buf
+
+    # ---- 관측 확장 (전부 기본 off) --------------------------------------
+    #
+    # 왜 이 세 가지인가. 실기 문제는 두 갈래로 정리돼 있다(ibatch §8-43, §8-44):
+    # (P1) 과제가 보행을 요구한 적이 없다 -> N 배치가 다룬다.
+    # (P2) 실기 제어 루프가 학습이 가정한 것보다 느리다 -> 다리 교차, Hip_Roll 표류,
+    #      발목 역구동. 여기가 **관측으로 답할 수 있는** 부분이다.
+    #
+    # 정보량 기준으로 줄을 세우면:
+    #   * 이력(history)   — 진짜 새 정보(시간축). 단일 프레임 정책은 기억이 없어서
+    #     자기 지연을 추정할 수 없다. 지연을 랜덤화해도 정책이 할 수 있는 최선은
+    #     "보수적으로 굴기"뿐이다. 이력이 있으면 지연을 **식별해서 보상**할 수 있다.
+    #     보행 RL 배포에서 사실상 표준인데 우리는 없다.
+    #   * 토크(dof_tau)   — 진짜 새 정보. 위치/속도의 함수가 아니다. 접촉과 하중을
+    #     싣고 있고, 실기의 발목 역구동(−5 W)은 애초에 토크 영역의 사실이다.
+    #   * 발 오프셋       — 관절각의 결정론적 함수라 **새 정보가 아니라 특징공학**이다.
+    #     그래도 값어치가 있다: 발에 관한 보상이 여섯 개인데(feet_offset_y, feet_cross,
+    #     feet_swing, feet_slip, foot_yaw_L/R) 정책은 그중 무엇도 직접 보지 못하고
+    #     12개 관절각에서 FK로 유추해야 한다. MA_feetcross에서 feet_cross가 학습 중
+    #     −0.183 -> −0.287로 **나빠진** 것이 그 어려움의 증거다.
+    #
+    # 레이아웃은 warm start 수술이 가능한 순서로 고정한다:
+    #     [legacy 54] [foot_offset 2] [dof_tau 12]   <- 한 프레임
+    #     [frame_t] [frame_{t-1}] ... [frame_{t-k+1}]  <- 이력 스택
+    # 그래서 옛 가중치는 항상 새 행렬의 [:, :54]에 그대로 들어가고, 새 열을 0으로
+    # 채우면 수술 직후 정책이 **기능적으로 동일**하다. tools/expand_checkpoint.py 참조.
+    def _obs_extra_channels(self):
+        obs_cfg = self.cfg.get("observation") or {}
+        out = ()
+        if obs_cfg.get("extra_foot_offset"):
+            fx, fy = self.get_feet_offset()
+            # y는 이미 feet_distance_ref를 뺀 상대 오프셋이다. 절대 간격으로 되돌려
+            # 준다 -- 정책이 알아야 하는 것은 "기준 대비 얼마"가 아니라 "발이 서로
+            # 얼마나 가까운가"이고, 교차는 그 절대량의 문제다.
+            gap = fy + self.cfg["rewards"]["feet_distance_ref"]
+            out = out + (torch.stack((fx, gap), dim=-1)
+                         * self.cfg["normalization"].get("foot_offset", 5.0),)
+        if obs_cfg.get("extra_dof_tau"):
+            # 관절별 **토크 점유율**로 정규화한다. 스칼라 상수를 곱하는 것보다 나은
+            # 이유: 관절마다 한계가 다르므로(엉덩이 대 발목) 같은 Nm 이 같은 의미가
+            # 아니고, 점유율은 그대로 [-1, 1] 근방에 들어가 정규화가 필요 없다.
+            # eval 의 torque_occupancy 와 같은 양이라 학습 중 값과 평가 지표가
+            # 같은 자를 쓴다. torque_limits 가 아직 0 이면(초기화 순서) 상수로 뒤로 뺀다.
+            lim = getattr(self, "torque_limits", None)
+            if lim is not None and bool((lim > 0).all()):
+                tau = self.torques / lim.clamp(min=1e-6)
+            else:
+                tau = self.torques * self.cfg["normalization"].get("dof_tau", 0.05)
+            out = out + (self._obs_dofs(
+                apply_randomization(tau, self.cfg["noise"].get("dof_tau"))),)
+        return out
+
+    def _privileged_extra_channels(self):
+        """비평자 전용. 배포에 나가지 않으므로 하드웨어 가용성 제약이 없다.
+
+        지금 비평자는 우리가 거는 랜덤화의 대부분을 못 본다. 그러면 같은 관측인데
+        조건이 다른 env들의 가치를 하나로 평균해야 하고, DR이 셀수록 가치추정이
+        흐려진다. 비대칭 actor-critic의 요점이 정확히 이걸 피하는 것이다.
+        """
+        if not (self.cfg.get("observation") or {}).get("privileged_extra"):
+            return ()
+        contact_z = self.contact_forces[:, self.feet_indices, 2] * 0.01   # 100 N -> 1.0
+        delay = getattr(self, "_obs_delay", None)
+        if delay is None:
+            delay = torch.zeros(self.num_envs, device=self.device)
+        return (contact_z, delay.float().unsqueeze(-1))
+
+    def _apply_obs_history(self):
+        """최근 k 프레임을 이어 붙인다. k=1이면 정확한 no-op이다.
+
+        리셋 처리가 지연 버퍼와 같은 이유로 필요하다: 안 지우면 리셋된 env가
+        넘어지기 직전 프레임들을 이력으로 물려받는다. reset 경로에서 지운다.
+        """
+        k = int((self.cfg.get("observation") or {}).get("history_steps", 1) or 1)
+        if k <= 1:
+            return
+        w = self.obs_buf.shape[-1]
+        if not hasattr(self, "_obs_stack") or self._obs_stack.shape != (k, self.num_envs, w):
+            self._obs_stack = self.obs_buf.unsqueeze(0).repeat(k, 1, 1).clone()
+        # 새 프레임을 앞으로 밀어 넣는다. [t, t-1, ..., t-k+1] 순서를 유지해야
+        # 수술이 [:, :54]에 옛 가중치를 넣는 것과 일치한다.
+        self._obs_stack = torch.cat(
+            (self.obs_buf.unsqueeze(0), self._obs_stack[:-1]), dim=0)
+        self.obs_buf = self._obs_stack.permute(1, 0, 2).reshape(self.num_envs, k * w)
+
+    def _assert_obs_width(self):
+        """config의 num_observations와 실제 폭이 어긋나면 **바로** 죽는다.
+
+        조용히 어긋나면 버퍼가 잘리거나 0으로 채워진 채 몇 시간을 학습한다.
+        이 저장소에서 '고쳤다고 생각했는데 코드에 안 닿았다'가 반복된 부류라
+        추론이 아니라 검사로 막는다.
+        """
+        if getattr(self, "_obs_width_checked", False):
+            return
+        self._obs_width_checked = True
+        want_o = int(self.cfg["env"]["num_observations"])
+        got_o = int(self.obs_buf.shape[-1])
+        want_p = int(self.cfg["env"]["num_privileged_obs"])
+        got_p = int(self.privileged_obs_buf.shape[-1])
+        if got_o != want_o or got_p != want_p:
+            raise RuntimeError(
+                "관측 폭 불일치: num_observations config={} 실제={}, "
+                "num_privileged_obs config={} 실제={}. "
+                "observation 블록(history_steps/extra_*)을 켰으면 env의 두 값도 "
+                "같이 고쳐야 한다.".format(want_o, got_o, want_p, got_p))
 
     def _apply_obs_delay(self):
         """관측을 per-env로 지연시킨다. 학습이 유일하게 모델링하지 않던 축이다.

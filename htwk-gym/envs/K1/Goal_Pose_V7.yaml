@@ -16,6 +16,28 @@ env:
   num_actions: 12
   env_spacing: 1.  # not used with plane terrain
 
+# 관측 확장. 전부 기본 off라 이 블록이 있는 것만으로는 아무것도 바뀌지 않는다.
+# 켜면 env.num_observations / num_privileged_obs 도 **같이** 고쳐야 하고,
+# 안 고치면 _assert_obs_width 가 첫 스텝에 죽인다(조용히 잘리는 것보다 낫다).
+#
+# 한 프레임 폭 = 54 + 2*extra_foot_offset + 12*extra_dof_tau
+# num_observations = 한 프레임 폭 * history_steps
+# num_privileged_obs = 14 + 3*privileged_extra
+observation:
+  # 좌우 발의 x 오프셋과 절대 간격(2채널). 관절각의 결정론적 함수라 새 정보는
+  # 아니지만, 발에 관한 보상이 여섯 개인데 정책은 그중 무엇도 직접 보지 못한다.
+  extra_foot_offset: false
+  # 실측 관절 토크(12채널). 위치·속도의 함수가 아닌 진짜 새 정보이고, 접촉과
+  # 하중을 싣고 있다. 실기의 발목 역구동(-5 W)은 토크 영역의 사실이다.
+  extra_dof_tau: false
+  # 최근 k 프레임 스택. 1이면 정확한 no-op. 단일 프레임 정책은 기억이 없어서
+  # 자기 지연을 추정할 수 없고, 지연을 랜덤화해도 할 수 있는 최선이 "보수적으로
+  # 굴기"뿐이다. 이력이 있으면 지연을 식별해서 보상할 수 있다.
+  history_steps: 1
+  # 비평자 전용 3채널(양발 수직 접촉력 2 + 그 env의 관측지연 1). 배포에 안 나가므로
+  # 하드웨어 가용성 제약이 없다. 지금 비평자는 우리가 거는 랜덤화 대부분을 못 본다.
+  privileged_extra: false
+
 runner:
   horizon_length: 24
   mini_epochs: 5   # was 20; rsl_rl/legged_gym standard is 5 learning epochs -- 4x less
@@ -287,6 +309,9 @@ normalization:
   push_force: 0.1
   push_torque: 0.5
   clip_actions: 1.
+  # observation.extra_* 를 켰을 때만 쓰인다.
+  foot_offset: 5.0          # 발 간격 0.2 m -> 1.0
+  dof_tau: 0.05             # 20 Nm -> 1.0
 
 noise:
   # BT/perception goal model (sim2real): on the real robot goal_rel_x/y and
@@ -326,6 +351,15 @@ noise:
   # 모이면서 발끼리 부딪혀 넘어짐"을 재현했다(교차 2.3% -> 9.2%, 실기 9.9%).
   # 1 step = 20 ms. [0,0] = 정확한 no-op.
   obs_delay_steps: [0, 0]
+
+  # observation.extra_dof_tau 를 켰을 때만 쓰인다. 실기 tau 는 모터 전류 기반
+  # 추정치라 sim 의 PD 출력과 스케일도 노이즈도 다르다. 관측에 넣으려면 그 차이를
+  # 랜덤화로 덮어야 한다 -- 안 덮으면 정책이 sim 고유의 깨끗한 토크에 기대게 된다.
+  # 단위는 Nm 이 아니라 **토크 점유율**(tau / torque_limit)이다. 0.05 = 한계의 5 %.
+  dof_tau:
+    range: [0., 0.05]
+    operation: "additive"
+    distribution: "gaussian"
 
   gravity:
     range: [0., 0.01]

@@ -92,6 +92,30 @@ class GoalPosePolicy:
 
         self.commands = np.zeros(10, dtype=np.float32)
         self.commands[3] = self.gait_frequency  # style slots [4:10] stay 0.0
+
+        # 관측 확장. 학습 config 와 **같은 값**이어야 하고, 여기서 폭을 계산해
+        # num_observations 와 대조한다 -- 어긋나면 정책을 올리기 전에 죽는다.
+        # 순서가 어긋난 관측은 예외를 내지 않고 그냥 이상하게 걷기 때문에,
+        # 하드웨어에 나가기 전 정적 검사로 막는 것이 유일하게 확실한 방법이다.
+        self.history_steps = int(c.get("history_steps", 1) or 1)
+        self.frame_width = (54
+                            + (2 if c.get("extra_foot_offset") else 0)
+                            + (self.num_act if c.get("extra_dof_tau") else 0))
+        expected_obs = self.frame_width * self.history_steps
+        if expected_obs != self.num_obs:
+            raise ValueError(
+                "관측 폭 불일치: config 조합이 {} (프레임 {} x 이력 {})인데 "
+                "num_observations 는 {}. 학습 config 의 observation 블록과 "
+                "env.num_observations 를 그대로 옮겨 적어라.".format(
+                    expected_obs, self.frame_width, self.history_steps, self.num_obs))
+        if c.get("extra_dof_tau") and len(c.get("torque_limits", [])) != self.num_act:
+            raise ValueError(
+                "extra_dof_tau 에는 policy.torque_limits 가 다리 관절 수({})만큼 "
+                "필요하다. 학습 자산의 관절 한계와 같은 값이어야 한다.".format(self.num_act))
+        self._frame = np.zeros(self.frame_width, dtype=np.float32)
+        self._hist = np.zeros((self.history_steps, self.frame_width), dtype=np.float32)
+        self._hist_primed = False
+
         self.obs = np.zeros(self.num_obs, dtype=np.float32)
         self.actions = np.zeros(self.num_act, dtype=np.float32)
         self.dof_targets = np.copy(self.default_dof_pos)
@@ -156,8 +180,38 @@ class GoalPosePolicy:
         self.gait_process = float(np.fmod(self.gait_process + dt * self.gait_frequency, 1.0))
         return self.gait_process
 
+    # ---- 관측 확장 (envs/K1/goal_pose.py::_obs_extra_channels 와 짝) --------
+    #
+    # 학습 쪽 레이아웃 규약을 그대로 따른다:
+    #     한 프레임 = [legacy 54][foot_offset 2][dof_tau 12]
+    #     전체      = [frame_t][frame_{t-1}] ... [frame_{t-k+1}]
+    #
+    # 어느 것이 켜졌는지는 config 가 정한다. num_observations 로 역산하지 않는다 --
+    # 폭이 같은 조합이 여럿이라 역산은 조용히 틀릴 수 있고, 관측 순서가 어긋난
+    # 정책은 죽지 않고 그냥 이상하게 걷는다(가장 잡기 어려운 실패다).
+    def _extra_frame(self, dof_pos, dof_vel, dof_tau, foot_offset):
+        c = self.cfg["policy"]
+        parts = []
+        if c.get("extra_foot_offset"):
+            if foot_offset is None:
+                raise ValueError(
+                    "policy.extra_foot_offset 이 켜져 있는데 inference 가 "
+                    "foot_offset 을 받지 못했다. 호출자가 FK 로 (x, gap) 을 줘야 한다.")
+            parts.append(np.asarray(foot_offset, dtype=np.float32)
+                         * c["normalization"].get("foot_offset", 5.0))
+        if c.get("extra_dof_tau"):
+            if dof_tau is None:
+                raise ValueError(
+                    "policy.extra_dof_tau 가 켜져 있는데 inference 가 dof_tau 를 "
+                    "받지 못했다. deploy 는 motor.tau_est 를 이미 읽고 있다.")
+            lim = np.asarray(c["torque_limits"], dtype=np.float32)
+            parts.append(np.asarray(dof_tau, dtype=np.float32)[self.leg_start:]
+                         / np.maximum(lim, 1e-6))
+        return np.concatenate(parts).astype(np.float32) if parts else None
+
     def inference(self, time_now, dof_pos, dof_vel, base_ang_vel, projected_gravity,
-                  goal_rel_x, goal_rel_y, heading_error):
+                  goal_rel_x, goal_rel_y, heading_error,
+                  dof_tau=None, foot_offset=None):
         self.advance_gait_clock(time_now)
 
         # Goal command, robot-local frame, clamped to the E0-trained goal range.
@@ -168,14 +222,33 @@ class GoalPosePolicy:
 
         n = self.cfg["policy"]["normalization"]
         ls = self.leg_start
-        self.obs[0:3] = projected_gravity * n["gravity"]
-        self.obs[3:6] = base_ang_vel * n["ang_vel"]
-        self.obs[6:16] = self.commands * self.commands_scale
-        self.obs[16] = np.cos(2.0 * np.pi * self.gait_process)
-        self.obs[17] = np.sin(2.0 * np.pi * self.gait_process)
-        self.obs[18:30] = (dof_pos - self.default_dof_pos)[ls:] * n["dof_pos"]
-        self.obs[30:42] = dof_vel[ls:] * n["dof_vel"]
-        self.obs[42:54] = self.actions
+        frame = self._frame
+        frame[0:3] = projected_gravity * n["gravity"]
+        frame[3:6] = base_ang_vel * n["ang_vel"]
+        frame[6:16] = self.commands * self.commands_scale
+        frame[16] = np.cos(2.0 * np.pi * self.gait_process)
+        frame[17] = np.sin(2.0 * np.pi * self.gait_process)
+        frame[18:30] = (dof_pos - self.default_dof_pos)[ls:] * n["dof_pos"]
+        frame[30:42] = dof_vel[ls:] * n["dof_vel"]
+        frame[42:54] = self.actions
+        extra = self._extra_frame(dof_pos, dof_vel, dof_tau, foot_offset)
+        if extra is not None:
+            frame[54:] = extra
+
+        if self.history_steps <= 1:
+            self.obs[:] = frame
+        else:
+            # 첫 호출에서는 이력이 없다. 0 으로 채우면 정책이 "중력 0 이었던 과거"를
+            # 보게 되므로, 학습 쪽 _apply_obs_history 와 같이 **현재 프레임으로**
+            # 채운다. 그래야 sim 의 에피소드 시작과 실기의 정책 시작이 같은 모양이다.
+            if not self._hist_primed:
+                for i in range(self.history_steps):
+                    self._hist[i] = frame
+                self._hist_primed = True
+            else:
+                self._hist[1:] = self._hist[:-1]
+                self._hist[0] = frame
+            self.obs[:] = self._hist.reshape(-1)
 
         with torch.inference_mode():
             output = self.policy(torch.from_numpy(self.obs).unsqueeze(0))
