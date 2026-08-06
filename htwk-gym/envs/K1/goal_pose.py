@@ -573,7 +573,12 @@ class GoalPose(BaseTask):
         if cfg and int(cfg[1]) > 0 and hasattr(self, "_obs_delay"):
             self._obs_delay[env_ids] = torch.randint(
                 int(cfg[0]), int(cfg[1]) + 1, (len(env_ids),), device=self.device)
-            self._obs_hist[:, env_ids] = self.obs_buf[env_ids]
+            # ⚠️ 폭을 잘라서 넣어야 한다. 리셋은 _compute_observations **뒤에** 돌고,
+            # 이력(history_steps>1)이 켜져 있으면 그 시점의 self.obs_buf 는 이미
+            # k 프레임이 이어 붙어 넓어져 있다. 지연 링 버퍼는 한 프레임 폭이므로
+            # 통째로 넣으면 broadcast 에러가 난다 -- 지연과 이력을 둘 다 켠 N4_hist
+            # 스모크가 정확히 이걸로 죽었다(shape [270] vs [3,1,54]).
+            self._obs_hist[:, env_ids] = self.obs_buf[env_ids, :self._obs_hist.shape[-1]]
         # 관측 이력도 같은 이유로 지운다. 지연 버퍼와 별개의 버퍼이므로 따로 지워야
         # 한다 -- 안 지우면 리셋된 env가 넘어지기 직전 k 프레임을 이력으로 물려받고,
         # 정책은 "방금 넘어졌다"는 과거를 보면서 새 에피소드를 시작한다.
