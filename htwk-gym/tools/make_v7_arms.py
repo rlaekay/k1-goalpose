@@ -701,6 +701,63 @@ N_ARMS = {
     "N3_pathcross": merge(_N_BASE, _PATH_ON, {"rewards.scales.feet_cross": -20.0}),
 }
 
+
+# ---- N 배치 관측 확장 (2026-08-07) ------------------------------------------
+#
+# 여기까지의 arm은 전부 **보상과 과제**를 건드렸다. 이 네 개는 정책이 **무엇을 보는가**를
+# 건드린다. 실기 문제 P2("제어 루프가 학습 가정보다 느리다" — 다리 교차, Hip_Roll 표류,
+# 발목 역구동)에 관측으로 답할 수 있는 것이 무엇인지 하나씩 가른다.
+#
+# 전부 `N1_path` 위에 얹는다. 이유가 있다: 이 증상들은 **걸을 때** 나온다. waypoint
+# 과제(요구 속도 median 0.12 m/s, 42%가 사실상 서 있기)에서는 발현될 기회 자체가 적어
+# MA_feetcross와 MB_obsdelay가 그 위에서 돈 것이 이미 낭비였다.
+#
+# ⚠️ warm start는 **N1의 최종 체크포인트에 수술을 해서** 쓴다(tools/expand_checkpoint.py).
+# 새 열이 0이라 수술 직후 정책이 N1과 출력이 완전히 같고(float64 검증: actor 0.0,
+# critic 2.8e-14), 그래서 "N1 대 N4"가 정확히 "이력을 더하니 좋아지는가"가 된다.
+# 처음부터 다시 학습하면 그 비교가 '관측'이 아니라 '학습 예산'을 재게 된다 --
+# 이 저장소가 반복해서 낸 오류가 그 부류다.
+#
+# 폭은 코드가 아니라 규약에서 나온다:
+#   한 프레임 = 54 + 2*extra_foot_offset + 12*extra_dof_tau
+#   num_observations = 한 프레임 * history_steps
+#   num_privileged_obs = 14 + 3*privileged_extra
+# 어긋나면 _assert_obs_width가 첫 스텝에 죽인다.
+N_OBS_ARMS = {
+    # 이력 5프레임(=100 ms). 지연 랜덤화와 짝이다: 지연을 겪게 하되 그것을 식별할
+    # 수단을 같이 준다. MB_obsdelay는 지연만 주고 수단은 안 줬다.
+    "N4_hist": merge(_N_BASE, _PATH_ON, {
+        "observation.history_steps": 5,
+        "noise.obs_delay_steps": [0, 2],
+        "env.num_observations": 270,
+    }),
+    # 실측 관절 토크. 접촉·하중을 싣는 진짜 새 정보다.
+    "N5_tau": merge(_N_BASE, _PATH_ON, {
+        "observation.extra_dof_tau": True,
+        "env.num_observations": 66,
+    }),
+    # 좌우 발 x 오프셋과 절대 간격. 새 정보는 아니고 특징공학이다.
+    "N6_foot": merge(_N_BASE, _PATH_ON, {
+        "observation.extra_foot_offset": True,
+        "env.num_observations": 56,
+    }),
+    # 비평자만 넓힌다. **배포되는 정책의 입력은 한 글자도 안 바뀐다** --
+    # 그래서 이 arm이 이득을 내면 sim2real 위험 없이 그냥 가져올 수 있다.
+    "N7_critic": merge(_N_BASE, _PATH_ON, {
+        "observation.privileged_extra": True,
+        "env.num_privileged_obs": 17,
+    }),
+}
+N_ARMS.update(N_OBS_ARMS)
+
+# 수술이 필요한 arm과 그 목표 폭. 큐 작업 스크립트가 이 표를 읽어 체크포인트를 넓힌다.
+OBS_SURGERY = {
+    "N4_hist":   {"new_obs": 270, "new_priv": 14},
+    "N5_tau":    {"new_obs": 66,  "new_priv": 14},
+    "N6_foot":   {"new_obs": 56,  "new_priv": 14},
+    "N7_critic": {"new_obs": 54,  "new_priv": 17},
+}
+
 # M3/M4는 checkpoint 없이 돈다. utils/runner.py:167 `if not checkpoint: return`이
 # 그 경로이므로 train 명령에서 --checkpoint를 빼면 된다. SCRATCH_ARMS가 그 표식이다.
 SCRATCH_ARMS = {"M3_scratch_phase", "M4_scratch_phasefree"}
@@ -774,6 +831,8 @@ GPU_OF = {
     "N1_path": "cuda:1",
     "N2_pathgrid": "cuda:0",
     "N3_pathcross": "cuda:0",
+    "N4_hist": "cuda:0", "N5_tau": "cuda:1",
+    "N6_foot": "cuda:0", "N7_critic": "cuda:1",
 }
 
 
