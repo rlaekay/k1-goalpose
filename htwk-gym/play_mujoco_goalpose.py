@@ -340,9 +340,20 @@ def main():
     mujoco.mj_forward(model, data)
 
     renderer = None
+    scene_opt = None
     frames = []
     if args.video:
         renderer = mujoco.Renderer(model, height=480, width=640)
+        # The feet carry TWO geoms: the detailed mesh (group 1, contype=0 --
+        # visual only) and the collision box (no group -> group 0, opaque grey,
+        # same rgba).  MuJoCo draws both, so the box is painted over the mesh and
+        # the foot renders as a bare slab -- which reads as the wrong foot
+        # entirely.  The geometry is right (box 16.0 x 7.0 cm, mesh 16.5 x 7.8,
+        # feet_edge_pos -0.066..0.094 x +-0.035); only the picture was wrong.
+        # Hide group 0 so the video shows the shape, not the collider.
+        scene_opt = mujoco.MjvOption()
+        mujoco.mjv_defaultOption(scene_opt)
+        scene_opt.geomgroup[0] = 0
     frame_every = max(1, int(round(1.0 / (args.fps * dt))))
 
     # ---- 목표 관리 ---------------------------------------------------------
@@ -554,7 +565,7 @@ def main():
             mujoco.mjv_defaultCamera(cam)
             cam.lookat[:] = [data.qpos[0], data.qpos[1], 0.35]
             cam.distance, cam.azimuth, cam.elevation = 3.0, 130.0, -15.0
-            renderer.update_scene(data, camera=cam)
+            renderer.update_scene(data, camera=cam, scene_option=scene_opt)
             frames.append(renderer.render())
 
     # ---- 결과 --------------------------------------------------------------
