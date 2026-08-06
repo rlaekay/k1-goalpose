@@ -37,8 +37,9 @@ stage() {
 # 그래서 이 arm 은 N1 과 완전히 같은 정책에서 출발하고, 'N1 대 $arm' 이 정확히
 # "관측을 더하니 좋아지는가" 가 된다. 처음부터 학습하면 그 비교가 관측이 아니라
 # 학습 예산을 재게 된다 -- 이 저장소가 반복해서 낸 오류가 그 부류다.
-D=\$(ls -1td logs/K1/K1/Goal_Pose_V7/*_N1_path 2>/dev/null | head -1)
-if [ -z "\$D" ]; then echo "N1_path run dir 이 없다 -- 건너뛴다."; exit 0; fi
+# 시간순 최신이 아니라 **실제로 학습된** run 을 고른다. 2026-08-07 에 3-iteration
+# 스모크가 더 최신이라 eval 이 체크포인트 0개짜리를 집은 사고가 있었다.
+D=\$(MIN_CKPT=10 bash tools/pick_run.sh N1_path) || exit 0
 CK="\$D/nn/best.pth"
 [ -e "\$CK" ] || CK=\$(ls -1v "\$D"/nn/model_*.pth 2>/dev/null | tail -1)
 if [ -z "\$CK" ]; then echo "N1_path 체크포인트가 없다 -- 건너뛴다."; exit 0; fi
