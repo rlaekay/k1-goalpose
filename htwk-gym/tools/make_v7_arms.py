@@ -630,6 +630,63 @@ M_ARMS = {
     }),
 }
 
+
+# ---- N 배치 (2026-08-06): 속도 수요를 되돌린다 -------------------------------
+#
+# ⛔ 왜 M 배치 전체가 요점을 빗나갔는가. 배포된 정책(I3b_stance10)과 M 배치 9개 arm이
+# 전부 `goal_mode_mixture: {waypoint: 1.0, path: 0.0}` 위에서 돌았다. _OFF_PATH가
+# _I1_BASE부터 상속돼 한 번도 꺼진 적이 없다. 그 과제를 실측하면:
+#
+#   stance10 평가 4,647 구간 -- 목표까지 거리 median 0.74 m, 42 %가 0.5 m 미만,
+#   **요구 속도 median 0.126 m/s**, 0.3 m/s를 넘는 구간이 12 %뿐.
+#
+# 즉 과제의 42 %가 사실상 "서 있기"이고, 지속 보행을 요구한 적이 없다. 베이스 config
+# 주석이 이미 그렇게 경고하고 있었다("waypoint ... can never teach or measure a
+# 1.3 m/s walk"). 그리고 평가가 같은 과제로 채점하므로 **지표가 보행을 잰 적이 없다** --
+# 3.86 cm라는 숫자가 좋아 보였던 이유다.
+#
+# 이것이 남은 제약을 전부 만족시키는 유일한 설명이다: 서 있기는 완벽하고(과제의 42 %),
+# 보행은 1-3 걸음에서 무너지며(지속 보행을 배운 적 없음), 남들은 되고(속도를 요구하는
+# 과제로 학습), E1(path 모드)로 학습한 사람은 걷는다.
+#
+# 결함 정정 두 가지가 모든 N arm에 공통으로 들어간다(레버가 아니다):
+#
+#   (a) base_height_target 0.55 -> 0.52. 실물 URDF(K1_robot_boxfoot)를 직접 재면
+#       Trunk 원점에서 Hip_Pitch까지 0.077, 거기서 발 링크까지 0.4367, 발바닥은
+#       링크 원점 아래 0.024(충돌 상자 origin z -0.008, 두께 0.032)이므로
+#       **다리를 완전히 편 최대 신장이 0.5377 m**다. 0.55는 도달 불가능하고,
+#       _reward_base_height = square(h - target)은 포화점이 없으므로 -20 스케일의
+#       "더 서라"가 영구히 남는다. 무릎을 펴는 방향이고, 보행에 정확히 해롭다.
+#       0.52는 base config 값이자 max_stride_m 0.28이 사이징된 기준이다.
+#       (L 배치가 같은 정정을 했는데 M 배치가 _I3_STANCE_BASE로 리베이스하면서 잃었다.)
+#   (b) save_interval 25 -> 100. 6000 iteration이면 240개가 아니라 60개가 남는다.
+#       선택기는 어차피 tail에서 12개만 뽑는다.
+#
+# ⚠️ 예산: 1500이 아니라 6000이다. warm start는 waypoint 정책이고 path 모드는 다른
+# 과제다. L3(phase-free)가 1000에서 무너진 것이 바로 이 실수였다 -- "클럭을 따르도록
+# 학습된 정책에게 클럭을 무시하라고 1000 iteration을 준 것"이라 재적응이 끝날 수 없었다.
+_N_BASE = merge(_M_BASE, _ROBOT_ASSET, {
+    "rewards.base_height_target": 0.52,
+    "runner.save_interval": 100,
+})
+
+# 베이스 config가 스스로 고른 값. dwell이 켜져 있어야 이 값이 안전하다 --
+# dwell 없이 path를 켠 v7 배치에서 waypoint 정확도가 6.3 -> 37.9 cm로 무너졌고,
+# dwell은 그 충돌을 없애려고 들어간 장치다(carrot이 멈춰서 도달 가능해진다).
+_PATH_ON = {"commands.goal_mode_mixture": {"waypoint": 0.65, "path": 0.35}}
+
+N_ARMS = {
+    # 대조군. path는 그대로 꺼져 있고 예산과 결함 정정만 N1/N2와 같다.
+    # 이게 없으면 "path가 좋아졌다"와 "6000 iteration이 좋아졌다"가 안 갈린다 --
+    # 이 저장소에서 반복해서 낸 오류가 정확히 그 부류다.
+    "N0_ctrl": merge(_N_BASE),
+    # 레버 하나: path 모드 + 스칼라 속도 커리큘럼(베이스 기본값).
+    "N1_path": merge(_N_BASE, _PATH_ON),
+    # N1 + (속도 x 곡률) 그리드 커리큘럼. N1과의 차이가 스케줄러 하나다.
+    "N2_pathgrid": merge(_N_BASE, _PATH_ON,
+                         {"commands.path.speed_grid.enabled": True}),
+}
+
 # M3/M4는 checkpoint 없이 돈다. utils/runner.py:167 `if not checkpoint: return`이
 # 그 경로이므로 train 명령에서 --checkpoint를 빼면 된다. SCRATCH_ARMS가 그 표식이다.
 SCRATCH_ARMS = {"M3_scratch_phase", "M4_scratch_phasefree"}
@@ -654,7 +711,7 @@ def set_dotted(cfg, dotted, value):
 # raised KeyError before it ever reached the per-arm is_v8 branch below --
 # G4 has never successfully generated a config, let alone run its smoke test.
 ALL_ARMS = dict(**ARMS, **F_ARMS, **I_ARMS, **I1_ARMS, **I2_ARMS, **I3_ARMS,
-                **I3A_ARMS, **I3B_ARMS, **L_ARMS, **M_ARMS, **V8_ARMS)
+                **I3A_ARMS, **I3B_ARMS, **L_ARMS, **M_ARMS, **N_ARMS, **V8_ARMS)
 
 # GPU 0 / GPU 1 split. F-batch: F1+F2 share GPU 0 (lighter, no disturbance),
 # F3 gets GPU 1 to itself (disturbance + higher flicker rate is the heavier one).
@@ -695,6 +752,13 @@ GPU_OF = {
     "M9_anklegain": "cuda:0",
     "MA_feetcross": "cuda:1",
     "MB_obsdelay": "cuda:0",
+    # N 배치: 대조군과 첫 path arm이 각각 다른 카드에서 동시에 출발한다. 둘의 차이가
+    # 레버 하나이므로 같은 카드에 두는 편이 열/클럭 조건까지 맞지만, 이번엔 결과를
+    # 15시간 안에 손에 쥐는 쪽이 우선이다 -- 두 카드 모두 4096 env 단독 점유라
+    # 조건 차이는 카드 개체차뿐이고, 그건 6000 iteration 학습 결과를 뒤집는 크기가 아니다.
+    "N0_ctrl": "cuda:0",
+    "N1_path": "cuda:1",
+    "N2_pathgrid": "cuda:0",
 }
 
 
