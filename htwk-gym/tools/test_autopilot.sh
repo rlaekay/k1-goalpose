@@ -30,8 +30,14 @@ EOF
 }
 
 run_once() {   # autopilot 을 한 바퀴만 돌린다
-    ( cd "$TMP" && timeout 12 env PROMOTE_AFTER="${PROMOTE_AFTER:-1800}" INTERVAL=600 \
-        bash tools/autopilot.sh >/dev/null 2>&1 || true )
+    # `timeout` 을 쓰지 않는다 -- macOS 에 없어서(coreutils 의 gtimeout 뿐) 시험 전체가
+    # 조용히 아무것도 실행하지 않고 "8건 실패"로 나왔다. 시험 하네스가 대상보다 먼저
+    # 틀린 경우이고, 실패 원인이 대상에 있는 것처럼 보였다.
+    ( cd "$TMP" && PROMOTE_AFTER="${PROMOTE_AFTER:-1800}" INTERVAL=600 \
+        bash tools/autopilot.sh >/dev/null 2>&1 & echo $! > "$TMP/.pid" )
+    sleep 3
+    kill "$(cat "$TMP/.pid" 2>/dev/null)" 2>/dev/null || true
+    sleep 0.3
 }
 
 echo "== 1. 유휴가 아니면 아무것도 안 한다 =="
