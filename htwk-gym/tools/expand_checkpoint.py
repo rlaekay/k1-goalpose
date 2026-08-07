@@ -89,6 +89,54 @@ def main():
         [(0, 0, args.old_obs),                                   # obs
          (args.old_obs, args.new_obs, args.old_priv)])           # privileged (이동)
 
+    # ---- 옵티마이저 상태도 같이 넓힌다 -----------------------------------
+    #
+    # ⛔ 이걸 빠뜨려서 NA_histzero 가 죽었다(2026-08-07). runner.py:204 가
+    # `optimizer.load_state_dict(model_dict["optimizer"])` 를 하는데, Adam 의
+    # state 는 **위치 기반**이고 load 시점에 모양을 검사하지 않는다. 그래서
+    # 학습이 정상적으로 시작하고 첫 `optimizer.step()` 에서야 터진다:
+    #     RuntimeError: tensor a (68) must match tensor b (284)
+    # (68 = 옛 critic 입력 54+14, 284 = 새 입력 270+14)
+    #
+    # 순전파만 검증하면 절대 못 잡는다 -- 그게 내가 낸 실수다. 아래 --verify 는
+    # 이제 실제로 optimizer.step() 을 돌린다.
+    #
+    # 매칭은 인덱스가 아니라 **모양**으로 한다. optimizer.state 의 키는
+    # param_groups 의 위치 인덱스인데 그 순서가 named_parameters() 순서와 다르다
+    # (실측: state[0] 이 logstd (1,12), state[1] 이 critic.0.weight (256,68)).
+    # (256, old_obs) 와 (256, old_obs+old_priv) 는 이 모델에서 유일하므로 모양이
+    # 인덱스보다 안전한 식별자다.
+    if "optimizer" in ck and isinstance(ck["optimizer"], dict):
+        ost = ck["optimizer"].get("state") or {}
+        want_actor = (aw.shape[0], args.old_obs)
+        want_critic = (cw.shape[0], args.old_obs + args.old_priv)
+        hits = {"actor": 0, "critic": 0}
+        for _, entry in ost.items():
+            for key in ("exp_avg", "exp_avg_sq"):
+                t = entry.get(key)
+                if not torch.is_tensor(t):
+                    continue
+                if tuple(t.shape) == want_actor:
+                    entry[key] = expand_linear_in(t, args.new_obs,
+                                                  [(0, 0, args.old_obs)])
+                    hits["actor"] += 1
+                elif tuple(t.shape) == want_critic:
+                    entry[key] = expand_linear_in(
+                        t, args.new_obs + new_priv,
+                        [(0, 0, args.old_obs),
+                         (args.old_obs, args.new_obs, args.old_priv)])
+                    hits["critic"] += 1
+        # 0 으로 채우는 것이 Adam 에서 옳다: 한 번도 갱신된 적 없는 파라미터의
+        # 1차/2차 모멘트가 정확히 0 이다. 새 열은 실제로 그런 파라미터다.
+        print("옵티마이저 상태 확장: actor {}개, critic {}개 텐서".format(
+            hits["actor"], hits["critic"]))
+        if args.new_obs != args.old_obs and hits["actor"] != 2:
+            raise SystemExit("⛔ actor 옵티마이저 상태를 못 찾았다(기대 2개, 발견 {})".format(
+                hits["actor"]))
+        if hits["critic"] != 2:
+            raise SystemExit("⛔ critic 옵티마이저 상태를 못 찾았다(기대 2개, 발견 {})".format(
+                hits["critic"]))
+
     if args.verify:
         sys.path.insert(0, ".")
         from utils.model import ActorCritic
@@ -129,6 +177,26 @@ def main():
         if da > 1e-10 or dv > 1e-10:
             raise SystemExit("⛔ 항등이 깨졌다. 저장하지 않는다.")
         print("검증 통과 -- 새 채널에 난수를 넣어도 출력이 옛 정책과 같다.")
+
+        # ⛔ 순전파 항등만으로는 부족하다. NA_histzero 는 위 검증을 통과하고도
+        # 첫 optimizer.step() 에서 죽었다 -- Adam 의 exp_avg 가 옛 모양이었기 때문이다.
+        # 그래서 학습이 실제로 하는 것(load -> backward -> step)을 그대로 돌려 본다.
+        if "optimizer" in ck:
+            m = ActorCritic(num_act, args.new_obs, new_priv)
+            m.load_state_dict(model, strict=False)
+            opt = torch.optim.Adam(
+                [m.logstd] + list(m.critic.parameters()) + list(m.actor.parameters()),
+                lr=1e-4)
+            try:
+                opt.load_state_dict(ck["optimizer"])
+            except Exception as exc:
+                raise SystemExit("⛔ 옵티마이저 상태를 못 읽는다: {}".format(exc))
+            for _ in range(2):
+                o = torch.randn(8, args.new_obs)
+                p = torch.randn(8, new_priv)
+                loss = m.actor(o).square().mean() + m.est_value(o, p).square().mean()
+                opt.zero_grad(); loss.backward(); opt.step()
+            print("검증 통과 -- optimizer.step() 2회가 실제로 돈다.")
 
     ck["model"] = model
     torch.save(ck, args.dst)
