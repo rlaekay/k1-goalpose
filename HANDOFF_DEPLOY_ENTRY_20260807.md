@@ -9,7 +9,11 @@
 
 ---
 
-## 0. 다음 한 걸음 — 이것만 하면 된다
+## 0. 이 문서의 판정 — 실행 순서에서 **3번**이다
+
+⛔ **먼저 [`DEPLOY_REQUESTS_FROM_TRAINING.md`](DEPLOY_REQUESTS_FROM_TRAINING.md) §0을
+읽어라.** 2026-08-08 감사가 4발자국을 목표로 실행 순서 6단계를 세웠고, **아래
+`--hold-diag`는 그중 3번**이다. 1·2가 더 싸고(전원도 필요 없다) 정보량이 크다.
 
 ```bash
 cd ~/Workspace/deploy && tmux new -s e0
@@ -17,14 +21,23 @@ python3 -u deploy_goal_pose.py --config Goal_Pose_E0.yaml \
   --goal-source fixed --goal "0,0,0" --hold-diag 15
 ```
 
-`b`를 누르고 **`hold-diag`의 `tilt` 한 값**만 보면 판정된다.
+`b`를 누르고 **`hold-diag`의 `tilt` 한 값**만 보면 이 문서의 수정이 판정된다.
 
 | tilt | 뜻 |
 |---|---|
 | **2° 안쪽** | 자세 수정이 맞았다. `r`로 진행 |
-| **4.9–13.8° 그대로** | 자세가 원인이 아니다 → 관절 영점 또는 IMU. `DEPLOY_REQUESTS_FROM_TRAINING.md` R4로 간다 |
+| **4.9–13.8° 그대로** | 자세가 원인이 아니다 → 관절 영점. **R4가 아니라 R7**이다(아래 §6) |
 
-⚠️ **다른 터미널을 미리 열어 둘 것.** `sshkeyboard`가 tty를 잡으면 Ctrl-C·SIGINT·
+### ⛔ 안전 — 두 가지
+
+**① 로봇을 매단 채로 `deploy_goal_pose.py`를 돌리지 마라.** tilt > 45°에서
+`_request_recovery` → **`kDamping`(하네스 안에서 툭 떨어진다)** → **공중에서
+GetUp(API 2008)** 이 돌고, 복귀 조건 `tilt < 0.35`를 못 맞춰 20초 타임아웃까지 간다.
+`--hold-diag`를 포함해 **이 스크립트는 무부하 시험용이 아니다.**
+무부하가 필요하면 `tools/probe_ankle_mapping.py`를 쓴다(정책 추론 없음, IMU 미사용,
+낙상 워치독 없음 — 닫히는 루프가 모터 드라이버 PD 하나뿐이라 안전하다).
+
+**② 다른 터미널을 미리 열어 둘 것.** `sshkeyboard`가 tty를 잡으면 Ctrl-C·SIGINT·
 SIGTERM이 전부 안 먹는다(2026-08-05에 SIGKILL로 죽여 DAMPING 전환을 못 했다).
 정지는 **`touch /tmp/e0_abort`**.
 
@@ -188,11 +201,19 @@ $ cat .../booster_interface/msg/__init__.py
 - **`r` 뒤 정책이 스스로 앞으로 넘어뜨리는지는 미확인.** 이번 로그의 낙상 넷은
   **사용자가 눕힌 것**이라 정책 탓으로 읽으면 안 된다. 자세 수정 뒤 `r`을 눌러
   `roll≈0 / pitch 45`가 다시 나오면 그때가 정책 문제다.
-- **관절 영점 실측(R4)** — `hold-diag`의 tilt가 그대로면 이것이 다음이다.
-  발을 평평하게 놓고 12관절 인코더 대 순기구학. `DEPLOY_REQUESTS_FROM_TRAINING.md` R4.
+- **관절 영점 실측** — `hold-diag`의 tilt가 그대로면 이것이 다음이다.
+  ⛔ **R4는 폐기됐고 R7이 대체한다**(2026-08-08). 내가 적었던 "발 평평 자세 하나로
+  순기구학과 비교"는 **원리적으로 안 풀린다** — hip/knee/ankle pitch가 셋 다 +y축이라
+  발바닥 pitch가 세 각의 **합**이고, 자세 하나로는 합 하나만 보인다(σ_min = 0, 특이).
+  R7이 12자세로 그 특이성을 푼다. 도구는 완성돼 있고 로봇에서 미실행이다.
 - **`/robot_state`(단수)와 `/motion_state`, `/enter_safe_mode`를 안 봤다.**
   특히 `/enter_safe_mode`(`booster_msgs/msg/BinaryData`)가 **빨간 프로텍트 발동을
   알려주는 토픽이면**, 지금은 못 보고 있는 그 순간을 감지할 수 있다.
+- ⛔ **이 문서보다 강한 리드가 생겼다** — [`AUDIT_20260807_2300.md`](AUDIT_20260807_2300.md):
+  **발목 roll이 URDF 하드 스톱(±0.345 rad) 밖에서 돈다**(실기 실측 −0.578 ~ +0.537,
+  초과 4~5 %, 붕괴 국면에 몰려 있다). 벤더 공개 사양(Ankle R ±20° = ±0.349)이 URDF를
+  지지하므로 **`motor_state_serial`이 URDF 관절각과 다른 양일 가능성**이 크고,
+  그러면 `obs[23]/obs[29]`가 학습과 다른 것을 싣는다. 실행 순서 1번이 이것이다.
 - **PD 게인이 Booster 기본값의 절반이다.** Booster Gym `T1.yaml`은 Hip/Knee
   kp 200 kd 5인데 우리는 100/2다(감쇠 지표 0.354 대 0.200). deploy config 주석은
   *"Frozen E0@6200 config"*라고만 적어 K1용 튜닝 근거가 없다. **미검증.**
