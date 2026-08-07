@@ -16,9 +16,14 @@
 >   **도착·정지를 제거한 조건**이라 사용자 요구 G2 와 같은 양이 아니다.
 >   **유효하게 남는 결론은 하나: 게이트 5 cm 를 통과하는 체크포인트가 없다.**
 > - 🔔 **백필 채점(`NC_actfilter` / `NZ_zeroiid`) 두 축 보고** — 사용자가 2026-08-07
->   22:1x 에 "백필 채점 끝나면 두 축 보고해"라고 요청했다. 백필 레인에서 학습과
->   병행 중이고 결과는 `logs/eval_rounds/n2na` 에 쌓인다
->   → `python tools/round_table.py logs/eval_rounds/n2na`.
+>   22:1x 에 "백필 채점 끝나면 두 축 보고해"라고 요청했다.
+>   ✅ **채점 완료(2026-08-08 01:1x). 숫자는 [OPINION_TRAINING_20260808.md](OPINION_TRAINING_20260808.md) §1-2 에 있다.**
+>   요약: `NZ_zeroiid` 정확도 10.43 cm / **낙상 0 (4,613구간, 표본탈락 0.00 %)**,
+>   보행 final 1.45 m/s **낙상 0**. `NC_actfilter` 19.92 cm / 낙상 31, 보행 final 1.49 / 낙상간격 802 s.
+>   ⛔ **두 arm 의 `best.pth` 가 it1700 대 it100 이다** — `claim_check.py` 는 둘 다
+>   `best.pth` 로 찍고 "조건이 전부 같다"를 통과시켰다(의견서 §1-3). 순위를 매기지 마라.
+>   ⛔ **그리고 `NZ_zeroiid` 는 `joint_zero.enabled: false` 로 채점됐다** — `NC` 와 같은
+>   결함이 영점 arm 에도 있다(의견서 §B-3).
 >
 >   ⚠️ **비교 규칙을 숫자 보기 전에 못 박아 둔다**(같은 실수를 열세 번 한 뒤에 만든 규칙):
 >   1. 둘 다 **계보 B**(`N1_path/model_100` warm start)다. **`N1_path` 와 나란히 놓지
@@ -31,6 +36,28 @@
 >   5. `v7_extras`(발 간격 등)는 **마지막 한 프레임 스냅샷**이라 인용하지 마라(C11).
 >   6. ⛔ `NC_actfilter` 의 레버(`action_filter_tau`)는 **공통 평가 config 에 없다** —
 >      채점은 필터 OFF 로 돈다. "필터를 학습시켰더니 좋아졌다"를 이 표로 말할 수 없다.
+> - 🔔 **계보 B 4셀 `model_6000` 재채점 보고** — 사용자가 2026-08-08 01:4x 에
+>   "model_6000 재채점 끝나면 4셀 비교 보고해"라고 요청했다.
+>   작업: `queue/small/gpu0/012-eval_lineageB_final.sh` → 결과 `logs/eval_rounds/lineageB`
+>   → `python tools/round_table.py logs/eval_rounds/lineageB`.
+>
+>   **왜 다시 재는가**: `claim_check` 가 막았다. `best.pth` 가 arm 마다 다른 iteration 을
+>   가리킨다(NE→`model_100`, NC→`model_100`, NZ→**`model_1700`**). 그대로 놓으면
+>   "레버 차이"와 "학습량 차이"가 교락된다 — RETRACTIONS C3 와 같은 모양이다.
+>
+>   ⚠️ **숫자 보기 전에 못 박아 두는 것**:
+>   1. **표 내기 전에 `claim_check` 를 돌려 ✅ 를 확인한다.** ⛔ 면 표를 내지 마라.
+>   2. **이건 완성된 2×2 가 아니다.** 셀 구성은
+>      `NE_ctrl100`(레버 없음, 대조군) / `NZ_zeroiid`(+영점) /
+>      `NC_actfilter`(+액션필터) / `NA_histzero`(+이력+지연+영점, 3레버).
+>      **`N4_hist`(이력 단독)는 보류 중이라 빠져 있다** → 2×2 의 네 번째 칸이 비었다.
+>   3. ⛔ **깨끗한 한 레버 비교는 `NE` 대 `NZ` 하나뿐이다.**
+>      - `NC_actfilter`: 레버(`action_filter_tau`)가 **공통 평가 config 에 없다** →
+>        필터 OFF 로 채점된다. 이 표로 "필터 학습이 효과 있다"를 말할 수 없다.
+>      - `NA_histzero`: **대칭손실이 확장 관측(270)을 안 덮는 결함 위에서 완주**했다
+>        (RETRACTIONS). 그 셀은 "이력+영점"이 아니라 "이력 + 깨진 대칭손실"이다.
+>   4. 낙상은 **낙상간격(초)**, 정확도는 **표본탈락(%)** 과 같이 읽는다.
+>      `v7_extras`(발 간격)는 인용하지 않는다.
 > - **`NA_histzero`** — 사용자가 직접 요청한 arm(이력 + 영점 오차 상호작용 셀).
 >   ⛔ **결과 해석 보류.** 두 가지가 겹쳤다: warm start 가 `best.pth`(=N1 **model_100**,
 >   가변 심볼릭 링크)였고, **대칭손실이 확장 관측(270)을 안 덮는 결함 위에서 완주**했다.
@@ -129,6 +156,20 @@
 >   낙상 5). 맞춘 비교는 위 STATUS 항목의 표를 봐라.
 > - **[DEPLOY_REQUESTS_FROM_TRAINING.md](DEPLOY_REQUESTS_FROM_TRAINING.md)** — 학습이
 >   못 닫고 로봇에서만 닫히는 측정 요청. R1·R5는 이미 답이 나와 종결됐다.
+> - ⭐ **[OPINION_TRAINING_20260808.md](OPINION_TRAINING_20260808.md)** (2026-08-08 01:xx) —
+>   **학습 담당에게 보내는 의견서 4축**(대칭 손실/증강 · `joint_encoder_bias` ·
+>   `pitch_chain` · teacher–student). 새로 찾은 것 넷이 지금 도는 arm 에 직접 걸린다:
+>   ① **`NZ_zeroiid` 가 영점을 꺼놓고 채점됐다**(`NC_actfilter` 와 같은 결함이
+>   `NZ`/`N9`/`NB` 에도 있다) ② **`joint_zero` 커리큘럼 수준이 어디에도 안 찍혀서
+>   NZ 가 몇 도에서 학습했는지 모른다** ③ **`anti_mirror 0.20` 의 근거 실험
+>   (`sig/hiprbias±5`)은 코드상 `mirror` 모드였다** — 그리고 `mirror` 는 가중치 최저(0.10)다
+>   ④ **`K1_locomotion_armsdown.urdf` 의 Hip_Pitch z 가 실기보다 15 mm 높다** —
+>   N 배치는 안전(`K1_robot_boxfoot.urdf`)하지만 **배포 계보 `I3b_stance10` 은 그 위에서
+>   학습됐다**. (`claim_check` best↔iteration 구멍은 나도 독립적으로 찾았고 `e76e926` 이
+>   이미 고쳤다. 문서 §1-5 에 병렬 커밋과의 겹침을 정리해 뒀다.)
+>   대칭 쪽 결론: **손실(0.5) 유지, 증강은 켜지 마라**(우리 env 에 `mirror_privileged_obs`
+>   가 없어 비평자 미러링이 조용히 빠진다). G10 "대칭 역효과"는 **H1 5레버 묶음**이었고
+>   2026-08-07 맵 수정과 무관하다(H1 은 obs 54).
 > - **[ibatch.md §8-44](ibatch.md)** (2026-08-07) — ⛔ **근본 원인 확정: 우리 과제가
 >   보행을 요구한 적이 없다.** 배포 정책과 M 배치 전부가 `path: 0.0` 위에서 돌았고,
 >   그 과제의 요구 속도는 median 0.119 m/s / 몸통속도 median 0.03 m/s다. 평가가

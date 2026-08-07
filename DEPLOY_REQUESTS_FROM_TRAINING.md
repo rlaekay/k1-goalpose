@@ -211,3 +211,112 @@ CSV의 `walking` 열로 두 구간이 갈리므로, **`walking=0`일 때와 `wal
 - ⛔ **sim 낙상률과 실기 낙상은 아직 한 번도 대응된 적이 없다.** sim에서 0.06 %인데
   실기에서 세 걸음이면, 지금의 sim 낙상 지표는 실기를 예측하지 못한다는 뜻이다.
   R1–R4가 그 간극을 좁히려는 것이다.
+
+---
+
+## R7. 관절 영점 δ 실측 — **R4를 대체한다** (2026-08-08)
+
+**상태**: 도구 완성, 로봇에서 미실행. **이것을 잊지 말고 시험해 달라.**
+
+R4는 "발 평평한 자세에서 인코더 값을 주면 순기구학과 비교해 보겠다"였다.
+그 방식은 **단일 자세로는 풀리지 않는다** — 아래 §식별가능성을 보라. R7은 같은 것을
+푸는 실행 가능한 절차다.
+
+### 무엇을 재는가
+
+`q_meas = q_true + δ` 의 δ (다리 12관절). 규약은 학습과 **정확히 같다**
+(`envs/K1/goal_pose.py:420-437` 의 `joint_encoder_bias`).
+
+### 왜 지금
+
+정책은 `Linear(54→256→128→128→12)`, 기억이 없어 δ를 **볼 수단이 없다.**
+랜덤화로 보정하는 것은 구조적으로 불가능하고 살 수 있는 것은 보수적 자세뿐이다.
+δ를 시작 시에 재서 빼면 **RL 강건성 문제가 캘리브레이션 문제로 바뀐다.**
+
+### 실행 (총 ~4분, 로봇 위)
+
+```bash
+cd htwk-gym
+# 0) 반드시 먼저. 모드를 바꾸지 않고 명령 프레임만 검증한다.
+python3 tools/collect_joint_zero.py --dry-run
+
+# 1) 수집. 12자세 x (램프 + settle 1.0 s + hold 1.5 s) ≈ 54 s + 램프
+python3 tools/collect_joint_zero.py --out /tmp/zero_poses.json
+
+# 2) 풀기 (로봇에서든 노트북에서든, 의존성 없음 — stdlib만)
+python3 tools/estimate_joint_zero.py --solve /tmp/zero_poses.json \
+        --emit-yaml deploy/configs/joint_zero.yaml
+```
+
+### ⛔ 안전
+
+- **두 사람** 또는 한 사람 + 거치대. `touch /tmp/zero_abort` 로 즉시 DAMPING.
+- **평평하고 단단한 바닥.** 카펫이면 방법 자체가 무효다 — 발바닥 평면이 유일한 기준인데
+  물렁한 바닥은 자세마다 다른 깊이로 가라앉는다.
+- CUSTOM 모드다 = **균형을 닫는 주체가 없다**(`b`~`r` 과 같은 창). 그래서
+  ① 전 자세가 양발 지지 + 지지다각형 안, ② 자세 간 이동은 **0.25 rad/s** 램프
+  (2026-08-07 에 0.8 rad/s 가 펌웨어 관절 보호를 걸어 DAMPING 으로 떨어뜨렸다),
+  ③ prepare 게인(350/7.5)을 쓴다 — RL 게인 100/2 는 개루프로 자세를 못 잡는다.
+- 최대 편위는 무릎 1.0 rad(스쿼트), 좌우 기울기 ±0.12 rad, 비틀기 ±0.15 rad.
+  **발목 roll 은 ±0.12 rad 안에서만 쓴다** — AUDIT §3-3 의 ±0.345 대 ±0.55 문제를
+  일부러 건드리지 않는다.
+
+### 받아야 하는 값 / 합격 판정
+
+`--solve` 출력에서 **세 가지**를 같이 보내 달라:
+
+| | 합격 | 의미 |
+|---|---|---|
+| `residual RMS` 감소 | **100배 이상** | 모형이 데이터를 설명했다 |
+| `condition number` | **200 이하** | 자세 집합이 충분히 다양했다 |
+| `max delta` | **8° 이하** | 이보다 크면 추정 실패를 의심하라(로더가 15°에서 거부한다) |
+
+12자세가 다 통과하지 못하면 `collect` 가 **중단하고 이유를 찍는다**(gyro/dof_vel/추종/tilt).
+거부된 자세를 그대로 보내 달라 — 어느 자세가 안 되는지가 그 자체로 정보다.
+
+### 반복성 검사 (권장, +4분)
+
+같은 절차를 **한 번 더** 돌려 달라. 두 δ 가 **1° 안**에서 일치해야 한다.
+어긋나면 관절 마찰/백래시(접근 방향 의존)가 지배하는 것이고, 그때는 이 방법의 바닥이다.
+
+### 적용 경로 (코드 준비됨, 기본 꺼짐)
+
+`deploy/utils/joint_zero.py`. `deploy_goal_pose.py` 에 **두 곳**만 고치면 된다:
+
+```python
+# 1) _low_state_handler (≈738행) -- 읽는 곳
+-   self.dof_pos_latest[i] = motor.q
++   self.dof_pos_latest[i] = motor.q - self.joint_zero.delta[i]
+#    바로 아래 self.dof_pos[i] = motor.q 도 같이
+
+# 2) 발행 지점 (≈877행) -- 쓰는 곳
+-   self.low_cmd.motor_cmd[i].q = float(q_target[i])
++   self.low_cmd.motor_cmd[i].q = float(q_target[i] + self.joint_zero.delta[i])
+```
+
+⛔ **둘 다 해야 한다.** 한쪽만 하면 편향을 다른 곳으로 옮기는 것뿐이고,
+읽기만 고치면 정책에게 거짓말까지 하게 된다. 그 성질을 시험이 지킨다:
+`python3 deploy/tests/test_joint_zero_apply.py` (5개 전부 통과 확인함).
+
+`deploy/configs/joint_zero.yaml` 이 없으면 **정확한 no-op** 이므로, 파일을 만들기
+전까지 배포 동작은 지금과 100% 같다.
+
+### 이 도구가 이미 통과한 것 (로봇 없이 확인 가능)
+
+```bash
+python3 tools/estimate_joint_zero.py --self-test       # 심은 δ 회수: 최대 오차 0.024°
+python3 tools/estimate_joint_zero.py --observability   # 자세 집합 점수
+```
+
+### 식별가능성 — R4가 왜 단일 자세로 안 되는가
+
+다리의 hip_pitch·knee·ankle_pitch 는 **셋 다 +y 축**이고 이 체인의 관절 origin rpy 는
+전부 정확히 0 이다. 그래서 발바닥 pitch 는 **정확히 그 셋의 합**이고, 자세 하나로는
+합 하나밖에 안 보인다(σ_min = 0, 문자 그대로 특이). 셋을 가르는 것은 **높이**다 —
+같은 합을 만드는 조합이라도 발이 뜨는 높이가 다르고, 그 차이는 **무릎 각이 자세마다
+달라야만** 나타난다. 그리고 hip_yaw 를 넣은 자세가 들어가는 순간 σ_min 이
+4e-5 → 3.1e-2 로 뛴다. 자세 다양성이 곁들이가 아니라 **방법 그 자체**다.
+
+**풀리지 않는 것 하나**: IMU 장착 roll/pitch 편향은 양다리 공통 기울기와 **정확히**
+축퇴한다. 그래서 도구가 `--imu-bias` 를 거부한다. δ 는 IMU 프레임 기준으로 나오고,
+정책도 같은 IMU 를 `obs[0:3]` 으로 먹으므로 그게 오히려 맞는 프레임이다.
