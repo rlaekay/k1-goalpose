@@ -34,15 +34,28 @@ stage() {
 #
 # 수술(tools/expand_checkpoint.py)은 첫 층만 넓히고 새 열을 0 으로 채우므로
 # **대수적 항등**이다 -- float64 검증에서 actor 최대차 0.0, critic 2.8e-14.
-# 그래서 이 arm 은 N1 과 완전히 같은 정책에서 출발하고, 'N1 대 $arm' 이 정확히
-# "관측을 더하니 좋아지는가" 가 된다. 처음부터 학습하면 그 비교가 관측이 아니라
-# 학습 예산을 재게 된다 -- 이 저장소가 반복해서 낸 오류가 그 부류다.
-# 시간순 최신이 아니라 **실제로 학습된** run 을 고른다. 2026-08-07 에 3-iteration
-# 스모크가 더 최신이라 eval 이 체크포인트 0개짜리를 집은 사고가 있었다.
+#
+# ⛔ 2026-08-07 정정: 여기가 `best.pth` 였는데 그건 **심볼릭 링크**이고
+# `select_best_checkpoint.py --link_best` 가 평가할 때마다 다시 만든다. 그리고
+# 실측하니 N1_path 의 best.pth 는 **model_100** 을 가리킨다 -- 정확도로 뽑은
+# 승자라 붕괴 **전** 지점이다. 즉 주석이 "N1 의 최종 정책에서 출발한다"고 말하는
+# 동안 코드는 100 iteration 짜리에서 출발하고 있었고, 이미 돌아버린 arm 들
+# (NA_histzero / NZ_zeroiid / NC_actfilter)이 그 계보다.
+#
+# 두 가지가 문제였다:
+#   1. 주석과 코드가 다르다 -> "N1 대 이 arm" 이 한 레버 비교가 아니게 된다.
+#   2. 출발점이 **가변**이다 -- 평가를 한 번 더 돌리면 앞으로 나갈 arm 의
+#      warm start 가 조용히 바뀐다. 재현 불가능한 실험이 된다.
+#
+# 그래서 **iteration 번호로 못 박는다.** WARM_IT 를 주면 그 체크포인트를 쓰고,
+# 안 주면 마지막 것을 쓴다. 어느 쪽이든 로그에 실제 파일명이 찍힌다.
 D=\$(MIN_CKPT=10 bash tools/pick_run.sh N1_path) || exit 0
-CK="\$D/nn/best.pth"
-[ -e "\$CK" ] || CK=\$(ls -1v "\$D"/nn/model_*.pth 2>/dev/null | tail -1)
-if [ -z "\$CK" ]; then echo "N1_path 체크포인트가 없다 -- 건너뛴다."; exit 0; fi
+if [ -n "\${WARM_IT:-}" ]; then
+    CK="\$D/nn/model_\${WARM_IT}.pth"
+else
+    CK=\$(ls -1v "\$D"/nn/model_*.pth 2>/dev/null | tail -1)
+fi
+if [ ! -e "\$CK" ]; then echo "warm start 체크포인트가 없다: \$CK"; exit 0; fi
 echo "warm start 원본: \$CK"
 WARM="\$CK"
 python -u tools/make_v7_arms.py --only $arm --max_iterations 6000 > /dev/null || exit 1
