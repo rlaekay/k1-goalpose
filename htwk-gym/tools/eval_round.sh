@@ -27,7 +27,10 @@ DEV="cuda:$GPU"
 # 모든 arm 이 같은 자로 재도록 고정한 공통 정확도 프로토콜. 배포가 실제로 요구하는
 # 과제(2 m 안쪽 목표로 가서 선다)가 이것이고, 게이트도 여기서 정의돼 있다.
 COMMON_CFG="${COMMON_CFG:-sweeps/N0_ctrl.yaml}"
-OUTROOT="$ROOT/logs/eval_rounds/$(date +%Y%m%d-%H%M%S)"
+# EVAL_OUT 을 주면 그 디렉터리에 쌓는다. 서로 다른 시각에 끝나는 arm 들을 **한 표**로
+# 보려면 필요하다 -- round_table.py 는 디렉터리 하나를 읽으므로, 각 채점이 자기
+# 타임스탬프 디렉터리를 만들면 arm 끼리 비교가 안 된다.
+OUTROOT="${EVAL_OUT:-$ROOT/logs/eval_rounds/$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$OUTROOT"
 
 if [ $# -eq 0 ]; then

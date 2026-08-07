@@ -5,9 +5,15 @@
 > 사용자가 잊더라도 내가 먼저 꺼내야 하는 것들이다. 처리했으면 이 블록에서 지운다.
 >
 > - ~~N 배치 **1라운드** 결과 보고~~ — 2026-08-07 09:5x 보고 완료(ibatch §8-47).
-> - **N 배치 2라운드 결과 보고** — 아직이다. `N2_pathgrid`, `NA_histzero`(사용자 요청),
->   `N8_pathdelay`가 돌고 있고 `N1_path` 마지막 체크포인트의 정확도가 채점 중이다.
->   끝나면 **먼저 보고한다**(사용자가 "끝나면 말 하도록"이라고 요청했다).
+> - **`N2_pathgrid` + `NA_histzero` 두 축 보고** — 사용자가 2026-08-07 10:3x 에
+>   "N2랑 NA 끝나면 두 축 다 보고해"라고 명시 요청했다. 채점은 **이미 큐에 걸려 있다**
+>   (`queue/gpu0/025-eval_N2_pathgrid.sh`, `queue/gpu1/040-eval_NA_histzero.sh`).
+>   둘 다 `logs/eval_rounds/n2na` 에 쌓이므로 **그 디렉터리 하나**를
+>   `python tools/round_table.py logs/eval_rounds/n2na` 로 읽으면 한 표로 나온다.
+>   예상 완료: N2 ~11:30, NA ~14:30 KST. 둘 다 들어오면 **먼저 보고한다.**
+>   ⛔ 비교 기준(ibatch §8-47): N0_ctrl 2.82 cm / 보행 1.10 m/s / 낙상률 0.0035,
+>   N1_path best 7.93 cm·1.15 m/s·0.038, N1_path model_6000 **47.70 cm**·1.48 m/s·0.0007.
+>   N1 은 잘 걷는 체크포인트가 도착을 못 한다 -- N2/NA 가 그 충돌을 푸는지가 쟁점이다.
 >   확인: `ssh a6000 'bash /mnt/DATA/.../htwk-gym/tools/round_status.sh'`
 >   결과: `logs/eval_rounds/<최신>` → `python tools/round_table.py <그 디렉터리>`
 >   보고는 **두 축 모두** — 정확도(공통 waypoint)와 지속 보행(forward_hold).
