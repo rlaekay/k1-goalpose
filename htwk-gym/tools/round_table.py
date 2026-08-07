@@ -70,6 +70,91 @@ def table(headers, rows):
     return "\n".join(out)
 
 
+def audit_round(arms):
+    """한 라운드 안의 리포트들이 **나란히 놓일 수 있는지** 먼저 검사한다.
+
+    ⛔ 왜 여기인가 (2026-08-08):
+    `eval_goal_pose.py:765` 주석은 "Cross-arm aggregation rejects a single
+    missing or unequal hash" 라고 약속한다. 그 거부를 실제로 하는 코드는
+    `archive/tools/compare_hbatch_results.py` 하나였고 -- **archive 안이다.**
+    지금 쓰는 교차집계기인 이 파일은 `protocol_sha` 도 `env_code_sha` 도
+    체크포인트 iteration 도 **한 번도 안 봤다.** 그래서 다음 두 가지가 조용히
+    한 표에 실렸다:
+      * lineageB 라운드: NE_ctrl100(env 8d763fb) 과 NZ_zeroiid(env 5a985b1) --
+        라운드 도중에 서버에서 git pull 이 일어나면 arm 마다 python 이 새로
+        뜨므로 **한 라운드가 두 커밋으로 쪼개진다.**
+      * n2na 라운드: best.pth 가 arm 마다 model_100 / model_1700 / model_3300 --
+        "레버 차이" 와 "학습량 17배 차이" 가 교락된 표.
+    이 저장소가 2026-08-07 에 열세 번 한 실수가 전부 이 모양이다.
+
+    ⚠️ kind 별로 본다. `walk` 은 `--goal_pattern forward_hold` 라 `commands` 가
+    바뀌어 `accuracy` 와 protocol_sha 가 다른 것이 **정상**이다.
+    """
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from claim_check import _ckpt_iter, _flatten
+    except Exception:                                   # 도구가 없어도 표는 나와야 한다
+        _ckpt_iter = _flatten = None
+
+    kinds = {}
+    for name in arms:
+        for kind, r in arms[name].items():
+            kinds.setdefault(kind, []).append((name, r))
+
+    warned = False
+    for kind in sorted(kinds):
+        entries = kinds[kind]
+        if len(entries) < 2:
+            continue
+        checks = [
+            ("protocol_sha", lambda r: (r.get("effective_eval_protocol_sha") or "?")[:8]),
+            ("env_code_sha", lambda r: (r.get("env_code_sha") or "?")[:8]),
+        ]
+        if _ckpt_iter is not None:
+            checks.append(("ckpt_iter", _ckpt_iter))
+        for label, fn in checks:
+            vals = {}
+            for name, r in entries:
+                vals.setdefault(str(fn(r)), []).append(name)
+            if len(vals) <= 1:
+                continue
+            # protocol_sha 는 dict 가 있으면 거동 차이인지 먼저 가른다.
+            if label == "protocol_sha" and _flatten is not None:
+                protos = [r.get("effective_eval_protocol") for _, r in entries]
+                if all(isinstance(p, dict) and p for p in protos):
+                    flat = [_flatten(p) for p in protos]
+                    keys = sorted(set().union(*[set(f) for f in flat]))
+                    MISS = object()
+                    real = [k for k in keys
+                            if len({repr(f.get(k, MISS)) for f in flat}) > 1
+                            and not all(f.get(k, MISS) in (MISS, None) for f in flat)]
+                    if not real:
+                        continue                        # 지문만 다르고 프로토콜은 같다
+            if not warned:
+                print("=" * 78)
+                print("⛔ 이 라운드는 나란히 놓을 수 없는 리포트를 섞고 있다")
+                print("=" * 78)
+                warned = True
+            print("[{}] {} 가 갈렸다:".format(kind, label))
+            for v in sorted(vals):
+                print("    {:<12} {}".format(v, ", ".join(sorted(vals[v]))))
+            if label == "env_code_sha":
+                print("    ⇒ 그 커밋들이 eval 경로를 건드렸는지 **직접** 확인해라:")
+                print("       git diff <A> <B> -- htwk-gym/eval_goal_pose.py htwk-gym/envs/")
+                print("       (라운드 도중 서버 git pull 이 원인인 경우가 많다.)")
+            elif label == "ckpt_iter":
+                print("    ⇒ 학습량이 다르면 arm 차이와 교락된다. `best.pth` 는 **가변")
+                print("       심볼릭 링크**라 이름이 같아도 다른 iteration 일 수 있다.")
+            else:
+                print("    ⇒ 실효 프로토콜이 실제로 다르다. 조건을 맞춰 다시 재라.")
+    if warned:
+        print()
+        print("아래 표는 **그래도** 찍는다 -- 지우면 아무도 원인을 못 본다.")
+        print("단 위에서 갈린 축을 넘어 순위를 매기지 마라. 쌍마다 확인:")
+        print("   python tools/claim_check.py <A>/report.json <B>/report.json")
+        print()
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -90,6 +175,8 @@ def main():
     if not arms:
         print("report.json 을 찾지 못했다: {}/*/report.json".format(root))
         return 1
+
+    audit_round(arms)
 
     # ---- 표 1: 정확도 (공통 waypoint 프로토콜) ---------------------------
     acc_rows = []
