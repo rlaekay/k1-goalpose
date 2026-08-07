@@ -59,6 +59,16 @@ for RUN in "$@"; do
     echo "== $NAME"
     echo "===================================================================="
 
+    # 공통 프로토콜에 이 arm 의 **관측 인터페이스만** 이식한다. 프로토콜(목표 분포,
+    # 노이즈, 외란, 자산)은 그대로 공통이고, 체크포인트의 성질인 num_observations 와
+    # observation 블록만 정책을 따라간다. 이게 없으면 관측을 넓힌 arm 은 채점 자체가
+    # 안 된다 -- NA_histzero(obs 270)가 공통 config(54)로 안 올라가서 죽었다.
+    CFG="$OUTROOT/$NAME.cfg.yaml"
+    if ! python -u tools/make_eval_cfg.py --common "$COMMON_CFG" \
+            --run "$RUN" --out "$CFG"; then
+        echo "!! $NAME: 평가 config 생성 실패. 건너뛴다."; continue
+    fi
+
     # --- 1단계: 최고 체크포인트 고르기 (공통 정확도 프로토콜) -------------
     # tail_frac 1.0: 봉우리가 run 후반에 있다는 보장이 없다. L 배치에서 12000
     # iteration run 의 최고점이 1250 이었다 -- 기본값 0.6 이면 그 지점을 아예
@@ -66,7 +76,7 @@ for RUN in "$@"; do
     SEL="$OUTROOT/$NAME.select"
     echo "-- 1/3 선택기 (--fast, tail_frac 1.0)"
     python -u tools/select_best_checkpoint.py \
-        --run_dir "$RUN" --task K1/Goal_Pose_V7 --config "$COMMON_CFG" \
+        --run_dir "$RUN" --task K1/Goal_Pose_V7 --config "$CFG" \
         --fast --tail_frac 1.0 --terrain plane \
         --sim_device "$DEV" --rl_device "$DEV" \
         --out "$SEL" --link_best 2>&1 | tail -40
@@ -81,14 +91,14 @@ for RUN in "$@"; do
 
     # --- 2단계: 공통 정확도 프로토콜 정식 채점 ---------------------------
     echo "-- 2/3 정확도 (공통 waypoint 프로토콜, 120 s)"
-    python -u eval_goal_pose.py --task K1/Goal_Pose_V7 --config "$COMMON_CFG" \
+    python -u eval_goal_pose.py --task K1/Goal_Pose_V7 --config "$CFG" \
         --checkpoint "$BEST" --terrain plane --duration_s 120 \
         --sim_device "$DEV" --rl_device "$DEV" \
         --out "$OUTROOT/$NAME.accuracy" 2>&1 | tail -25
 
     # --- 3단계: 지속 보행 (그동안 아무도 재지 않은 축) --------------------
     echo "-- 3/4 지속 보행 (forward_hold, 120 s)"
-    python -u eval_goal_pose.py --task K1/Goal_Pose_V7 --config "$COMMON_CFG" \
+    python -u eval_goal_pose.py --task K1/Goal_Pose_V7 --config "$CFG" \
         --checkpoint "$BEST" --terrain plane --duration_s 120 \
         --goal_pattern forward_hold \
         --sim_device "$DEV" --rl_device "$DEV" \
@@ -102,7 +112,7 @@ for RUN in "$@"; do
     FINAL=$(ls -1v "$RUN"/nn/model_*.pth 2>/dev/null | tail -1)
     if [ -n "$FINAL" ] && [ "$(readlink -f "$FINAL")" != "$(readlink -f "$BEST")" ]; then
         echo "-- 4/4 지속 보행: 마지막 체크포인트 $(basename "$FINAL") (60 s)"
-        python -u eval_goal_pose.py --task K1/Goal_Pose_V7 --config "$COMMON_CFG" \
+        python -u eval_goal_pose.py --task K1/Goal_Pose_V7 --config "$CFG" \
             --checkpoint "$FINAL" --terrain plane --duration_s 60 \
             --goal_pattern forward_hold \
             --sim_device "$DEV" --rl_device "$DEV" \
