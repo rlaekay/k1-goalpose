@@ -139,12 +139,24 @@ run_server "set -e
   cd '${SERVER_REPO}/htwk-gym'
   '${SERVER_PY}' - <<'PY'
 import torch
+# 폭을 하드코딩하지 않는다. 관측을 넓힌 arm(NA/N4/N5/N6/N7)은 54 가 아니고,
+# 여기서 (1,54)로 굴리면 그 정책은 **설치 직전에** 실패한다.
+# TorchScript 모듈에서 첫 층의 입력 폭을 읽어 그 폭으로 굴린다.
 m = torch.jit.load('${PT_PATH}', map_location='cpu').eval()
+w = None
+for p_ in m.parameters():
+    if p_.dim() == 2:
+        w = p_; break
+assert w is not None, 'actor 에 2차원 가중치가 없다'
+n_obs = int(w.shape[1])
 with torch.inference_mode():
-    y = m(torch.zeros(1, 54))
+    y = m(torch.zeros(1, n_obs))
 assert tuple(y.shape) == (1, 12), y.shape
 assert torch.isfinite(y).all(), 'non-finite actor output'
-print('actor ok: (1,54) -> %s  |max|=%.4f' % (tuple(y.shape), float(y.abs().max())))
+print('actor ok: (1,%d) -> %s  |max|=%.4f' % (n_obs, tuple(y.shape), float(y.abs().max())))
+# ⛔ 배포 config 의 num_observations 와 일치하는지 확인한다. 순서가 어긋난 관측은
+# 예외를 내지 않고 그냥 이상하게 걷기 때문에, 폭이라도 여기서 잡아야 한다.
+print('  ⚠️ deploy config 의 policy.num_observations 가 %d 인지 확인해라' % n_obs)
 PY
 "
 
