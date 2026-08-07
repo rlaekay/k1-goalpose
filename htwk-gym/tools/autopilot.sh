@@ -67,11 +67,11 @@ while true; do
     fi
     if [ "$stall" -ge 300 ]; then
         say "⚠️ 정체 $((stall / 60))분 -- 할 일이 있는데 아무것도 안 돈다. 복구 시도."
-        nw=$(ps -eo comm=,args= | awk '$1 ~ /^bash/ && /tools\/gpu_queue\.sh [01]/ {n++} END{print n+0}')
+        nw=$(ps -eo comm=,args= | awk '$1 ~ /^bash/ && $3 == "tools/gpu_queue.sh" {n++} END{print n+0}')
         if [ "$nw" -lt 2 ]; then
             say "  워커가 ${nw}개뿐이다. 두 장 모두 다시 띄운다."
             for g in 0 1; do
-                ps -eo comm=,args= | awk -v g="$g" '$1 ~ /^bash/ && $0 ~ ("tools/gpu_queue.sh " g)' \
+                ps -eo comm=,args= | awk -v g="$g" '$1 ~ /^bash/ && $3 == "tools/gpu_queue.sh" && $4 == g' \
                     | grep -q . && continue
                 ( cd "$ROOT" && setsid nohup bash tools/gpu_queue.sh "$g" \
                     < /dev/null >> "queue/worker$g.log" 2>&1 & )

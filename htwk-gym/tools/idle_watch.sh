@@ -58,7 +58,7 @@ while true; do
     q1=$(find "$ROOT/queue/gpu1" -maxdepth 1 -name '*.sh' 2>/dev/null | wc -l | tr -d ' ')
     running=$(find "$ROOT/queue/done" -maxdepth 1 -name '*.running' 2>/dev/null | wc -l | tr -d ' ')
     # 워커도 같은 이유로 실행 파일 기준으로 센다.
-    workers=$(ps -eo comm=,args= | awk '$1 ~ /^bash/ && /tools\/gpu_queue\.sh [01]/ {n++} END{print n+0}')
+    workers=$(ps -eo comm=,args= | awk '$1 ~ /^bash/ && $3 == "tools/gpu_queue.sh" {n++} END{print n+0}')
     [ -z "$workers" ] && workers=0
 
     # --- 판정 -----------------------------------------------------------
