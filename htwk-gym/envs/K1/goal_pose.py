@@ -877,6 +877,33 @@ class GoalPose(BaseTask):
                 self.gym.fetch_results(self.sim, True)
             self.gym.refresh_dof_state_tensor(self.sim)
         self.torques /= self.cfg["control"]["decimation"]
+
+        # ⛔ 관절별 토크 점유율을 **롤아웃 전체에 걸쳐** 누산한다.
+        # `extras["v7"]["torque_saturated"]` 는 `_v7_extras` 가 호출되는 순간의
+        # 한 프레임 스냅샷이라(eval 은 그것을 롤아웃 끝에 한 번 읽는다) 인용할 수
+        # 없다 -- RETRACTIONS C11 이 발 간격으로 이미 겪은 것과 같은 결함이다.
+        #
+        # 왜 관절별인가: `torque_limits` 가 관절마다 다르고(20/30/35/40),
+        # **두 URDF 가 같은 물리 관절에 다른 값을 준다** --
+        #   K1_robot_boxfoot(N 배치)  Hip_Roll 35 / Ankle_Roll 20
+        #   K1_locomotion_armsdown(배포 계보 I3b) Hip_Roll 20 / Ankle_Roll 15
+        #   deploy/configs/Goal_Pose_E0.yaml      Hip_Roll 30 / Ankle_Roll 20
+        # 셋이 전부 다르다. max-over-joints 로 뭉치면 어느 관절이 한계에
+        # 붙었는지 알 수 없고, 그러면 "학습이 실기에 없는 토크를 쓰는가"에 답할
+        # 수 없다.
+        with torch.no_grad():
+            occ = self.torques.abs() / self.torque_limits.clamp(min=1e-6)
+            if not hasattr(self, "_tq_occ_sum"):
+                self._tq_occ_sum = torch.zeros(self.num_dofs, dtype=torch.float, device=self.device)
+                self._tq_occ_max = torch.zeros(self.num_dofs, dtype=torch.float, device=self.device)
+                self._tq_sat_sum = torch.zeros(self.num_dofs, dtype=torch.float, device=self.device)
+                self._tq_abs_sum = torch.zeros(self.num_dofs, dtype=torch.float, device=self.device)
+                self._tq_steps = 0
+            self._tq_occ_sum += occ.mean(dim=0)
+            self._tq_occ_max = torch.maximum(self._tq_occ_max, occ.max(dim=0)[0])
+            self._tq_sat_sum += (occ > 0.95).float().mean(dim=0)
+            self._tq_abs_sum += self.torques.abs().mean(dim=0)
+            self._tq_steps += 1
         self.render()
 
         # post physics step

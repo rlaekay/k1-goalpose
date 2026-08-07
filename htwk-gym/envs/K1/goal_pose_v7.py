@@ -781,6 +781,24 @@ class GoalPoseV7(GoalPoseV3):
         e["torque_occupancy"] = float((self.torques.abs() / self.torque_limits.clamp(min=1e-6)).max(dim=-1)[0].mean().item())
         e["torque_saturated"] = float((self.torques.abs() > 0.95 * self.torque_limits).float().mean().item())
 
+        # ⛔ 위 두 줄은 **한 프레임**이다(eval 은 롤아웃 끝에 한 번 읽는다).
+        # 아래가 롤아웃 전체 누산이고, 인용해도 되는 쪽이다 -- RETRACTIONS C11.
+        n = max(1, int(getattr(self, "_tq_steps", 0)))
+        if hasattr(self, "_tq_occ_sum"):
+            names = [d.replace("_Pitch", "P").replace("_Roll", "R").replace("_Yaw", "Y")
+                     for d in self.dof_names]
+            e["torque_by_joint"] = {
+                names[i]: {
+                    "limit": round(float(self.torque_limits[i]), 1),
+                    "mean_Nm": round(float(self._tq_abs_sum[i]) / n, 3),
+                    "mean_occ": round(float(self._tq_occ_sum[i]) / n, 4),
+                    "peak_occ": round(float(self._tq_occ_max[i]), 4),
+                    "sat_share": round(float(self._tq_sat_sum[i]) / n, 5),
+                }
+                for i in range(self.num_dofs)
+            }
+            e["torque_steps_accumulated"] = n
+
         # Symmetry: we finally switched the loss on, but had no way to check
         # whether left/right actually became symmetric. This is the direct
         # readout of armA's "left foot always slightly ahead" observation.
