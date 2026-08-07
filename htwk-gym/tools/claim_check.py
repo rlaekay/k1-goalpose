@@ -193,6 +193,74 @@ def retractions_for(names, repo_root):
     return hits
 
 
+def _flatten(v, path=""):
+    """중첩 dict 를 `a.b.c` 평면 키로 편다. 리스트는 통째로 하나의 값이다."""
+    if isinstance(v, dict):
+        out = {}
+        for k in v:
+            out.update(_flatten(v[k], "{}.{}".format(path, k) if path else str(k)))
+        return out
+    return {path: v}
+
+
+def explain_protocol_sha(reports, labels):
+    """`protocol_sha` 가 갈렸을 때 **무엇 때문에** 갈렸는지 찍는다.
+
+    ⛔ 왜 이게 필요한가 (2026-08-08, 실제로 치른 대가):
+    지문만 있고 프로토콜 자체가 없으면, 어긋난 sha 가 **진짜 프로토콜 차이**인지
+    아니면 `eval_goal_pose.py` 가 해시 입력 dict 에 키를 하나 더한 것인지 구별할
+    방법이 없다. NZ_zeroiid 대 NE_ctrl100 에서 실제로 갈렸고, 원인을 알아내려고
+    sha 계산을 손으로 재현해야 했다 -- 답은 `joint_zero_probe: None` 키 하나였고
+    실효 프로토콜은 바이트 단위로 같았다. 그 확인을 안 하면 두 갈래로 틀린다:
+    ⛔ 를 그냥 넘겨서 진짜 차이를 놓치거나, 멀쩡한 비교를 버리거나.
+
+    ⚠️ 이 함수가 "차이 없음"을 찍어도 **`env_code_sha` 는 따로 봐야 한다.**
+    프로토콜이 같아도 그 코드가 eval 경로를 바꿨을 수 있다.
+
+    반환: "benign"(거동 차이 0 -- 지표의 ⛔ 를 걷어도 된다) / "real" / "unknown".
+    """
+    protos = [r.get("effective_eval_protocol") for r in reports]
+    if not all(isinstance(p, dict) and p for p in protos):
+        print("ℹ️  protocol_sha 가 갈렸지만 리포트에 `effective_eval_protocol` 이 없다.")
+        print("   (2026-08-08 이전 리포트다.) 원인을 아티팩트만으로 못 가린다 --")
+        print("   두 커밋의 diff 로 eval 경로가 바뀌었는지 **직접** 확인해라.")
+        print()
+        return "unknown"
+    flat = [_flatten(p) for p in protos]
+    keys = sorted(set().union(*[set(f) for f in flat]))
+    MISS = object()
+    diffs = [(k, [f.get(k, MISS) for f in flat])
+             for k in keys if len({repr(f.get(k, MISS)) for f in flat}) > 1]
+    print("=" * 78)
+    print("protocol_sha 가 왜 갈렸나 — 실효 프로토콜의 실제 차이")
+    print("=" * 78)
+    if not diffs:
+        print("   차이 0개. 지문만 다르고 **프로토콜은 동일**하다.")
+        print("   (해시 입력 dict 에 키가 추가된 커밋을 사이에 두고 채점한 경우다.)")
+        print("   ⇒ 이 축의 ⛔ 는 무해하다. 단 `env_code_sha` 는 따로 확인해라.")
+        print()
+        return "benign"
+    # 한쪽에만 있고 값이 None 인 키는 "새로 생긴 선택적 프로브를 안 걸었다"는 뜻이라
+    # 거동에 영향이 없다. 진짜 차이와 섞이면 판단을 흐리므로 갈라서 찍는다.
+    benign = [(k, v) for k, v in diffs
+              if all(x is MISS or x is None for x in v)]
+    real = [(k, v) for k, v in diffs if (k, v) not in benign]
+    for k, vals in real:
+        print("   ⛔ {}".format(k))
+        for lab, val in zip(labels, vals):
+            print("        {:<28}{}".format(
+                lab, "(키 없음)" if val is MISS else repr(val)[:90]))
+    for k, vals in benign:
+        print("   ·  {}  — 한쪽에만 있고 값이 None (안 건 선택적 프로브) → 무해".format(k))
+    print()
+    if not real:
+        print("   ⇒ 거동에 영향을 주는 차이 **0개**. 이 축의 ⛔ 는 무해하다.")
+    else:
+        print("   ⇒ 위 ⛔ 항목이 **진짜** 프로토콜 차이다. 조건을 맞춰 다시 재라.")
+    print()
+    return "real" if real else "benign"
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -235,6 +303,17 @@ def main():
         print("{}{:<15}".format(mark, cname)
               + "".join("{:<{}}".format(v[:w0 - 1], w0) for v in vals))
 
+    # 지문이 갈렸으면 **지표 표를 찍기 전에** 원인을 가른다. 실효 프로토콜을 직접
+    # 비교할 수 있으면 그쪽이 지문보다 권위 있으므로, 거동 차이가 0 이면 지표의
+    # ⛔ 를 걷는다 -- 안 걷으면 도구가 "무해하다"와 "비교 불가"를 동시에 말한다.
+    protocol_benign = False
+    if "protocol_sha" in mismatched:
+        print()
+        verdict = explain_protocol_sha([r for _, r in cols], labels)
+        if verdict == "benign":
+            mismatched.remove("protocol_sha")
+            protocol_benign = True
+
     print()
     print("=" * 78)
     print("지표 (의존하는 조건)")
@@ -253,6 +332,12 @@ def main():
         print("   ⛔ 표시된 지표는 **비교 불가**다. 조건을 맞춰 다시 재거나,")
         print("      주장에 그 차이를 명시해라. 그냥 나란히 쓰면 이 저장소가")
         print("      2026-08-07 에 열세 번 한 실수를 다시 하는 것이다.")
+        if protocol_benign:
+            print("   (`protocol_sha` 는 위에서 무해로 판정돼 이 목록에서 뺐다.)")
+    elif protocol_benign:
+        print("✅ `protocol_sha` 지문만 갈렸고 **실효 프로토콜은 동일**했다(위 참조).")
+        print("   나머지 조건은 전부 같다. 나란히 비교해도 된다 --")
+        print("   단 `env_code_sha` 가 갈렸다면 그 커밋이 eval 경로를 바꿨는지 직접 봐라.")
     else:
         print("✅ 조건이 전부 같다. 이 리포트들은 나란히 비교해도 된다.")
 

@@ -784,6 +784,13 @@ def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
     evaluation = cfg.setdefault("evaluation", {})
     evaluation["effective_eval_protocol_sha"] = _stable_protocol_sha(
         effective_protocol)
+    # ⛔ 지문만 남기면 어긋났을 때 **아티팩트만으로는 원인을 알 수 없다.**
+    # 2026-08-08 에 실제로 그 대가를 치렀다: NZ_zeroiid 대 NE_ctrl100 의
+    # protocol_sha 가 갈렸는데, 그것이 진짜 프로토콜 차이인지 아니면 이 dict 에
+    # 키가 하나 늘어난 것인지 알아내려고 sha 계산을 손으로 재현해야 했다
+    # (답은 후자였다 -- `joint_zero_probe: None` 하나). 다음 사람은 그 비용을
+    # 치르거나, 더 나쁘게 확인 없이 ⛔ 를 넘길 것이다. 그래서 dict 를 같이 남긴다.
+    evaluation["effective_eval_protocol"] = copy.deepcopy(effective_protocol)
     evaluation["effective_disturbance_protocol"] = copy.deepcopy(
         cfg.get("randomization", {}).get("disturbance") or {"enabled": False})
     return cfg
@@ -2291,6 +2298,8 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
         "hbatch_protocol_version": eval_cfg.get("hbatch_protocol_version"),
         "effective_eval_protocol_sha": eval_cfg.get(
             "effective_eval_protocol_sha"),
+        "effective_eval_protocol": copy.deepcopy(
+            eval_cfg.get("effective_eval_protocol") or {}),
         "effective_disturbance_protocol": copy.deepcopy(
             eval_cfg.get("effective_disturbance_protocol") or {}),
         "joint_dr_probe": copy.deepcopy(
@@ -3817,6 +3826,8 @@ def summarize_stress(roll, cfg, num_envs, duration_s, dt, checkpoint, config_pat
             "hbatch_protocol_version"),
         "effective_eval_protocol_sha": cfg.get("evaluation", {}).get(
             "effective_eval_protocol_sha"),
+        "effective_eval_protocol": copy.deepcopy(
+            cfg.get("evaluation", {}).get("effective_eval_protocol") or {}),
         "effective_disturbance_protocol": copy.deepcopy(
             cfg.get("evaluation", {}).get(
                 "effective_disturbance_protocol") or {}),
