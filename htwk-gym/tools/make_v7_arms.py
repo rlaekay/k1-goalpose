@@ -881,17 +881,27 @@ N_ARMS.update(NC_ARMS)
 # 도달 불가능이고, 감속과 goal_reached 누적 시간까지 덮어야 한다. 줄이면 그 근거가
 # 깨진다. **interval 만 줄여서 dwell 을 더 자주 오게 한다** -- 레버 하나다.
 #
-#   현재  interval [12,24] duration [3,5] -> duty 18.2 %
-#   ND    interval [ 4, 8] duration [3,5] -> duty 40.0 %   (2.2배)
+# ⛔ 정정(2026-08-07, 병렬 Codex 세션이 잡았다): `interval_s` 는 dwell **사이의 간격**이
+# 아니라 **주기**다. `goal_pose_v7.py:317` 의 `path_dwell_next` 가 dwell 중에도 매 스텝
+# 감소하므로, 다음 dwell 은 이전 dwell 이 **시작한** 시점에서 interval 초 뒤에 발화한다.
+# 따라서 duty = duration / interval 이지 duration/(interval+duration) 이 아니다.
+# 베이스 주석의 "measured 19.5 %" 도 4/18 = 22.2 % 쪽과 맞는다(4/22 = 18.2 % 가 아니라).
 #
-# 속도 수요가 얼마나 줄어드는가: path 시간 중 추격 구간이 82 % -> 60 % 로 준다.
-# 전체 시간 기준으로는 0.35*0.82 = 29 % -> 0.35*0.60 = 21 %. 줄지만 사라지지 않는다.
+# 처음에 [4, 8] 로 잡았는데 그러면 duty 가 40 % 가 아니라 **66.7 %** 이고, 게다가
+# max duration 5 > min interval 4 라 **dwell 중에 다음 dwell 이 발화해 영구 dwell 이
+# 되는 env 가 약 6 % 생긴다**. path 모드가 사실상 waypoint 로 퇴화한다.
+#
+#   베이스  interval [12,24] duration [3,5] -> duty 22.2 %
+#   ND      interval [ 8,12] duration [3,5] -> duty 40.0 %  (1.8배, 겹침 없음)
+#
+# 속도 수요가 얼마나 줄어드는가: path 시간 중 추격 구간이 77.8 % -> 60 % 로 준다.
+# 전체 시간 기준으로는 0.35*0.778 = 27 % -> 0.35*0.60 = 21 %. 줄지만 사라지지 않는다.
 # 그래서 이 arm 은 "속도를 포기하고 정확도를 되찾는" 것이 아니라 **두 축이 양립
 # 가능한 지점이 있는지**를 묻는다. 없으면 다음은 2단계 학습(path 로 걷기를 익힌 뒤
 # waypoint 로 finetune)이고, 그건 레버가 하나가 아니라 절차라 더 비싸다.
 ND_ARMS = {
     "ND_dwell": merge(_N_BASE, _PATH_ON,
-                      {"commands.path.dwell.interval_s": [4.0, 8.0]}),
+                      {"commands.path.dwell.interval_s": [8.0, 12.0]}),
 }
 N_ARMS.update(ND_ARMS)
 
