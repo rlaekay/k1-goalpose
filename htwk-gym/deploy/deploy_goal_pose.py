@@ -433,6 +433,16 @@ class Controller:
         self._custom_mode_entered_monotonic = 0.0
         self._prepare_q = None
         self._joint_layout_checked = False
+        # DDS 콜백 스레드에서 난 관절 배치 오류를 메인으로 넘기는 자리.
+        # 콜백 안에서 raise 하면 메인이 못 본다.
+        self._layout_error = None
+        # 발행 스레드가 예외로 죽은 자리. 예전에는 try/except 가 없어서 `_send_cmd`
+        # 예외 한 번에 스레드가 즉사하는데 `running` 은 True 로 남고 감지 경로가
+        # 없었다 -- LowCmd 가 한 프레임도 안 나가는데 정책은 계속 추론한다.
+        self._publish_error = None
+        # 오퍼레이터가 `r` 을 눌렀는가. 복구가 `b`~`r` 대기 중에 완료돼도
+        # 정책을 마음대로 켜지 않기 위한 문이다.
+        self._policy_authorized = False
 
         # --- fall recovery ---------------------------------------------------
         # RECOVER_NONE while the policy is driving; anything else means the
@@ -663,41 +673,69 @@ class Controller:
         command shifts. Checked once, on the first low_state, before any LowCmd
         is published.
         """
-        if self._joint_layout_checked:
+        if self._joint_layout_checked or self._layout_error is not None:
+            return
+        # ⛔ 2026-08-08. 이 가드는 스스로를 무력화하고 있었다. 세 가지가 겹쳤다:
+        #
+        #   1. `_joint_layout_checked = True` 를 검사보다 **먼저** 세웠다. 첫 콜백이
+        #      raise 로 빠져나가면 두 번째 콜백은 검사를 통째로 건너뛴다.
+        #   2. 이 함수는 **DDS 콜백 스레드**에서 돈다. 여기서 raise 해도 메인은
+        #      모른다 -- pybind11 이 콜백 밖 예외를 어떻게 다루는지(삼키는지
+        #      std::terminate 인지)는 로봇에서만 닫히는 미확인 항목이다.
+        #   3. 평행 인덱스 읽기가 실패하면 `except Exception: return` 으로 조용히
+        #      빠졌는데, 위 1 때문에 플래그는 이미 True 라 두 번 다시 안 봤다.
+        #
+        # 그래서 결과를 **필드에 남기고** 플래그는 **통과했을 때만** 세운다.
+        # 메인 스레드는 `_require_fresh_low_state` 에서 이것을 보고 raise 한다 --
+        # 그 함수가 CUSTOM 진입 직전에 반드시 불린다.
+        actual = len(low_state_msg.motor_state_serial)
+        observed = None
+        try:
+            if actual != self.joint_cnt:
+                raise RuntimeError(
+                    "Joint count mismatch: robot reports %d joints, config says %d "
+                    "(common.joint_cnt, or len(common.default_qpos)). "
+                    "This K1 has no waist joint, so the correct layout is 22 joints "
+                    "with policy.leg_dof_start=10. Running with the wrong layout "
+                    "shifts every leg command by one joint."
+                    % (actual, self.joint_cnt)
+                )
+            # The parallel-mechanism indices are a second, independent fingerprint
+            # of the layout: those are the only joints where serial and parallel
+            # differ.
+            try:
+                observed = {
+                    i for i in range(actual)
+                    if abs(low_state_msg.motor_state_serial[i].q
+                           - low_state_msg.motor_state_parallel[i].q) > 1e-4
+                }
+            except Exception as exc:
+                self.logger.warning(
+                    "[joint-layout] 평행 인덱스를 읽지 못했다 (%s) -- 관절 수만 "
+                    "확인하고 넘어간다", exc)
+            configured = set(self.cfg.get("mech", {}).get("parallel_mech_indexes", []))
+            if observed and configured and observed != configured:
+                raise RuntimeError(
+                    "Parallel-mechanism indices disagree with the robot: observed %s, "
+                    "config mech.parallel_mech_indexes=%s. The configured joint layout "
+                    "does not match this hardware."
+                    % (sorted(observed), sorted(configured))
+                )
+        except RuntimeError as exc:
+            self._layout_error = exc
+            self.running = False
+            self.logger.error("[joint-layout] ⛔ %s", exc)
             return
         self._joint_layout_checked = True
-        actual = len(low_state_msg.motor_state_serial)
-        if actual != self.joint_cnt:
-            raise RuntimeError(
-                "Joint count mismatch: robot reports %d joints, config says %d "
-                "(common.joint_cnt, or len(common.default_qpos)). "
-                "This K1 has no waist joint, so the correct layout is 22 joints "
-                "with policy.leg_dof_start=10. Running with the wrong layout "
-                "shifts every leg command by one joint."
-                % (actual, self.joint_cnt)
-            )
-        # The parallel-mechanism indices are a second, independent fingerprint of
-        # the layout: those are the only joints where serial and parallel differ.
-        try:
-            observed = {
-                i for i in range(actual)
-                if abs(low_state_msg.motor_state_serial[i].q
-                       - low_state_msg.motor_state_parallel[i].q) > 1e-4
-            }
-        except Exception:
-            return
-        configured = set(self.cfg.get("mech", {}).get("parallel_mech_indexes", []))
-        if observed and configured and observed != configured:
-            raise RuntimeError(
-                "Parallel-mechanism indices disagree with the robot: observed %s, "
-                "config mech.parallel_mech_indexes=%s. The configured joint layout "
-                "does not match this hardware."
-                % (sorted(observed), sorted(configured))
-            )
+        # ⛔ 예전에는 `sorted(configured)` 를 찍었다(RETRACTIONS C17). 가드가
+        # `if observed and ...` 라 **observed 가 비어 있어도 같은 줄이 나왔고**,
+        # 그래서 이 로그는 "확인했다"의 증거가 아니었다. 실제로 본 것을 찍는다.
         self.logger.info(
-            "[joint-layout] %d joints, legs %d..%d, parallel %s -- matches hardware",
+            "[joint-layout] %d joints, legs %d..%d, parallel 관측 %s / 설정 %s",
             actual, self.policy.leg_start,
-            self.policy.leg_start + self.policy.num_act - 1, sorted(configured))
+            self.policy.leg_start + self.policy.num_act - 1,
+            "미확인" if observed is None else sorted(observed),
+            sorted(self.cfg.get("mech", {}).get("parallel_mech_indexes", [])))
 
     def _low_state_handler(self, low_state_msg: LowState):
         # Safety watchdog: a large base roll/pitch means the robot is going over.
@@ -850,6 +888,17 @@ class Controller:
         self._enter_custom_latched()
 
     def _require_fresh_low_state(self, context):
+        # ⛔ 관절 배치 검사는 DDS 콜백 스레드에서 도므로 거기서 raise 해도 메인은
+        # 모른다. 결과를 필드로 받아 **여기서** 던진다 -- 이 함수는 CUSTOM 진입
+        # 직전에 반드시 불리므로, 배치가 어긋난 채로 관절을 가져가는 일이 없다.
+        if self._layout_error is not None:
+            raise RuntimeError(
+                "joint layout check failed before %s: %s" % (context, self._layout_error))
+        # 발행 스레드가 죽었으면 LowCmd 가 한 프레임도 안 나간다. 그 상태로 램프를
+        # 돌리면 `dof_target` 만 움직이고 로봇은 마지막 프레임에 머문다.
+        if self._publish_error is not None:
+            raise RuntimeError(
+                "publish thread died before %s: %s" % (context, self._publish_error))
         low_state_timeout = float(self.cfg.get("safety", {}).get("low_state_timeout_s", 0.2))
         low_state_age = time.monotonic() - self._last_low_state_monotonic
         if self._last_low_state_monotonic <= 0.0 or low_state_age > low_state_timeout:
@@ -1444,6 +1493,17 @@ class Controller:
                 self.running = False
                 self._recovery_phase = "none"
                 return
+            # ⛔ 오퍼레이터가 아직 `r` 을 누르지 않았으면 정책을 켜지 않는다.
+            # 복구의 일은 "서 있는 상태로 되돌리기"까지이고 보행 시작은 사람이
+            # 연다. 이 갈래가 없으면 `b`~`r` 대기 중 낙상이 곧바로 보행으로
+            # 이어진다 -- 오퍼레이터는 아직 아무것도 허락하지 않았는데.
+            if not self._policy_authorized:
+                self._recovery_phase = "none"
+                self.logger.warning(
+                    "[recovery] complete (#%d, %.1f s) -- `r` 대기로 돌아간다. "
+                    "정책은 아직 켜지 않는다 (prepare 자세/게인 유지)",
+                    self._recovery_count, time.monotonic() - self._recovery_t0)
+                return
             # ⛔ 진입과 **정확히 같은 경로**로 정책 구동을 시작한다. 예전에는
             # 여기서 타이머만 되감고 곧바로 추론을 켰다 -- prepare 게인 위에서,
             # 자세 램프 없이. 독립 감사 3회가 전부 이것을 1순위로 짚었다.
@@ -1542,10 +1602,24 @@ class Controller:
         print(f"{self.remoteControlService.get_rl_gait_operation_hint()}")
         wait_t0 = time.monotonic()
         while True:
-            if self.remoteControlService.start_rl_gait():
-                break
+            # ⛔ 2026-08-08. 이 대기는 **무한**이고 그동안 `run()` 은 아직 안 돈다.
+            # 그런데 낙상 트리거는 `_custom_mode_started = True`(ChangeMode 이전)부터
+            # 무장돼 있다. 그래서 예전에는 여기서 넘어지면 "FALL DETECTED" 만 찍히고
+            # **DAMPING 도 get-up 도 돌지 않은 채** 쓰러진 로봇을 계속 붙잡았고,
+            # 그 상태에서 `r` 을 누르면 **넘어진 채로 RL 램프가 실행됐다.**
+            # 실측에 이 대기가 124 초인 구간이 있다. 4발자국은 반복 시도이므로
+            # 이 경로는 반드시 온다.
             if self._abort_requested("RL-gait prompt"):
                 raise KeyboardInterrupt("abort file")
+            if self.in_recovery():
+                self._step_recovery()
+                if not self.running:
+                    raise KeyboardInterrupt(
+                        "recovery gave up while waiting at the RL-gait prompt")
+                time.sleep(0.01)
+                continue
+            if self.remoteControlService.start_rl_gait():
+                break
             # The publish thread has been streaming since CUSTOM entry, so the
             # robot is held properly for however long this prompt waits.
             time.sleep(0.1)
@@ -1555,6 +1629,8 @@ class Controller:
             time.monotonic() - wait_t0,
             time.monotonic() - getattr(self, "_custom_mode_entered_monotonic", wait_t0))
 
+        # 이 문이 열린 뒤에야 복구 재진입도 정책을 다시 켠다.
+        self._policy_authorized = True
         self._start_policy_control(reason="RL-gait start")
         if self.goal_source_mode == "stdin":
             self.goal_source.start_stdin_reader(self.logger)
@@ -1744,6 +1820,21 @@ class Controller:
             self.logger.warning("Failed to publish policy debug: %s", exc)
 
     def _publish_cmd(self):
+        # ⛔ 2026-08-08. try/except 가 없었다. `_send_cmd` 예외 한 번이면 스레드가
+        # 즉사하는데 `self.running` 은 True 로 남고, 이를 감지하는 경로가 어디에도
+        # 없었다 -- **LowCmd 가 한 프레임도 안 나가는데 정책은 계속 추론한다.**
+        # 그리고 진입·복구 램프는 `dof_target` 만 움직이고 발행은 이 스레드가 하므로,
+        # 이 스레드가 죽어 있으면 **램프가 조용히 무효**가 된다.
+        # BaseException 까지 잡는다 -- 여기서 무엇이 나오든 로봇은 명령을 잃는다.
+        try:
+            self._publish_loop()
+        except BaseException as exc:      # noqa: BLE001 -- 의도적으로 전부 잡는다
+            self._publish_error = exc
+            self.logger.error("[publish] ⛔ 발행 스레드가 죽었다: %s", exc, exc_info=True)
+            # 메인 루프가 이것을 보고 정상 종료 경로(cleanup -> kDamping)를 탄다.
+            self.running = False
+
+    def _publish_loop(self):
         while self.running:
             time_now = self.timer.get_time()
             if time_now < self.next_publish_time:
