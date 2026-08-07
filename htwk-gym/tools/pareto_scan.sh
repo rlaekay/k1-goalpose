@@ -36,7 +36,12 @@ python -u tools/make_eval_cfg.py --common "$COMMON_CFG" --run "$RUN" --out "$CFG
 
 # 체크포인트를 iteration 순으로 정렬해 균등하게 N개 뽑는다. 마지막 것은 반드시 포함한다
 # -- 지금까지 "잘 걷는 쪽"이 거기였다.
-mapfile -t ALL < <(ls -1v "$RUN"/nn/model_*.pth 2>/dev/null)
+# MAX_IT 를 주면 그 iteration 이하만 후보로 본다. 1차 스캔에서 정확도 붕괴가
+# iteration 100~900 사이에 일어나는 것이 드러났는데 그 구간에 표본이 두 개뿐이라,
+# 같은 도구로 구간을 좁혀 다시 훑기 위해 있다.
+mapfile -t ALL < <(ls -1v "$RUN"/nn/model_*.pth 2>/dev/null | awk -v m="${MAX_IT:-0}" '
+    { it=$0; sub(/.*model_/,"",it); sub(/\.pth/,"",it);
+      if (m+0==0 || it+0<=m+0) print }')
 TOTAL=${#ALL[@]}
 if [ "$TOTAL" -lt 2 ]; then echo "체크포인트가 부족하다: $TOTAL"; exit 1; fi
 PICK=()
