@@ -724,21 +724,26 @@ class GoalPose(BaseTask):
         if cfg and int(cfg[1]) > 0 and hasattr(self, "_obs_delay"):
             self._obs_delay[env_ids] = torch.randint(
                 int(cfg[0]), int(cfg[1]) + 1, (len(env_ids),), device=self.device)
-            # ⚠️ 폭을 잘라서 넣어야 한다. 리셋은 _compute_observations **뒤에** 돌고,
-            # 이력(history_steps>1)이 켜져 있으면 그 시점의 self.obs_buf 는 이미
-            # k 프레임이 이어 붙어 넓어져 있다. 지연 링 버퍼는 한 프레임 폭이므로
-            # 통째로 넣으면 broadcast 에러가 난다 -- 지연과 이력을 둘 다 켠 N4_hist
-            # 스모크가 정확히 이걸로 죽었다(shape [270] vs [3,1,54]).
-            self._obs_hist[:, env_ids] = self.obs_buf[env_ids, :self._obs_hist.shape[-1]]
-        # 관측 이력도 같은 이유로 지운다. 지연 버퍼와 별개의 버퍼이므로 따로 지워야
-        # 한다 -- 안 지우면 리셋된 env가 넘어지기 직전 k 프레임을 이력으로 물려받고,
-        # 정책은 "방금 넘어졌다"는 과거를 보면서 새 에피소드를 시작한다.
-        # ⚠️ _obs_stack의 프레임 폭은 이력이 붙기 **전**의 폭이라, 여기서 쓰는
-        # self.obs_buf(이미 이력이 붙어 넓어진 것)를 그대로 넣으면 안 된다.
-        # 앞쪽 한 프레임만 잘라 쓴다.
-        if hasattr(self, "_obs_stack"):
-            w = self._obs_stack.shape[-1]
-            self._obs_stack[:, env_ids] = self.obs_buf[env_ids, :w]
+        # ⛔ 이력/지연 버퍼를 **여기서 채우지 않는다**(2026-08-07 감사).
+        #
+        # 여기는 `_resample_goals` 안이고 두 가지가 어긋나 있었다:
+        #
+        #   1. **잘못된 이벤트다.** 이 함수는 목표가 재추첨되는 env 전부에 대해 돈다
+        #      (`episode_length_buf == cmd_resample_time`). 리셋 env 는 그 부분집합일
+        #      뿐이라, 정상 주행 중인 env 의 이력도 목표 경계마다(4-8초) 지워졌다.
+        #      에피소드 30초 기준 호출의 약 80 %가 의도치 않은 것이었고, 걷는 중
+        #      로봇의 100 ms 이력이 6초마다 한 프레임 복제로 평탄화됐다.
+        #      배포는 그러지 않는다 -- `policy_goal_pose.py` 는 최초 1회만 prime 한다.
+        #
+        #   2. **잘못된 값이다.** step() 의 순서가
+        #         _reset_idx -> _resample_goals -> _compute_observations
+        #      이므로, 여기서 읽는 `self.obs_buf` 는 **직전 스텝**의 관측 -- 곧
+        #      "넘어지기 직전" 프레임이다. 이 코드가 막겠다고 적어 둔 바로 그것을
+        #      대신 집어넣고 있었다.
+        #
+        # 그래서 표식만 남기고, 실제 채우기는 새 프레임이 만들어진 뒤
+        # `_prime_obs_buffers()` 가 한다.
+        self._obs_prime_ids = env_ids
 
     def _update_goal_state(self):
         """Recompute the goal position/heading relative to the robot's current local
@@ -1095,10 +1100,31 @@ class GoalPose(BaseTask):
             + self._privileged_extra_channels(),
             dim=-1,
         )
+        self._prime_obs_buffers()
         self._apply_obs_delay()
         self._apply_obs_history()
         self._assert_obs_width()
         self.extras["privileged_obs"] = self.privileged_obs_buf
+
+    def _prime_obs_buffers(self):
+        """리셋된 env 의 이력/지연 버퍼를 **방금 만든 새 프레임**으로 채운다.
+
+        이 시점의 `self.obs_buf` 는 아직 지연도 이력도 안 붙은 **한 프레임 폭**이고,
+        리셋 후 자세로 계산된 값이다. 그래서 두 버퍼 모두 여기서 채우는 것이 맞다.
+
+        0 으로 채우지 않는 이유: 정책이 에피소드 시작마다 "중력 0" 같은 물리적으로
+        불가능한 과거를 보게 된다. 현재 프레임으로 채우면 "방금까지 이 자세로
+        가만히 있었다"가 되고, 그것은 실제로 참이다(리셋 직후니까).
+        """
+        ids = getattr(self, "_obs_prime_ids", None)
+        if ids is None or len(ids) == 0:
+            return
+        self._obs_prime_ids = None
+        frame = self.obs_buf[ids]
+        if hasattr(self, "_obs_hist"):
+            self._obs_hist[:, ids] = frame
+        if hasattr(self, "_obs_stack"):
+            self._obs_stack[:, ids] = frame
 
     # ---- 관측 확장 (전부 기본 off) --------------------------------------
     #

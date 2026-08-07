@@ -122,8 +122,35 @@ class GoalPoseV3(GoalPose):
 
         # obs layout (54): gravity 0:3 | angvel 3:6 | commands 6:16 |
         #                  clock 16:18 | dof_pos 18:30 | dof_vel 30:42 | actions 42:54
-        perm = list(range(self.num_obs))
-        sign = [1.0] * self.num_obs
+        #
+        # ⛔ 2026-08-07 감사: 여기가 `perm = list(range(self.num_obs))` 였다. 관측을
+        # 넓힌 arm(history_steps>1, extra_dof_tau, extra_foot_offset)에서는 54 를
+        # 넘는 인덱스가 **항등 순열 + 부호 +1** 로 남고, `RunnerV3` 가 그것을 폭 검사
+        # 없이 대칭손실에 쓴다(`utils/runner_v3.py:320`, `symmetry_coef: 0.5`).
+        # 그러면 `mirror_obs(obs)` 가 물리적으로 존재할 수 없는 관측이 되고, 손실은
+        # "현재 프레임만 뒤집은 관측에서 뒤집힌 액션을 내라"는 **틀린 정칙화**가 된다.
+        # N4_hist(270) 는 채널의 80 % 가, N5_tau(66)/N6_foot(56) 은 확장분 전체가 그랬다.
+        # smoke_v7 의 involution/유일성 검사는 항등 항목을 통과시키므로 못 잡는다.
+        #
+        # 그래서 **한 프레임 폭의 맵을 먼저 만들고, 이력 프레임 수만큼 타일링한다.**
+        obs_cfg = self.cfg.get("observation") or {}
+        hist_k = max(1, int(obs_cfg.get("history_steps", 1) or 1))
+        frame_w = 54
+        foot_at = tau_at = None
+        if obs_cfg.get("extra_foot_offset"):
+            foot_at = frame_w
+            frame_w += 2
+        if obs_cfg.get("extra_dof_tau"):
+            tau_at = frame_w
+            frame_w += num_dofs
+        if frame_w * hist_k != self.num_obs:
+            raise ValueError(
+                "미러 맵이 계산한 관측 폭({} x {} = {})이 num_observations({})와 다르다. "
+                "observation 블록과 env.num_observations 가 어긋났다.".format(
+                    frame_w, hist_k, frame_w * hist_k, self.num_obs))
+
+        perm = list(range(frame_w))
+        sign = [1.0] * frame_w
         sign[1] = -1.0                    # gravity_y
         sign[3], sign[5] = -1.0, -1.0     # angvel_x (roll rate), angvel_z (yaw rate)
         sign[7] = -1.0                    # goal_rel_y
@@ -138,6 +165,33 @@ class GoalPoseV3(GoalPose):
             for i in range(num_dofs):
                 perm[block + i] = block + dof_perm[i]
                 sign[block + i] = dof_sign[i]
+
+        # ---- 확장 채널 (goal_pose.py::_obs_extra_channels 와 짝) ----------
+        if foot_at is not None:
+            # get_feet_offset 은 (오른발 - 왼발) 을 base yaw 프레임에서 준다.
+            #   fx  = x_R - x_L      미러하면 좌우가 바뀌므로 x_L - x_R = -fx  -> 부호 -1
+            #   gap = y_R - y_L      미러는 y 를 뒤집고(y -> -y) 동시에 좌우를 바꾼다.
+            #                        y_R' = -y_L, y_L' = -y_R 이므로
+            #                        gap' = y_R' - y_L' = -y_L + y_R = gap    -> 부호 +1
+            # 두 채널 모두 자기 자리에 남으므로 순열은 항등이다.
+            sign[foot_at] = -1.0
+            sign[foot_at + 1] = 1.0
+        if tau_at is not None:
+            # 토크는 관절 좌표량이라 dof_pos 와 **같은** 순열·부호로 미러된다.
+            for i in range(num_dofs):
+                perm[tau_at + i] = tau_at + dof_perm[i]
+                sign[tau_at + i] = dof_sign[i]
+
+        # ---- 이력 타일링 -------------------------------------------------
+        # 과거 프레임도 같은 로봇의 같은 관측이므로 프레임 맵을 그대로 반복한다.
+        # 프레임 사이에는 섞이지 않는다(오프셋을 더해 자기 프레임 안에서만 치환).
+        if hist_k > 1:
+            fperm, fsign = perm, sign
+            perm, sign = [], []
+            for f in range(hist_k):
+                off = f * frame_w
+                perm.extend(off + p for p in fperm)
+                sign.extend(fsign)
 
         self.mirror_obs_perm = torch.tensor(perm, dtype=torch.long, device=self.device)
         self.mirror_obs_sign = torch.tensor(sign, dtype=torch.float, device=self.device)
