@@ -743,9 +743,15 @@ N_OBS_ARMS = {
     }),
     # 비평자만 넓힌다. **배포되는 정책의 입력은 한 글자도 안 바뀐다** --
     # 그래서 이 arm이 이득을 내면 sim2real 위험 없이 그냥 가져올 수 있다.
+    #
+    # 14 -> 29 (접촉 2 + 관측지연 1 + 관절 영점 12). 처음엔 17(접촉+지연)로 잡았는데
+    # 가장 큰 구멍인 관절 영점 12채널을 빠뜨렸다 -- goal_pose.py 의 그 함수 주석 참조.
+    # N7 자체는 joint_zero 가 꺼져 있어 그 12채널이 전부 0 이다. 그래서 N7 이 재는
+    # 것은 여전히 "접촉과 지연을 보여주면 좋아지는가" 하나이고, 12채널은 폭만 맞춘다.
+    # 그 채널이 실제로 신호를 싣는 것은 아래 NB_zerocritic 이다.
     "N7_critic": merge(_N_BASE, _PATH_ON, {
         "observation.privileged_extra": True,
-        "env.num_privileged_obs": 17,
+        "env.num_privileged_obs": 29,
     }),
 }
 # N1 + 관측 지연만. N4_hist와 달리 관측 폭을 건드리지 않으므로(54 유지) 배포된
@@ -807,6 +813,25 @@ N_ZERO_ARMS = {
     "N9_zerostruct": merge(_N_BASE, _PATH_ON, _ZERO_STRUCT),
 }
 N_ARMS.update(N_ZERO_ARMS)
+
+# 비평자에게 **실제로 숨은 인자를 보여주는** 셀. NZ_zeroiid 와의 차이가
+# privileged_extra 하나다.
+#
+# 왜 NZ 위인가: privileged_extra 의 12채널은 `joint_encoder_bias` 다. joint_zero 가
+# 꺼져 있으면 그 채널은 전부 0 이라 정보가 없다. NZ 위에 얹어야 비로소 "비평자가
+# 그 env 의 영점 오차를 안다"는 조건이 만들어진다.
+#
+# 가설: DR 축 중 차원이 가장 크고(12) 관측에 없는 것이 관절 영점이다. 비평자가
+# 그것을 모르면 발목이 10도 틀어진 env 와 멀쩡한 env 의 가치를 하나로 평균해야 하고,
+# 그 잡음이 그대로 advantage 로 들어간다. 보여주면 가치추정이 날카로워지고,
+# **배포되는 정책의 입력은 한 글자도 안 바뀐다.**
+NB_ARMS = {
+    "NB_zerocritic": merge(_N_BASE, _PATH_ON, _ZERO_ON, {
+        "observation.privileged_extra": True,
+        "env.num_privileged_obs": 29,
+    }),
+}
+N_ARMS.update(NB_ARMS)
 
 
 # ---- NA: 이력 + 영점 오차를 함께 (2026-08-07, 사용자 요청) --------------------
@@ -926,6 +951,7 @@ GPU_OF = {
     "N6_foot": "cuda:0", "N7_critic": "cuda:1",
     "NZ_zeroiid": "cuda:1", "N9_zerostruct": "cuda:0",
     "NA_histzero": "cuda:1",
+    "NB_zerocritic": "cuda:0",
 }
 
 

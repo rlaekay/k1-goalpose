@@ -1099,6 +1099,26 @@ class GoalPose(BaseTask):
         지금 비평자는 우리가 거는 랜덤화의 대부분을 못 본다. 그러면 같은 관측인데
         조건이 다른 env들의 가치를 하나로 평균해야 하고, DR이 셀수록 가치추정이
         흐려진다. 비대칭 actor-critic의 요점이 정확히 이걸 피하는 것이다.
+
+        ⛔ 2026-08-07 재검토: 처음 설계(접촉 2 + 지연 1)는 **가장 큰 구멍을 놓쳤다.**
+        비평자가 보는 것과 우리가 랜덤화하는 것을 나란히 적으면:
+
+          base_com / base_mass   -> base_mass_scaled(4) 로 **보인다**
+          push_force / torque    -> 3+3 으로 **보인다**
+          발 접촉                -> 안 보였다  (여기서 추가)
+          그 env 의 관측 지연     -> 안 보였다  (여기서 추가)
+          **관절 영점 오차(12)**  -> 안 보인다  ← 지금 NZ_zeroiid / NA_histzero 가
+                                     바로 이걸 켜고 학습 중인데, 비평자는 어느 env 가
+                                     몇 도 틀어졌는지 전혀 모른 채 가치를 매긴다.
+                                     한 env 는 발목이 10도 틀어져 있고 다른 env 는
+                                     멀쩡한데, 관측이 같으면 비평자는 두 가치를
+                                     하나로 평균할 수밖에 없다. DR 축 중 차원이 가장
+                                     크고(12) 결과에 가장 세게 붙는 축이다.
+
+        `joint_target_offset` 은 따로 넣지 않는다 -- joint_zero 를 켜면 정확히
+        `-joint_encoder_bias` 라서 같은 정보다(§8-46 의 유도).
+        joint_zero 가 꺼져 있으면 이 12채널은 전부 0 이고, 그건 "이 env 는 영점이
+        정상"이라는 참인 정보라 낭비가 아니라 상수다.
         """
         if not (self.cfg.get("observation") or {}).get("privileged_extra"):
             return ()
@@ -1106,7 +1126,9 @@ class GoalPose(BaseTask):
         delay = getattr(self, "_obs_delay", None)
         if delay is None:
             delay = torch.zeros(self.num_envs, device=self.device)
-        return (contact_z, delay.float().unsqueeze(-1))
+        # 10도 = 0.175 rad 이 최대이므로 x5 로 대략 [-0.9, 0.9] 에 넣는다.
+        bias = self._obs_dofs(self.joint_encoder_bias) * 5.0
+        return (contact_z, delay.float().unsqueeze(-1), bias)
 
     def _apply_obs_history(self):
         """최근 k 프레임을 이어 붙인다. k=1이면 정확한 no-op이다.
