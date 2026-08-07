@@ -1228,17 +1228,28 @@ class GoalPose(BaseTask):
         리셋 처리가 지연 버퍼와 같은 이유로 필요하다: 안 지우면 리셋된 env가
         넘어지기 직전 프레임들을 이력으로 물려받는다. reset 경로에서 지운다.
         """
-        k = int((self.cfg.get("observation") or {}).get("history_steps", 1) or 1)
+        obs_cfg = self.cfg.get("observation") or {}
+        k = int(obs_cfg.get("history_steps", 1) or 1)
+        # ⛔ 간격(stride). 두 축이 서로 다른 창을 요구한다:
+        #   * 관측 지연 0-40 ms = 0-2 제어스텝 -> 미세 해상도, 짧은 창(5면 충분)
+        #   * 관절 영점 anti_mirror -> 왼발 stance 와 오른발 stance 를 **비교**해야
+        #     보이므로 **한 주기 = 50 Hz / 2.0 Hz = 25 제어스텝**이 필요하다
+        # history_steps: 5 는 첫째 축에 맞춘 값이고 둘째 축에는 0.2 주기다.
+        # 원시 스택 25 x 54 = 1350 은 첫 층이 345K 파라미터라 과하다. stride 로
+        # 창을 넓히면서 프레임 수를 줄인다 -- 25스텝 창을 stride 2 로 13프레임(702).
+        stride = max(1, int(obs_cfg.get("history_stride", 1) or 1))
         if k <= 1:
             return
         w = self.obs_buf.shape[-1]
-        if not hasattr(self, "_obs_stack") or self._obs_stack.shape != (k, self.num_envs, w):
-            self._obs_stack = self.obs_buf.unsqueeze(0).repeat(k, 1, 1).clone()
-        # 새 프레임을 앞으로 밀어 넣는다. [t, t-1, ..., t-k+1] 순서를 유지해야
-        # 수술이 [:, :54]에 옛 가중치를 넣는 것과 일치한다.
+        depth = (k - 1) * stride + 1      # 링 버퍼가 덮어야 하는 스텝 수
+        if not hasattr(self, "_obs_stack") or self._obs_stack.shape != (depth, self.num_envs, w):
+            self._obs_stack = self.obs_buf.unsqueeze(0).repeat(depth, 1, 1).clone()
+        # 새 프레임을 앞으로 밀어 넣는다. [t, t-1, ..., t-depth+1] 순서를 유지해야
+        # 수술이 [:, :54]에 옛 가중치를 넣는 것과 일치한다(프레임 0 = 현재).
         self._obs_stack = torch.cat(
             (self.obs_buf.unsqueeze(0), self._obs_stack[:-1]), dim=0)
-        self.obs_buf = self._obs_stack.permute(1, 0, 2).reshape(self.num_envs, k * w)
+        sel = self._obs_stack[::stride][:k]
+        self.obs_buf = sel.permute(1, 0, 2).reshape(self.num_envs, k * w)
 
     def _assert_obs_width(self):
         """config의 num_observations와 실제 폭이 어긋나면 **바로** 죽는다.

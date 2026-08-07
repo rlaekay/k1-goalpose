@@ -34,6 +34,11 @@ observation:
   # 자기 지연을 추정할 수 없고, 지연을 랜덤화해도 할 수 있는 최선이 "보수적으로
   # 굴기"뿐이다. 이력이 있으면 지연을 식별해서 보상할 수 있다.
   history_steps: 1
+  # 프레임 간격. history_steps x history_stride 가 창의 길이(제어스텝)다.
+  # 보행 한 주기 = 50 Hz / gait 2.0 Hz = 25 스텝. 좌우 비대칭(anti_mirror 영점)은
+  # 왼발 stance 와 오른발 stance 를 비교해야 보이므로 한 주기를 덮어야 한다.
+  # 13 x 2 = 25 스텝을 obs 702 로 덮는다(원시 25프레임이면 1350).
+  history_stride: 1
   # 비평자 전용 3채널(양발 수직 접촉력 2 + 그 env의 관측지연 1). 배포에 안 나가므로
   # 하드웨어 가용성 제약이 없다. 지금 비평자는 우리가 거는 랜덤화 대부분을 못 본다.
   privileged_extra: false

@@ -726,10 +726,16 @@ N_ARMS = {
 N_OBS_ARMS = {
     # 이력 5프레임(=100 ms). 지연 랜덤화와 짝이다: 지연을 겪게 하되 그것을 식별할
     # 수단을 같이 준다. MB_obsdelay는 지연만 주고 수단은 안 줬다.
+    # ⛔ 2026-08-08 재설계. 원래 5프레임(=0.2 보행주기)이었는데, 그건 관측 지연
+    # (0-2 제어스텝)에 맞춘 창이고 좌우 비대칭 영점 오차에는 턱없이 짧다 --
+    # anti_mirror δ 는 왼발 stance 와 오른발 stance 를 **비교**해야 보이므로
+    # **한 주기 = 25 제어스텝**이 필요하다. 원시 25프레임은 obs 1350 이라
+    # stride 2 로 13프레임(obs 702)으로 같은 창을 덮는다.
     "N4_hist": merge(_N_BASE, _PATH_ON, {
-        "observation.history_steps": 5,
+        "observation.history_steps": 13,
+        "observation.history_stride": 2,
         "noise.obs_delay_steps": [0, 2],
-        "env.num_observations": 270,
+        "env.num_observations": 702,
     }),
     # 실측 관절 토크. 접촉·하중을 싣는 진짜 새 정보다.
     "N5_tau": merge(_N_BASE, _PATH_ON, {
@@ -1008,7 +1014,7 @@ N_ARMS.update(NA_ARMS)
 OBS_SURGERY = {
     # NA_histzero 도 이력 5프레임이라 N4 와 같은 폭이다.
     "NA_histzero": {"new_obs": 270, "new_priv": 14},
-    "N4_hist":   {"new_obs": 270, "new_priv": 14},
+    "N4_hist":   {"new_obs": 702, "new_priv": 14},
     "N5_tau":    {"new_obs": 66,  "new_priv": 14},
     "N6_foot":   {"new_obs": 56,  "new_priv": 14},
     "N7_critic": {"new_obs": 54,  "new_priv": 17},
