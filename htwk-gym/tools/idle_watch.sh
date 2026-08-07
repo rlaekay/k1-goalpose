@@ -73,8 +73,10 @@ while true; do
     n1=$(nvidia-smi -i 1 --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . )
 
     # --- 신호 3: 큐 깊이 + 실행 표식 ------------------------------------
-    q0=$(find "$ROOT/queue/gpu0" -maxdepth 1 -name '*.sh' 2>/dev/null | wc -l | tr -d ' ')
-    q1=$(find "$ROOT/queue/gpu1" -maxdepth 1 -name '*.sh' 2>/dev/null | wc -l | tr -d ' ')
+    # 백필(small) 레인도 센다. 안 세면 짧은 작업이 대기 중인데 "카드 유휴"로
+    # 잡혀서 autopilot 이 그 위에 3.5시간짜리 학습을 얹는다.
+    q0=$(find "$ROOT/queue/gpu0" "$ROOT/queue/small/gpu0" -maxdepth 1 -name '*.sh' 2>/dev/null | wc -l | tr -d ' ')
+    q1=$(find "$ROOT/queue/gpu1" "$ROOT/queue/small/gpu1" -maxdepth 1 -name '*.sh' 2>/dev/null | wc -l | tr -d ' ')
     running=$(find "$ROOT/queue/done" -maxdepth 1 -name '*.running' 2>/dev/null | wc -l | tr -d ' ')
     # 워커도 같은 이유로 실행 파일 기준으로 센다.
     workers=$(ps -eo comm=,args= | awk '$1 ~ /^bash/ && $3 == "tools/gpu_queue.sh" {n++} END{print n+0}')
