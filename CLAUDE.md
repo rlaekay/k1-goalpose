@@ -49,6 +49,13 @@
 >   보행을 깎는다는 것이 가장 강한 후보(예측 0.66 → MuJoCo 0.64 → 실기 0.61). 수정
 >   `--rate-fixed-filter`가 MuJoCo에서 증상을 없앤다. **다음 한 걸음은 로봇 30초
 >   `pub_hz` 측정**(R6). 밤새 고친 방법론 오류 넷도 같이 있다.
+> - **[FILTER_AUDIT-non-codex.md](FILTER_AUDIT-non-codex.md)** (2026-08-07) — Codex의
+>   필터 가설(§8-45/§8-47) 감사. ②/③ 대조·질량 기각·떨림 기각은 옳다. **그러나
+>   인과 전제가 코드와 다르다**: `sleep(0.001)`은 속도 제한이 아니라 데드라인 폴링이고
+>   `common.dt: 0.002` → 루프는 **500 Hz를 겨냥**한다. "50 Hz로 돈다"는 가정이지 측정이
+>   아니다. 그리고 `base_walk`는 **같은 필터·같은 루프·같은 dt로 걷는다** —
+>   사용자의 반증이 아직 안 풀렸다(실마리: 우리 `gait_frequency` 2.0 vs base_walk 1.0).
+>   **`pub_hz` 30초 실측이 유일한 판별 측정이다.**
 > - **[DEPLOY_REQUESTS_FROM_TRAINING.md](DEPLOY_REQUESTS_FROM_TRAINING.md)** — 학습이
 >   못 닫고 로봇에서만 닫히는 측정 요청. R1·R5는 이미 답이 나와 종결됐다.
 > - **[ibatch.md §8-44](ibatch.md)** (2026-08-07) — ⛔ **근본 원인 확정: 우리 과제가
