@@ -85,14 +85,29 @@ for RUN in "$@"; do
         --fast --tail_frac 1.0 --terrain plane \
         --sim_device "$DEV" --rl_device "$DEV" \
         --out "$SEL" --link_best 2>&1 | tail -40
-    rc=$?
-    if [ $rc -ne 0 ]; then echo "!! $NAME 선택기 실패 rc=$rc"; FAILED=$((FAILED+1)); continue; fi
+    # ⛔ `rc=$?` 는 파이프라인의 **마지막** 명령(tail)의 종료코드다. 이 가드는
+    # 죽은 코드였고, 선택기가 죽어도 rc=0 으로 통과해 다음 단계가 빈 체크포인트로
+    # 넘어갔다(2026-08-07 감사). PIPESTATUS 로 python 의 코드를 읽는다.
+    rc=${PIPESTATUS[0]}
+    if [ "$rc" -ne 0 ]; then echo "!! $NAME 선택기 실패 rc=$rc"; FAILED=$((FAILED+1)); continue; fi
 
     BEST="$RUN/nn/best.pth"
     if [ ! -e "$BEST" ]; then
         BEST=$(ls -1v "$RUN"/nn/model_*.pth 2>/dev/null | tail -1)
         echo "   (best.pth 없음 -> 마지막 체크포인트 $BEST 로 진행)"
     fi
+    # ⛔ 빈 문자열을 절대 넘기지 않는다. eval_goal_pose.py:4149 가 ""를 "-1"로
+    # 취급하고 find_latest_checkpoint() 가 `logs/**/*.pth` 중 **mtime 최신**을 집는다.
+    # 학습이 병렬로 도는 서버에서는 그때그때 다른 arm 의 체크포인트가 잡히고,
+    # 실제로 2026-08-07 에 N0_ctrl 이라는 이름으로 N1_path/model_6000(정확도)과
+    # N2_pathgrid/model_200(보행)이 채점됐다 -- 한 행 안에서 두 축이 서로 다른 정책이었다.
+    if [ -z "$BEST" ] || [ ! -e "$BEST" ]; then
+        echo "!! $NAME: 쓸 수 있는 체크포인트가 없다. 건너뛴다(빈 --checkpoint 는 절대 넘기지 않는다)."
+        FAILED=$((FAILED+1)); continue
+    fi
+    # 실제로 무엇을 채점하는지 로그에 남긴다. best.pth 는 심볼릭 링크라 이름만으로는
+    # 어느 iteration 인지 알 수 없다.
+    echo "   채점 대상: $(readlink -f "$BEST")"
 
     # --- 2단계: 공통 정확도 프로토콜 정식 채점 ---------------------------
     echo "-- 2/3 정확도 (공통 waypoint 프로토콜, 120 s)"
@@ -117,7 +132,7 @@ for RUN in "$@"; do
     # 한 축으로 뽑아 다른 축으로 채점하는 것이 이 저장소가 반복한 오류라, 두 번째
     # 후보를 싸게(60 s) 같이 재서 그 가능성을 열어둔다.
     FINAL=$(ls -1v "$RUN"/nn/model_*.pth 2>/dev/null | tail -1)
-    if [ -n "$FINAL" ] && [ "$(readlink -f "$FINAL")" != "$(readlink -f "$BEST")" ]; then
+    if [ -n "$FINAL" ] && [ -e "$FINAL" ] && [ "$(readlink -f "$FINAL")" != "$(readlink -f "$BEST")" ]; then
         echo "-- 4/4 지속 보행: 마지막 체크포인트 $(basename "$FINAL") (60 s)"
         python -u eval_goal_pose.py --task K1/Goal_Pose_V7 --config "$CFG" \
             --checkpoint "$FINAL" --terrain plane --duration_s 60 \

@@ -35,6 +35,18 @@ def g(d, *keys, default=None):
     return cur
 
 
+def mtbf(r):
+    """평균 무사고 시간(초). 낙상률/구간은 **프로토콜 의존값**이라 축이 다르면 비교가
+    안 된다 -- 정확도 축의 구간 median 이 5.94 s, forward_hold 가 0.98 s 로 6배 다르다.
+    구간 길이를 곱해 초 단위로 환산하면 프로토콜과 무관하게 읽힌다."""
+    seg = g(r, "segments_completed") or 0
+    fl = g(r, "falls") or 0
+    dur = g(r, "feasibility", "segment_duration_s", "median")
+    if not fl or not dur:
+        return None
+    return (seg + fl) * dur / fl
+
+
 def fmt(v, mult=1.0, nd=2):
     if v is None:
         return "-"
@@ -85,19 +97,32 @@ def main():
         r = arms[name].get("accuracy")
         if r is None:
             continue
+        # ⛔ 생존 편향을 표에 드러낸다. eval_goal_pose.py:1750 이
+        # `completed = changed & ~done` 이므로 **낙상으로 끝난 구간은 기록 자체가
+        # 안 된다.** 즉 오차/strict/heading 은 전부 "안 넘어진 구간만"의 통계다.
+        # 배포 정책은 시도의 36.8 %가 표본에서 빠지고도 오차 3.10 cm 로 M7(3.54,
+        # 탈락 0.2 %)보다 위에 온다. 분모가 arm 마다 다른 순위표였다.
+        seg = g(r, "segments_completed") or 0
+        fl = g(r, "falls") or 0
+        drop = (100.0 * fl / (seg + fl)) if (seg + fl) else None
         acc_rows.append([
             name,
             fmt(g(r, "pos_err_m", "median"), 100),      # cm
             fmt(g(r, "pos_err_m", "p90"), 100),
             fmt(g(r, "heading_err_deg", "median"), 1, 1),
             str(g(r, "falls", default="-")),
+            fmt(drop, 1, 1),
             fmt(g(r, "success_rate_strict"), 100, 1),
             str(g(r, "segments_completed", default="-")),
             "PASS" if g(r, "all_gates_pass") else "fail",
         ])
     print("== 정확도: 공통 waypoint 프로토콜 (모든 arm 을 같은 config 로 채점) ==")
     print(table(["arm", "오차med(cm)", "오차p90(cm)", "heading(도)",
-                 "낙상", "strict(%)", "구간수", "게이트"], acc_rows))
+                 "낙상", "표본탈락(%)", "strict(%)", "구간수", "게이트"], acc_rows))
+    print()
+    print("⛔ 표본탈락(%) = 낙상으로 끝나 **오차 통계에서 빠진** 시도의 비율이다.")
+    print("   이 값이 큰 arm 의 오차 숫자는 '안 넘어졌을 때만'의 값이라 다른 arm 과")
+    print("   같은 자가 아니다. 오차만으로 순위를 매기지 마라.")
     print()
 
     # ---- 표 2: 지속 보행 (forward_hold) ----------------------------------
@@ -117,18 +142,24 @@ def main():
             fmt(g(r, "body_speed", "share_above_0p5"), 100, 1),
             fmt(g(r, "body_speed", "share_above_1p0"), 100, 1),
             fmt(g(r, "high_speed_stability", "cruise_share_of_valid"), 100, 2),
-            str(g(r, "falls", default="-")),
-            fmt(g(r, "feasibility", "required_speed_median")),
+            fmt(mtbf(r), 1, 0),
+            fmt(g(r, "fall_rate_per_attempt"), 1, 4),
+            str(g(r, "duration_s", default="-")),
         ])
     print("== 지속 보행: --goal_pattern forward_hold (목표가 항상 2 m 앞, 도착 없음) ==")
     print(table(["arm", "속도med", "속도p90", "구간peak_med",
-                 ">0.5m/s(%)", ">1.0m/s(%)", "순항체류(%)", "낙상", "요구속도med"],
+                 ">0.5m/s(%)", ">1.0m/s(%)", "순항체류(%)", "낙상간격(s)",
+                 "낙상률/구간", "길이(s)"],
                 walk_rows))
     print()
-    print("주: 요구속도med 는 프로브가 실제로 속도를 요구했는지의 확인용이다.")
-    print("    waypoint 과제에서 이 값이 0.12 였다 -- 그게 '보행을 잰 적이 없다'의 정체다.")
-    print("    forward_hold 에서 이 값이 여전히 0.2 미만이면 프로브가 안 걸린 것이므로")
-    print("    아래 속도 숫자를 믿지 마라.")
+    print("⛔ 낙상을 **원시 개수**로 읽지 마라. 이 표에는 120 s 런과 60 s 런이 섞여 있고")
+    print("   개수는 길이에 비례한다. '낙상간격(s)'이 프로토콜에 무관한 값이다 --")
+    print("   구간수와 구간 길이로 환산한 평균 무사고 시간이고, 실기 요구와 직접 대조된다.")
+    print()
+    print("⛔ 속도med 에는 **넘어지며 나는 속도가 들어간다.** 유일한 마스크가 리셋 직후")
+    print("   0.2 s 뿐이라(eval_goal_pose.py:1174), 낙상간격이 짧은 arm 은 전도 동작이")
+    print("   그대로 히스토그램에 들어간다. 배포 정책이 낙상간격 1.2 s 인데 속도 1.12 로")
+    print("   M7(0.87)보다 빨라 보이는 것이 그 결과다. **순항체류(%)와 같이 읽어라.**")
     print()
 
     # ---- 표 3: 자세/포화 -- 실기 증상과 대조하는 축 ----------------------
