@@ -4157,3 +4157,89 @@ Codex의 필터 조사(§8-45/§8-47)를 감사한 결과(`FILTER_AUDIT-non-code
 `tools/clean_smoke_runs.sh` 로 고정했다. 세 조건을 **전부** 만족해야 지운다:
 체크포인트 0개 **그리고** 20분 이상 오래됨 **그리고** 살아 있는 `train_v7.py` 가
 그 arm 을 돌고 있지 않음. 기본은 dry-run 이고 `--yes` 를 붙여야 지운다.
+
+---
+
+## 8-49. ⛔ 복구 재진입이 get-up 을 기다린 적이 없다 (2026-08-07 실기)
+
+사용자가 로봇을 눕혀 복구를 시험했다. 네 번 다 **펌웨어 관절 보호(빨간불)** 로
+DAMPING 에 떨어졌다. 로그가 사슬을 그대로 보여준다.
+
+```
+ModeMonitor disabled (cannot import name 'RobotStatesMsg' from 'booster_interface.msg')
+cannot read /robot_states; entering CUSTOM without confirming the robot is standing
+[recovery] standing again after 4.9 s; re-entering CUSTOM
+[mode-timing] latched CUSTOM entry done in 3.04 s, joints moved 1.5934 rad
+[recovery] get-up never became available (state=IS_READY); stopping.
+```
+
+### ① 서 있는지 확인하는 게이트가 **경고만 찍고 통과**했다
+
+`_ensure_standing_before_custom` 은 `mode_monitor.available == False` 면 그냥
+return 한다. 안전 전제조건이 옵션이면 필요한 순간에 꺼져 있다.
+
+`ros2 topic info /robot_states` 는 타입이 **정확히
+`booster_interface/msg/RobotStatesMsg`** 라고 답한다. 그런데 그 패키지의
+`__init__.py` 는 그것을 export 하지 않는다(FallDownState 등 17개만 있다).
+**메시지는 생성돼 있고 `__init__` 만 빠진 것이다.** 그래서 공개 import 가
+실패하면 `_robot_states_msg` 모듈을 직접 집도록 고쳤다.
+
+### ② `IS_READY` 는 get-up 의 완료가 아니다
+
+판정이 `state == IS_READY and elapsed > 2.0` 한 줄이었다. 실측 get-up 은
+**HAS_FALLEN → IS_READY 8.0 s** 인데 **4.9 s 에 재진입**했다. 사용자 관찰이
+정확했다 — 로봇은 그 시점에 **다리를 오므려 서기를 하는 중**이고, 그것이 끝나야
+stand mode 다.
+
+시간 상수를 추측하는 대신 **로봇이 멈추는 것을 본다**: 다리 12관절의 `|dq|` 가
+0.15 rad/s 아래로 0.5 s 지속. `LowState` 에서 직접 읽히므로 `/robot_states` 가
+없는 빌드에서도 쓸 수 있다. 최소 대기도 2.0 → 8.0 s(실측값).
+
+**직립도 같이 요구한다.** `/fall_down` 은 ~1 Hz 라 DAMPING 직후에도 낡은
+`IS_READY` 를 들고 있을 수 있고, **그때 다리는 힘이 빠져서 오히려 조용하다** --
+"IS_READY + 조용함"만으로는 무너지는 중인 로봇을 서 있다고 읽는다. `tilt` 는
+LowState 에서 500 Hz 로 오므로 그 창이 없다.
+
+### ③ 램프가 거리를 무시했다
+
+| 진입 | 이동량 | 옛 램프 | 속도 | 새 램프 |
+|---|---|---|---|---|
+| 최초 (`b`) | 0.4894 rad | 2.0 s | 0.24 rad/s | **2.0 s (그대로)** |
+| 복구 #1 | 1.5934 rad | 2.0 s | **0.80 rad/s** | 5.31 s |
+| 복구 #3 | 1.6773 rad | 2.0 s | **0.84 rad/s** | 5.59 s |
+
+`clamp(이동량 / 0.3, 2.0, 8.0)`. **안 망가진 경로(최초 진입)는 안 바꾼다** --
+0.4894 rad 은 하한에 걸려 2.0 s 그대로다. 96도를 2초에 끄는 복구 재진입만 늘어난다.
+
+### ④ `IS_READY` 를 "get-up 불가"로 읽어 중단했다
+
+이미 서 있으면 SDK 가 `is_recovery_available=False` 로 답하는 것이 **정상**이다
+("일으킬 수 없다"가 아니라 "일으킬 것이 없다"). 그것을 실패로 읽고 10 초 뒤
+멈췄다. GetUp 을 건너뛰고 완료 판정으로 넘어가게 했다 -- 거기서 정지/직립을
+확인하므로 이르게 들어가지 않는다.
+
+### ⛔ 아직 안 고친 것 — `b` 구간이 붙잡는 자세
+
+`--hold-diag 15` 로 잰 결과: **관절 추종은 완벽한데(전 관절 max 0.0108 rad =
+0.6°, 발목 ≤1.5°) 몸통 tilt 가 4.9–13.8°** 로 15 초 내내 흔들린다. 관절이
+명령대로 가 있는데 몸이 기울어 있다 = **명령한 자세 자체가 곧게 서지 못한다.**
+
+평면 다리에서 발이 평평하고 몸통이 수직이려면 `hip + knee + ankle = 0` 이어야 한다:
+
+| | Hip | Knee | Ankle | 합 |
+|---|---|---|---|---|
+| 첫 deploy (`73e71f3` 이전, `prepare` 자세) | −0.1 | 0.2 | −0.1 | **0.00** |
+| 지금 (`common.default_qpos`) | −0.2 | 0.4 | −0.25 | **−0.05** |
+
+`b`~`r` 구간에는 **균형을 닫는 주체가 없다** -- 관절 위치 서보만 돈다. 첫
+deploy 는 합이 0 인 자세를 잡아 개루프로 버텼고, 지금은 **정책이 있어야만 설 수
+있는 자세**를 정책 없이 붙잡는다. `r` 을 누르면 멀쩡해지는 이유가 이것이다.
+
+수정 방향: `b` 에서는 합=0 인 prepare 자세를, `r` 에서 RL 자세로 짧게 램프하며
+게인 교체. **아직 안 넣었다** -- 위 넷과 변수를 섞지 않기 위해서다.
+
+### 기록 사고
+
+위 코드 넷은 **`544642a "ND_dwell + eval_round 실패 전파"` 안에 들어가 있다.**
+병렬 세션이 `git add -A` 로 내 작업 트리를 같이 커밋했다. 코드는 정상이지만 그
+커밋 메시지에 이 변경의 근거가 없어서 여기에 남긴다.
