@@ -75,10 +75,11 @@ def foot_contact_geoms(model):
     return out
 
 
-def weld_xml(path):
-    """발 두 링크를 world 에 용접한 모델을 문자열로 만든다.
+def weld_model(path):
+    """발 두 링크를 world 에 용접한 모델. 원본 자산은 건드리지 않는다.
 
-    자산 파일을 건드리지 않는다 -- 공유 파일을 조용히 바꾸면 다른 실행이 오염된다.
+    from_xml_string 은 meshdir 상대경로를 못 찾으므로 **같은 디렉터리**에 임시
+    파일로 쓴 뒤 지운다. 공유 자산을 조용히 바꾸면 다른 실행이 오염된다.
     """
     with open(path, "r", encoding="utf-8") as f:
         src = f.read()
@@ -87,7 +88,14 @@ def weld_xml(path):
           '<weld body1="right_foot_link"/>'
           '</equality>')
     assert "</mujoco>" in src
-    return src.replace("</mujoco>", eq + "</mujoco>")
+    tmp = os.path.join(os.path.dirname(path), "_weld_tmp_%d.xml" % os.getpid())
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(src.replace("</mujoco>", eq + "</mujoco>"))
+        return mujoco.MjModel.from_xml_path(tmp)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def settle_height(model, data, q0, nj):
@@ -192,8 +200,7 @@ def main():
     a = ap.parse_args()
 
     cfg = yaml.safe_load(open(DEPLOY_CFG, encoding="utf-8"))
-    src = weld_xml(a.xml) if a.weld_feet else None
-    model = (mujoco.MjModel.from_xml_string(src) if src
+    model = (weld_model(a.xml) if a.weld_feet
              else mujoco.MjModel.from_xml_path(a.xml))
     nj = model.nu
 
