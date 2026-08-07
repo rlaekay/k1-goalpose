@@ -88,7 +88,7 @@ class FakePolicy:
         self.gait_process = 0.0
 
 
-def make_ctl(parallel_torque=False, policy=None):
+def make_ctl(parallel_torque=False, policy=None, policy_authorized=True):
     c = D.Controller.__new__(D.Controller)
     import logging
     c.logger = logging.getLogger("t"); c.logger.setLevel(logging.CRITICAL)
@@ -108,6 +108,13 @@ def make_ctl(parallel_torque=False, policy=None):
     c.running_policy = False
     c.publish_runner = None
     c._policy_gains_active = False
+    # 2026-08-08 추가. 재진입 시나리오는 **이미 `r` 을 누른 뒤**이므로 문이 열려
+    # 있다. 닫힌 경우(= `b`~`r` 대기 중 낙상)는 T14 에서 따로 본다.
+    c._policy_authorized = policy_authorized
+    # DDS 콜백/발행 스레드에서 난 오류를 메인으로 넘기는 자리.
+    # `_require_fresh_low_state` 가 이 둘을 본다.
+    c._layout_error = None
+    c._publish_error = None
     c._parallel_torque = parallel_torque
     c._rate_fixed_filter = False
     c._filter_tau_s = 0.010
@@ -334,6 +341,65 @@ if reset_fn is not None:
     need = {"actions", "gait_process", "_last_time", "_hist", "_hist_primed"}
     check("T13 reset 이 낙상을 건너던 상태 5개를 전부 지운다",
           need <= cleared, "빠진 것=%s" % sorted(need - cleared))
+
+# ---- T14~T16: `b`~`r` 대기 중 낙상 -- 복구는 돌되 정책은 안 켜진다 ----------
+# 오퍼레이터가 아직 `r` 을 누르지 않았는데 복구가 완료되면, 예전 코드는 곧바로
+# 정책을 켰다(그리고 그 앞의 결함 때문에 애초에 복구 자체가 안 돌았다).
+# 복구의 일은 "서 있는 상태로 되돌리기"까지이고 보행 시작은 사람이 연다.
+c2 = make_ctl(policy_authorized=False)
+_stop2, _th2 = live_publisher(c2)
+time.sleep(0.02)
+c2._frames.clear()
+c2._step_recovery()
+_stop2.set(); _th2.join(timeout=1.0)
+
+check("T14 문이 닫혀 있으면 `running_policy` 를 켜지 않는다",
+      c2.running_policy is False)
+check("T15 문이 닫혀 있으면 정책 게인으로 바꾸지 않는다 (prepare 유지)",
+      c2._policy_gains_active is False
+      and np.allclose(np.array([m.kp for m in c2.low_cmd.motor_cmd])[LEGS],
+                      PREP_KP[LEGS]),
+      "kp[10:22]=%s" % np.array2string(
+          np.array([m.kp for m in c2.low_cmd.motor_cmd])[LEGS], precision=0))
+check("T16 문이 닫혀 있어도 복구 자체는 끝난다 (prepare 자세로 서 있다)",
+      c2._recovery_phase == "none"
+      and np.allclose(c2.dof_target, PREP_Q, atol=1e-6),
+      "phase=%s dof_target[10:22]=%s" % (
+          c2._recovery_phase,
+          np.array2string(np.asarray(c2.dof_target)[LEGS], precision=3)))
+
+# ---- T17: 관절배치 가드가 플래그를 통과했을 때만 세우는가 (정적) ------------
+# 예전에는 `_joint_layout_checked = True` 가 raise 보다 먼저였다. 첫 콜백이
+# 실패로 빠져나가면 두 번째 콜백이 검사를 통째로 건너뛰었다 -- 가드가 스스로를
+# 무력화했다. 소스에서 순서를 본다(콜백 스레드라 실행으로 잡기 어렵다).
+_src = open(os.path.join(DEPLOY, "deploy_goal_pose.py"), encoding="utf-8").read()
+_fn = None
+for node in ast.walk(ast.parse(_src)):
+    if isinstance(node, ast.FunctionDef) and node.name == "_verify_joint_layout":
+        _fn = node
+_set_line = _raise_line = None
+if _fn is not None:
+    for sub in ast.walk(_fn):
+        if (isinstance(sub, ast.Attribute) and sub.attr == "_joint_layout_checked"
+                and isinstance(sub.ctx, ast.Store)):
+            _set_line = sub.lineno if _set_line is None else min(_set_line, sub.lineno)
+        if isinstance(sub, ast.Raise):
+            _raise_line = sub.lineno if _raise_line is None else min(_raise_line, sub.lineno)
+check("T17 `_joint_layout_checked` 를 raise 보다 **뒤에** 세운다",
+      _fn is not None and _set_line is not None and _raise_line is not None
+      and _set_line > _raise_line,
+      "set@%s raise@%s" % (_set_line, _raise_line))
+
+# ---- T18: 발행 스레드가 예외를 삼키지 않는가 (정적) -------------------------
+_pub = None
+for node in ast.walk(ast.parse(_src)):
+    if isinstance(node, ast.FunctionDef) and node.name == "_publish_cmd":
+        _pub = node
+check("T18 `_publish_cmd` 가 예외를 잡아 `_publish_error` 에 남긴다",
+      _pub is not None
+      and any(isinstance(h, ast.ExceptHandler) for h in ast.walk(_pub))
+      and any(isinstance(a, ast.Attribute) and a.attr == "_publish_error"
+              for a in ast.walk(_pub)))
 
 print()
 if FAILED:
