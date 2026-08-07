@@ -68,7 +68,7 @@ echo "arm 배치 (인자로 준 것은 live 큐, 나머지는 plan/):"
 # NA_histzero 는 사용자가 직접 요청한 상호작용 셀(이력 + 영점)이라 030 으로 앞에 둔다.
 stage NA_histzero 270 14 1 030
 stage N4_hist     270 14 1 800
-stage N7_critic    54 17 1 810
+stage N7_critic    54 29 1 810
 stage NZ_zeroiid   54 14 1 830
 stage N5_tau       66 14 0 810
 stage N6_foot      56 14 0 820
