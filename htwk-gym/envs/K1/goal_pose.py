@@ -392,6 +392,7 @@ class GoalPose(BaseTask):
         self._reset_root_states(env_ids)
 
         self.last_dof_targets[env_ids] = self.dof_pos[env_ids]
+        self._resample_action_filter(env_ids)
         if (self.cfg["randomization"].get("joint_zero") or {}).get("enabled"):
             self._resample_joint_zero(env_ids)
         else:
@@ -769,6 +770,62 @@ class GoalPose(BaseTask):
         hide scripted (non-learned) joints so the observation width is stable."""
         return x
 
+    def _apply_action_filter(self, target):
+        """배포가 실제로 모터에 보내는 것은 정책 출력이 아니라 **저역통과를 통과한 값**이다.
+
+        `deploy_goal_pose.py:1430` 이 발행 루프마다 이걸 한다:
+
+            filtered = filtered * 0.8 + target * 0.2
+
+        그런데 **학습에는 이 필터가 아예 없다.** 액션 쪽에 있는 것은 `delay_steps`
+        (제어주기 안 0-18 ms 순수지연)뿐이고, PD 는 날것 목표를 그대로 받는다
+        (:793). 즉 정책은 만난 적 없는 구동 경로 위에서 배포된다.
+
+        ⛔ 이건 `--rate-fixed-filter` 를 켜도 남는다. 그 수정은 시정수를 10 ms 로
+        **고정**하는 것이지 0 으로 만드는 것이 아니다. 로봇에는 항상 1차 지연이 있고
+        sim 에는 없다.
+
+        왜 물리 서브스텝에 얹는가: `sim.dt = 0.002` 이고 배포 `common.dt = 0.002` 라
+        **둘이 정확히 같은 500 Hz** 다. 그래서 서브스텝마다 한 번 적용하는 것이
+        로봇의 발행 루프와 1:1 대응이고, 근사가 아니다.
+
+        alpha 는 env 마다 에피소드 시작에 뽑은 시정수에서 나온다:
+            alpha = 1 - exp(-sim_dt / tau)
+        tau 를 [0, 30] ms 로 랜덤화하면 한 정책이 필터 없음(0), 수정본(10 ms),
+        느린 루프(30 ms)를 모두 겪는다. 그러면 로봇의 `pub_hz` 가 얼마로 나오든
+        정책이 그 축에서 무관해진다 -- 측정을 기다릴 필요가 없어지는 것이 요점이다.
+
+        `[0, 0]` 이면 `_act_alpha` 가 None 이라 텐서 연산조차 없고 기존과 비트 단위로
+        같다. 기존 arm 은 전부 무관하다.
+        """
+        if getattr(self, "_act_alpha", None) is None:
+            return target
+        self.filtered_dof_targets += self._act_alpha * (target - self.filtered_dof_targets)
+        return self.filtered_dof_targets
+
+    def _resample_action_filter(self, env_ids):
+        """env 마다 필터 시정수를 뽑는다. 실제 루프 속도는 그 로봇의 성질이지 매 스텝
+        흔들리는 값이 아니므로, 에피소드 안에서는 고정한다(obs_delay 와 같은 이유)."""
+        rng = (self.cfg["control"].get("action_filter_tau") or [0.0, 0.0])
+        lo, hi = float(rng[0]), float(rng[1])
+        if hi <= 0.0:
+            self._act_alpha = None
+            return
+        if not hasattr(self, "filtered_dof_targets"):
+            self.filtered_dof_targets = self.dof_pos.clone()
+            self._act_tau = torch.zeros(self.num_envs, 1, device=self.device)
+            self._act_alpha = torch.ones(self.num_envs, 1, device=self.device)
+        tau = lo + (hi - lo) * torch.rand(len(env_ids), 1, device=self.device)
+        self._act_tau[env_ids] = tau
+        # tau <= 0 은 필터 없음이다. exp(-dt/0) 을 피하려고 분기한다.
+        sim_dt = float(self.cfg["sim"]["dt"])
+        a = torch.where(tau > 1e-9, 1.0 - torch.exp(-sim_dt / tau.clamp(min=1e-9)),
+                        torch.ones_like(tau))
+        self._act_alpha[env_ids] = a.clamp(max=1.0)
+        # 리셋된 env 의 필터 상태는 현재 자세로 초기화한다. 안 하면 넘어지기 직전
+        # 목표를 물려받는다(last_dof_targets 를 :394 에서 같은 이유로 초기화한다).
+        self.filtered_dof_targets[env_ids] = self.dof_pos[env_ids]
+
     def _dof_targets_from_actions(self):
         """PD position targets for every DOF.
 
@@ -790,7 +847,8 @@ class GoalPose(BaseTask):
         self.torques.zero_()
         for i in range(self.cfg["control"]["decimation"]):
             self.last_dof_targets[self.delay_steps == i] = dof_targets[self.delay_steps == i]
-            dof_torques = self.dof_stiffness * (self.last_dof_targets - self.dof_pos) - self.dof_damping * self.dof_vel
+            applied = self._apply_action_filter(self.last_dof_targets)
+            dof_torques = self.dof_stiffness * (applied - self.dof_pos) - self.dof_damping * self.dof_vel
             friction = torch.min(self.dof_friction, dof_torques.abs()) * torch.sign(dof_torques)
             dof_torques = torch.clip(dof_torques - friction, min=-self.torque_limits, max=self.torque_limits)
             self.torques += dof_torques

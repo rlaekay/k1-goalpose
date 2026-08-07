@@ -133,6 +133,18 @@ control:
   damping: {"Hip": 2., "Knee": 2., "Ankle": 1., "Elbow": 1.} # [N*m*s/rad]
   action_scale: 1.
   decimation: 10
+  # 배포가 모터에 보내는 것은 정책 출력이 아니라 저역통과를 통과한 값이다
+  # (deploy_goal_pose.py:1430). 그런데 학습에는 그 필터가 아예 없었다 -- 액션 쪽은
+  # delay_steps(순수지연)뿐이고 PD 가 날것 목표를 받는다.
+  #
+  # 단위는 **초**. [0, 0] 이면 정확한 no-op 이고 기존 arm 은 전부 무관하다.
+  # sim.dt = 0.002 이고 배포 common.dt = 0.002 라 둘이 같은 500 Hz 이므로,
+  # 물리 서브스텝마다 alpha = 1 - exp(-sim_dt/tau) 를 적용하는 것이 로봇의 발행
+  # 루프와 1:1 대응이다(근사가 아니다).
+  #
+  # [0, 0.030] 으로 켜면 한 정책이 필터 없음(0) / 수정본(10 ms) / 느린 루프(30 ms)
+  # 를 모두 겪는다. 그러면 로봇의 pub_hz 가 얼마든 정책이 그 축에서 무관해진다.
+  action_filter_tau: [0.0, 0.0]
 
 terrain:
   type: "plane" # "plane" or "trimesh" -- MASTERPLAN scope: flat ground only
