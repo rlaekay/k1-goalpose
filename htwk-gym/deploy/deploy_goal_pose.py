@@ -549,14 +549,60 @@ class Controller:
         # 가르려면 이게 있어야 한다.
         self.dof_tau = np.zeros(n, dtype=np.float32)
 
+    # InitChannel 데드락을 잘라내는 시간(초). 정상 초기화는 1초 안에 끝나므로
+    # 8초면 오검출이 없다.
+    INIT_WATCHDOG_S = 8.0
+    # 워치독이 발동하면 이 파일에 스택이 남는다. faulthandler는 종료코드를 1로
+    # 고정하므로(커스텀 불가), run_e0.sh는 **이 파일이 비어 있지 않은지**로
+    # 데드락을 판별하고 재시도한다.
+    INIT_DEADLOCK_LOG = "/tmp/e0_init_deadlock.log"
+
     def _init_communication(self) -> None:
+        """SDK 채널을 연다. InitChannel의 GIL 데드락에 하드 타임아웃을 건다.
+
+        무엇이 일어나는가
+        ------------------
+        `B1LowStateSubscriber(handler)`는 **파이썬 콜백**을 등록하고, 그 다음
+        `InitChannel()`이 C++에서 블록한다. 그 창(window) 안에 LowState가 한 개라도
+        배달되면 DDS 스레드가 콜백을 부르려고 GIL을 요구하는데, GIL은 InitChannel을
+        부른 스레드가 쥐고 있다. 순환 대기 -- 전 스레드가 futex_wait로 들어간다.
+
+        왜 스레드로 못 푸는가
+        ---------------------
+        **GIL은 프로세스 전역이다.** InitChannel을 별도 스레드에서 돌려도 그 스레드가
+        GIL을 쥔 채 블록하므로 메인도 DDS도 못 돈다. 콜백을 나중에 등록하는 방법도
+        없다 -- SDK API가 `__init__(handler)` 하나뿐이다.
+
+        그래서 무엇을 하는가
+        --------------------
+        경합이므로 **대개는 통과한다**(창이 좁다). 통과 못 한 실행만 잘라내고 다시
+        띄우면 된다. 자르는 수단으로 `faulthandler`를 쓴다 -- 이것의 워치독은
+        **C 스레드**라 GIL 없이 발동해서 `_exit()`를 부른다. `signal.alarm`은 안 된다:
+        파이썬 시그널 핸들러는 바이트코드 사이에서만 돌고, 그 인터프리터가 멈춰 있다.
+        `threading.Timer`도 안 된다 -- 깨어날 때 GIL이 필요하다.
+
+        걸린 실행은 INIT_DEADLOCK_LOG 에 스택을 남기고 죽는다. faulthandler는
+        종료코드를 1로 고정하므로 run_e0.sh는 그 파일이 비어 있지 않은지로 판별한다.
+        """
+        import faulthandler
         try:
             self.low_cmd = LowCmd()
             self.low_state_subscriber = B1LowStateSubscriber(self._low_state_handler)
             self.low_cmd_publisher = B1LowCmdPublisher()
             self.client = B1LocoClient()
 
-            self.low_state_subscriber.InitChannel()
+            # 데드락은 여기서만 난다. 창을 정확히 이 호출로 좁힌다.
+            # 파일은 열어둔 채로 둔다 -- _exit()는 버퍼를 안 비우므로 워치독이
+            # 직접 쓸 수 있게 살아 있어야 한다. 통과하면 아래에서 지운다.
+            wd = open(self.INIT_DEADLOCK_LOG, "w")
+            faulthandler.dump_traceback_later(self.INIT_WATCHDOG_S, file=wd, exit=True)
+            try:
+                self.low_state_subscriber.InitChannel()
+            finally:
+                faulthandler.cancel_dump_traceback_later()
+            wd.close()
+            os.remove(self.INIT_DEADLOCK_LOG)   # 통과 -- 흔적을 남기지 않는다
+
             self.low_cmd_publisher.InitChannel()
             self.client.Init()
         except Exception as e:

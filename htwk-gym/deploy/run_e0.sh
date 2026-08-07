@@ -33,9 +33,23 @@ ARGS=(--config Goal_Pose_E0.yaml --net 127.0.0.1 --goal-source "$SOURCE")
 [ "$SOURCE" = "fixed" ] && ARGS+=(--goal "$GOAL")
 ARGS+=("$@")
 
+# InitChannel의 GIL 데드락은 경합이라 대개 통과하고 가끔 걸린다. 걸린 실행은
+# deploy_goal_pose.py의 faulthandler 워치독이 8초 만에 잘라내고 DEADLOCK_LOG에
+# 스택을 남긴다(종료코드는 1로 고정이라 그것으로는 구분이 안 된다).
+# 그 파일이 남아 있을 때만 재시도한다 -- 다른 실패는 그대로 올린다.
+DEADLOCK_LOG=/tmp/e0_init_deadlock.log
 echo "starting: python3 deploy_goal_pose.py ${ARGS[*]}"
-python3 deploy_goal_pose.py "${ARGS[@]}"
-rc=$?
+for attempt in 1 2 3 4 5; do
+    rm -f "$DEADLOCK_LOG"
+    python3 deploy_goal_pose.py "${ARGS[@]}"
+    rc=$?
+    if [ $rc -eq 0 ] || [ ! -s "$DEADLOCK_LOG" ]; then
+        break
+    fi
+    echo "[run_e0] InitChannel 데드락 (시도 $attempt/5). 스택: $DEADLOCK_LOG -- 재시도한다."
+    stty sane 2>/dev/null || true
+    sleep 2
+done
 
 # The wrapper's own cleanup does this too, but not if it was killed outright.
 stty sane 2>/dev/null || true
