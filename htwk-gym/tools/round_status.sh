@@ -34,8 +34,12 @@ fi
 echo
 echo "=== 직접 샘플 (감시자와 무관한 교차확인) ==="
 nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader
-echo "GPU 작업 프로세스: $(pgrep -fc 'train_v7\.py|eval_goal_pose\.py|select_best_checkpoint\.py' 2>/dev/null || echo 0)개"
-echo "큐 워커: $(pgrep -fc 'gpu_queue\.sh [01]' 2>/dev/null || echo 0)개"
+# ⛔ pgrep -f 를 쓰지 않는다. 명령줄에 그 문자열이 들어 있기만 한 셸까지 세서
+# 2026-08-07 에 유휴 감지가 원리적으로 발동하지 못하게 만든 버그의 원인이었다.
+# 이 블록은 감시자와 **무관한 교차확인**이 목적이므로, 감시자와 같은 방식으로
+# 세야 두 숫자가 어긋났을 때 그것이 실제 불일치임을 알 수 있다.
+echo "GPU 작업 프로세스: $(ps -eo comm=,args= | awk '$1 ~ /^python/ && /train_v7\.py|eval_goal_pose\.py|select_best_checkpoint\.py/ {n++} END{print n+0}')개"
+echo "큐 워커: $(ps -eo comm=,args= | awk '$1 ~ /^bash/ && $3 == "tools/gpu_queue.sh" {n++} END{print n+0}')개"
 
 echo
 echo "=== 큐 ==="
