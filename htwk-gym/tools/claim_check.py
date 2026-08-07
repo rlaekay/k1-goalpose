@@ -24,11 +24,21 @@ import sys
 import json
 import glob
 
-# 비교 가능성을 결정하는 조건들. 하나라도 다르면 그 축의 숫자는 나란히 못 놓는다.
-CONDITIONS = [
+# 조건을 두 갈래로 나눈다. 이 구분이 없으면 도구가 **모든 비교에 경보를 울리고**,
+# 그러면 아무도 안 읽게 된다 -- 2026-08-07 첫 실사용에서 실제로 그랬다.
+#
+#   IDENTITY  : 비교 대상을 **가르는** 것. 달라야 정상이다(다르니까 비교한다).
+#               다만 "무엇과 무엇을 비교하는지"를 눈에 보이게 찍어 준다.
+#   PROTOCOL  : 비교를 **성립시키는** 것. 하나라도 다르면 나란히 못 놓는다.
+#
+# `config` 는 IDENTITY 다 -- `make_eval_cfg.py` 가 arm 마다 다른 파일명을 쓴다.
+# 프로토콜이 정말 같은지는 `effective_eval_protocol_sha` 가 답한다. 그게 PROTOCOL 이다.
+IDENTITY = [
     ("checkpoint",        lambda r: os.path.basename(r.get("checkpoint") or "?")),
     ("run",               lambda r: (r.get("checkpoint") or "/?/").split("/nn/")[0].split("/")[-1]),
     ("config",            lambda r: os.path.basename(r.get("config") or "?")),
+]
+CONDITIONS = [
     ("goal_pattern",      lambda r: r.get("goal_pattern") or "(waypoint)"),
     ("duration_s",        lambda r: r.get("duration_s")),
     ("num_envs",          lambda r: r.get("num_envs")),
@@ -147,7 +157,17 @@ def main():
     w0 = max(16, max(len(l) for l in labels) + 2)
 
     print("=" * 78)
-    print("조건 — 여기 ⛔ 가 하나라도 있으면 그 축의 숫자를 나란히 놓지 마라")
+    print("무엇과 무엇을 비교하는가 (달라도 정상 — 이게 비교 대상이다)")
+    print("=" * 78)
+    print("{:<18}".format("") + "".join("{:<{}}".format(l, w0) for l in labels))
+    for cname, fn in IDENTITY:
+        vals = [fmt(fn(r)) for _, r in cols]
+        print("   {:<15}".format(cname)
+              + "".join("{:<{}}".format(v[:w0 - 1], w0) for v in vals))
+
+    print()
+    print("=" * 78)
+    print("프로토콜 — ⛔ 가 하나라도 있으면 그 축의 숫자를 나란히 놓지 마라")
     print("=" * 78)
     print("{:<18}".format("") + "".join("{:<{}}".format(l, w0) for l in labels))
     mismatched = []
