@@ -34,11 +34,18 @@ import glob
 # `config` 는 IDENTITY 다 -- `make_eval_cfg.py` 가 arm 마다 다른 파일명을 쓴다.
 # 프로토콜이 정말 같은지는 `effective_eval_protocol_sha` 가 답한다. 그게 PROTOCOL 이다.
 IDENTITY = [
-    ("checkpoint",        lambda r: os.path.basename(r.get("checkpoint") or "?")),
+    ("checkpoint",        lambda r: _ckpt_label(r)),
     ("run",               lambda r: (r.get("checkpoint") or "/?/").split("/nn/")[0].split("/")[-1]),
     ("config",            lambda r: os.path.basename(r.get("config") or "?")),
 ]
 CONDITIONS = [
+    # ⛔ 2026-08-08 추가. `best.pth` 는 **가변 심볼릭 링크**라 양쪽 다 "best.pth" 로
+    # 찍히면서 실제로는 다른 iteration 을 가리킬 수 있다. 실제로 그랬다:
+    # NC_actfilter best.pth -> model_100, NZ_zeroiid best.pth -> model_1700.
+    # 그런데도 도구는 "✅ 조건이 전부 같다" 를 출력했다 -- 이 파일 맨 위 docstring 이
+    # **첫 번째 실수로 적어 둔 바로 그것**(best vs final)을 도구가 못 잡고 있었다.
+    # iteration 이 다르면 "arm 차이" 와 "학습량 차이" 가 교락된다. 그래서 PROTOCOL 이다.
+    ("ckpt_iter",         lambda r: _ckpt_iter(r)),
     ("goal_pattern",      lambda r: r.get("goal_pattern") or "(waypoint)"),
     ("duration_s",        lambda r: r.get("duration_s")),
     ("num_envs",          lambda r: r.get("num_envs")),
@@ -53,21 +60,69 @@ CONDITIONS = [
 # 조건이 같아야만 의미가 있는 지표들. 어느 조건에 의존하는지 같이 적는다.
 METRICS = [
     ("pos_err med (cm)",  lambda r: _g(r, "pos_err_m", "median", mult=100),
-     "config, goal_pattern"),
-    ("strict (%)",        lambda r: _g(r, "success_rate_strict", mult=100), "config"),
-    ("falls (원시)",       lambda r: r.get("falls"), "duration_s ⚠"),
-    ("낙상률/시도",        lambda r: _g(r, "fall_rate_per_attempt"), "goal_pattern ⚠"),
-    ("낙상간격 (s)",       lambda r: _mtbf(r), "(프로토콜 무관)"),
-    ("표본탈락 (%)",       lambda r: _drop(r), "(생존편향 크기)"),
-    ("body_speed med",    lambda r: _g(r, "body_speed", "median"), "goal_pattern"),
+     "config, goal_pattern, ckpt_iter"),
+    ("strict (%)",        lambda r: _g(r, "success_rate_strict", mult=100), "config, ckpt_iter"),
+    ("falls (원시)",       lambda r: r.get("falls"), "duration_s ⚠, ckpt_iter"),
+    ("낙상률/시도",        lambda r: _g(r, "fall_rate_per_attempt"), "goal_pattern ⚠, ckpt_iter"),
+    ("낙상간격 (s)",       lambda r: _mtbf(r), "ckpt_iter"),
+    ("표본탈락(생존편향) %", lambda r: _drop(r), "ckpt_iter"),
+    ("body_speed med",    lambda r: _g(r, "body_speed", "median"), "goal_pattern, ckpt_iter"),
     ">1.0 m/s (%)",
 ]
 METRICS = [m for m in METRICS if isinstance(m, tuple)]
 METRICS.append((">1.0 m/s (%)", lambda r: _g(r, "body_speed", "share_above_1p0", mult=100),
-                "goal_pattern"))
+                "goal_pattern, ckpt_iter"))
 METRICS.append(("순항체류 (%)", lambda r: _g(r, "high_speed_stability",
-                                            "cruise_share_of_valid", mult=100), "goal_pattern"))
+                                            "cruise_share_of_valid", mult=100),
+                "goal_pattern, ckpt_iter"))
 METRICS.append(("segments", lambda r: r.get("segments_completed"), "duration_s"))
+
+
+def _resolve_ckpt(r):
+    """`best.pth` 는 심볼릭 링크다. 링크가 살아 있으면 실제 대상까지 따라간다.
+
+    링크를 못 따라가는 경우(다른 기계에서 리포트만 받아 본 경우)에는 이름 그대로
+    돌려준다 -- **모른다는 것을 아는 척하지 않기 위해** `?` 를 붙여 표시한다.
+    """
+    ck = r.get("checkpoint") or ""
+    if not ck:
+        return "?", None, False
+    base = os.path.basename(ck)
+    try:
+        if os.path.islink(ck) or os.path.exists(ck):
+            real = os.path.basename(os.path.realpath(ck))
+            return base, real, True
+    except OSError:
+        pass
+    return base, None, False
+
+
+def _ckpt_label(r):
+    """표시용. 심볼릭 링크면 `best.pth→model_1700` 처럼 실제 대상을 같이 찍는다."""
+    base, real, ok = _resolve_ckpt(r)
+    if ok and real and real != base:
+        return "{}→{}".format(base, real.replace(".pth", ""))
+    return base
+
+
+def _ckpt_iter(r):
+    """체크포인트의 iteration. 비교 가능성 판정에 쓰이므로 **추측하지 않는다.**
+
+    - 해석되면 정수 iteration
+    - 링크를 못 따라가면 `?<name>` -- 두 리포트가 같은 이름이어도 **같다고 못 박지 않는다**
+    """
+    base, real, ok = _resolve_ckpt(r)
+    name = real if (ok and real) else base
+    m = re.search(r"model_(\d+)", name or "")
+    if m:
+        return int(m.group(1))
+    if not ok and base:
+        # 미해석. 같은 이름이라도 **같은 것이라고 단정하지 않는다** -- 그래서 run 을
+        # 붙여 서로 다른 값으로 만든다. 결과적으로 ⛔ 가 뜨고, 사람이 서버에서
+        # 다시 돌려 확인하게 된다. 조용히 통과시키는 것보다 이쪽이 안전하다.
+        run = (r.get("checkpoint") or "/?/").split("/nn/")[0].split("/")[-1]
+        return "?{}@{}".format(base, run[:18])
+    return name or "?"
 
 
 def _g(r, *keys, mult=1.0):

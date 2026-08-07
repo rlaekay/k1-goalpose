@@ -58,10 +58,22 @@ for f in $(ls -1t "$ROOT/queue/logs"/*.log 2>/dev/null | head -4); do
 done
 
 echo
-echo "=== 채점되지 않은 run (eval/ 디렉터리 없음) ==="
+echo "=== 채점 상태 ==="
+# ⛔ 2026-08-08 수정. 예전에는 `$d/eval` 하나만 봤다. 그런데 **현행 라운드 파이프라인은
+# 결과를 `logs/eval_rounds/<라운드>/<run>.accuracy` 에 쓴다** -- run 디렉터리 안이 아니다.
+# 그래서 NC_actfilter·NZ_zeroiid·N0_ctrl·NA_histzero 처럼 **이미 채점이 끝난 run 이
+# 전부 "미채점" 으로 찍혔다**(실측 확인). 그 표를 믿고 재채점하면 GPU 를 그냥 버린다.
+# 두 경로를 모두 본다.
 for d in $(ls -1td "$ROOT"/logs/K1/K1/Goal_Pose_V7/*/ 2>/dev/null | head -14); do
     name=$(basename "$d")
     n=$(ls "$d/nn"/model_*.pth 2>/dev/null | wc -l | tr -d ' ')
-    if [ -d "$d/eval" ]; then mark="채점됨"; else mark="미채점"; fi
+    rounds=$(ls -d "$ROOT"/logs/eval_rounds/*/"$name".accuracy 2>/dev/null | wc -l | tr -d ' ')
+    if [ -d "$d/eval" ]; then
+        mark="채점됨 (run내 eval/)"
+    elif [ "$rounds" -gt 0 ]; then
+        mark="채점됨 (eval_rounds ${rounds}건)"
+    else
+        mark="미채점"
+    fi
     printf '%-46s ckpt=%-4s %s\n' "$name" "$n" "$mark"
 done
