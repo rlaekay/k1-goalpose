@@ -906,6 +906,31 @@ ND_ARMS = {
 N_ARMS.update(ND_ARMS)
 
 
+# ---- NE: 계보 B 의 대조군 (2026-08-07) --------------------------------------
+#
+# ⛔ 왜 필요한가. `stage_obs_arms.sh` 가 warm start 로 `best.pth` 를 썼는데 그건
+# 심볼릭 링크이고 `N1_path/nn/best.pth` 는 **model_100**(붕괴 전)을 가리킨다.
+# 그래서 `NA_histzero` / `NZ_zeroiid` / `NC_actfilter` 세 arm 이 의도와 달리
+# "N1_path 의 100 iteration 지점"에서 출발해 6000 을 더 돌았다.
+#
+# 되돌리는 것보다 **그 계보를 완성하는 편이 싸다.** 셋을 버리지 않아도 되고,
+# 텐서보드상 goal_reached 가 N1(1.03)의 1.7배(NC 1.78 / NZ 1.78)라 붕괴하지 않을
+# 가능성이 실제로 보인다. `NA_histzero` 도 best 가 iteration 3300(5.47 cm)이다.
+#
+# 그런데 **대조군이 없다.** 그러면 "NA 가 안 무너졌다"가
+#   (a) 이력+영점 레버 덕인지
+#   (b) 그냥 붕괴 전 지점에서 다시 출발하면 안 무너지는 것인지
+# 를 가를 수 없다. (b) 라면 레버 전부가 무의미하고, 동시에 **그 자체가 가장 값싼
+# 해결책**이다 -- 붕괴는 예산의 함수가 아니라 출발점의 함수라는 뜻이니까.
+#
+# NE_ctrl100 은 config 가 `N1_path` 와 **완전히 동일**하다(description 만 다르다).
+# 다른 것은 warm start 뿐이고, 그건 config 가 아니라 큐 스크립트가 정한다.
+NE_ARMS = {
+    "NE_ctrl100": merge(_N_BASE, _PATH_ON),
+}
+N_ARMS.update(NE_ARMS)
+
+
 # ---- NA: 이력 + 영점 오차를 함께 (2026-08-07, 사용자 요청) --------------------
 #
 # 이 조합은 편의가 아니라 **둘이 서로를 필요로 하기 때문에** 존재한다.
@@ -1026,6 +1051,7 @@ GPU_OF = {
     "NB_zerocritic": "cuda:0",
     "NC_actfilter": "cuda:1",
     "ND_dwell": "cuda:0",
+    "NE_ctrl100": "cuda:0",
 }
 
 
