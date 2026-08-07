@@ -47,6 +47,49 @@ while true; do
         fi
     fi
 
+    # --- 정체 복구: 할 일이 있는데 아무것도 안 돈다 -----------------------
+    #
+    # 유휴 승격보다 **먼저** 본다. 큐에 대기 작업이 있는데 워커가 죽어 있으면
+    # plan 에서 하나 더 승격해봐야 아무도 안 집는다. 원인부터 고쳐야 한다.
+    #
+    # 두 가지를 복구한다:
+    #   1. 워커가 2개 미만이면 다시 띄운다.
+    #   2. 고아 `.running` 표식을 원래 큐로 되돌린다. 워커가 작업 도중 죽으면
+    #      그 표식이 남고, 그 작업은 **영원히 사라진다** -- 큐에도 없고 done 에도
+    #      완료로 안 남는다. 아무 신호도 안 나가는 최악의 모드다.
+    stall=0
+    if [ -f "$STATE" ]; then
+        age=$(( $(date +%s) - $(stat -c %Y "$STATE" 2>/dev/null || echo 0) ))
+        if [ "$age" -le 180 ]; then
+            stall=$(sed -n 's/.*"stall_seconds": *\([0-9]*\).*/\1/p' "$STATE")
+            [ -z "$stall" ] && stall=0
+        fi
+    fi
+    if [ "$stall" -ge 300 ]; then
+        say "⚠️ 정체 $((stall / 60))분 -- 할 일이 있는데 아무것도 안 돈다. 복구 시도."
+        nw=$(ps -eo comm=,args= | awk '$1 ~ /^bash/ && /tools\/gpu_queue\.sh [01]/ {n++} END{print n+0}')
+        if [ "$nw" -lt 2 ]; then
+            say "  워커가 ${nw}개뿐이다. 두 장 모두 다시 띄운다."
+            for g in 0 1; do
+                ps -eo comm=,args= | awk -v g="$g" '$1 ~ /^bash/ && $0 ~ ("tools/gpu_queue.sh " g)' \
+                    | grep -q . && continue
+                ( cd "$ROOT" && setsid nohup bash tools/gpu_queue.sh "$g" \
+                    < /dev/null >> "queue/worker$g.log" 2>&1 & )
+                say "  워커 $g 재기동"
+            done
+        fi
+        for f in "$ROOT/queue/done"/*.running; do
+            [ -e "$f" ] || continue
+            n=$(basename "$f" .running)
+            # 이름 앞의 우선순위 숫자로 어느 카드였는지는 알 수 없으므로 gpu0 로
+            # 되돌린다. 작업 스크립트는 cuda:$GPU_INDEX 라 카드에 무관하다.
+            mv "$f" "$ROOT/queue/gpu0/$n.sh" 2>/dev/null \
+                && say "  고아 표식 복구: $n -> queue/gpu0/"
+        done
+        sleep "$INTERVAL"
+        continue
+    fi
+
     if [ "$idle" -ge "$PROMOTE_AFTER" ]; then
         promoted=0
         for g in 0 1; do

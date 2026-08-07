@@ -26,6 +26,7 @@ mkdir -p "$ROOT/queue"
 
 # 연속 유휴 시작 시각. 0 이면 "지금 유휴가 아님".
 idle_since=0
+stall_since=0
 
 json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
@@ -40,14 +41,24 @@ while true; do
 
     # --- 신호 2: 살아 있는 GPU 작업 프로세스 ----------------------------
     # util 이 0 이어도 이게 있으면 유휴가 아니다.
-    nproc_gpu=$(pgrep -fc 'train_v7\.py|train\.py|eval_goal_pose\.py|select_best_checkpoint\.py|play_mujoco' 2>/dev/null)
+    #
+    # ⛔ 2026-08-07: 여기가 `pgrep -fc 'train_v7\.py|...'` 였는데 **명령줄에 그
+    # 문자열이 들어 있기만 한 셸까지 셌다.** 13.5시간 전 내 ssh 셸 하나가
+    # heredoc 안에 train_v7.py 를 담은 채 살아 있어서 계수가 항상 2 이상이었다.
+    # 그러면 학습이 전부 끝나도 nproc_gpu 가 0 이 되지 않고, 유휴 조건이
+    # **원리적으로 절대 성립하지 않는다** -- autopilot 승격이 한 번도 안 일어난
+    # 이유이고, GPU 13.8시간 유휴 사고가 그대로 재현될 수 있는 구멍이었다.
+    #
+    # 그래서 **실행 파일이 python 인 것만** 센다. 셸은 comm 이 bash 라 걸러진다.
+    nproc_gpu=$(ps -eo comm=,args= | awk '$1 ~ /^python/ && /train_v7\.py|train\.py|eval_goal_pose\.py|select_best_checkpoint\.py|play_mujoco/ {n++} END{print n+0}')
     [ -z "$nproc_gpu" ] && nproc_gpu=0
 
     # --- 신호 3: 큐 깊이 + 실행 표식 ------------------------------------
     q0=$(find "$ROOT/queue/gpu0" -maxdepth 1 -name '*.sh' 2>/dev/null | wc -l | tr -d ' ')
     q1=$(find "$ROOT/queue/gpu1" -maxdepth 1 -name '*.sh' 2>/dev/null | wc -l | tr -d ' ')
     running=$(find "$ROOT/queue/done" -maxdepth 1 -name '*.running' 2>/dev/null | wc -l | tr -d ' ')
-    workers=$(pgrep -fc 'gpu_queue\.sh [01]' 2>/dev/null)
+    # 워커도 같은 이유로 실행 파일 기준으로 센다.
+    workers=$(ps -eo comm=,args= | awk '$1 ~ /^bash/ && /tools\/gpu_queue\.sh [01]/ {n++} END{print n+0}')
     [ -z "$workers" ] && workers=0
 
     # --- 판정 -----------------------------------------------------------
@@ -60,6 +71,21 @@ while true; do
     fi
 
     if [ "$idle_since" -eq 0 ]; then idle_s=0; else idle_s=$((now - idle_since)); fi
+
+    # --- 판정 2: **정체**(stall) -- 할 일이 있는데 아무것도 안 돈다 ---------
+    #
+    # 유휴 판정은 큐가 비어 있을 것을 요구한다. 그래서 "큐에 대기 작업이 있는데
+    # 워커가 죽어서 아무도 안 집는" 상태는 유휴로도 잡히지 않고 정상으로도 안 잡힌다.
+    # 그건 GPU 가 노는 것과 결과가 똑같은데 **아무 신호도 안 나가는** 최악의 모드다.
+    # 고아 `.running` 표식(워커가 작업 도중 죽으면 남는다)도 같은 부류다.
+    if [ "$u0" -lt "$IDLE_UTIL" ] && [ "$u1" -lt "$IDLE_UTIL" ] \
+       && [ "$nproc_gpu" -eq 0 ] \
+       && { [ "$q0" -gt 0 ] || [ "$q1" -gt 0 ] || [ "$running" -gt 0 ]; }; then
+        [ "$stall_since" -eq 0 ] && stall_since=$now
+    else
+        stall_since=0
+    fi
+    if [ "$stall_since" -eq 0 ]; then stall_s=0; else stall_s=$((now - stall_since)); fi
 
     # 마지막으로 끝난 작업 세 개 -- 깨어난 에이전트가 무엇을 채점해야 하는지 알려면 필요하다.
     recent=$(ls -1t "$ROOT/queue/done"/*.rc* 2>/dev/null | head -3 \
@@ -77,6 +103,8 @@ while true; do
   "queue_workers_alive": $workers,
   "idle_seconds": $idle_s,
   "idle_30min": $([ "$idle_s" -ge 1800 ] && echo true || echo false),
+  "stall_seconds": $stall_s,
+  "stalled": $([ "$stall_s" -ge 300 ] && echo true || echo false),
   "recent_done": [${recent}]
 }
 EOF

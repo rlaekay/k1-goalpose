@@ -917,9 +917,18 @@ class Controller:
 
         prep_stiff = np.asarray(self.cfg["prepare"]["stiffness"], dtype=np.float32)
         prep_damp = np.asarray(self.cfg["prepare"]["damping"], dtype=np.float32)
-        rl_stiff = np.asarray(self.cfg["common"]["stiffness"], dtype=np.float32)
-        rl_damp = np.asarray(self.cfg["common"]["damping"], dtype=np.float32)
-        rl_q = np.asarray(self.cfg["common"]["default_qpos"], dtype=np.float32)
+        # ⛔ 진입 램프의 목표는 **prepare 자세**이지 RL 자세가 아니다.
+        #
+        # 여기서 `r` 을 누를 때까지는 균형을 닫는 주체가 없다 -- 정책이 균형
+        # 제어기인데 아직 안 돈다. 그래서 이 구간이 붙잡는 자세는 개루프로 설 수
+        # 있어야 하고, 그 조건이 hip+knee+ankle = 0 이다.
+        # prepare 는 -0.1/0.2/-0.1 로 합이 정확히 0, RL 은 -0.2/0.4/-0.25 로 -0.05.
+        #
+        # 2026-08-07 실기에서 RL 자세를 붙잡았더니 관절 추종은 0.6도인데 몸통이
+        # 4.9-13.8도 기울어 15초 내내 흔들렸다. `r` 을 누르면 멀쩡해지는 이유가
+        # 이것이다 -- 그때 비로소 균형 루프가 닫힌다.
+        # RL 자세로는 `start_rl_gait_conditionally` 가 추론 직전에 옮긴다.
+        hold_q = np.asarray(self.cfg["prepare"]["default_qpos"], dtype=np.float32)
 
         # ⛔ 램프 시간을 **이동량에 비례**시킨다. 고정 시간은 거리를 무시한다:
         # 2026-08-07 실기에서 최초 진입은 0.4894 rad, get-up 뒤 재진입은 1.5934 /
@@ -932,7 +941,7 @@ class Controller:
         # 무한정 길어져 그동안 로봇이 무방비로 서 있게 된다.
         legs = slice(self.policy.leg_start,
                      self.policy.leg_start + self.policy.num_act)
-        travel = float(np.max(np.abs(rl_q[legs] - latched[legs])))
+        travel = float(np.max(np.abs(hold_q[legs] - latched[legs])))
         if requested_ramp_s is None:
             floor_s = float(rec.get("custom_entry_ramp_s", 0.6))
             max_rate = float(rec.get("custom_entry_max_rate_rps", 0.3))
@@ -986,7 +995,7 @@ class Controller:
             # which are the gains the policy closes its own loop with -- with
             # nobody closing it, the ankles could not hold and it went over
             # forwards.
-            self._fill_low_cmd((1 - blend) * latched + blend * rl_q,
+            self._fill_low_cmd((1 - blend) * latched + blend * hold_q,
                                prep_stiff, prep_damp)
             self._send_cmd(self.low_cmd)
             if alpha >= 1.0:
@@ -994,9 +1003,12 @@ class Controller:
             next_send += step_dt
             time.sleep(max(0.0, next_send - time.monotonic()))
 
-        self.dof_target[:] = rl_q
-        self.filtered_dof_target[:] = rl_q
+        self.dof_target[:] = hold_q
+        self.filtered_dof_target[:] = hold_q
         self._prepare_q = latched
+        # 이 단계의 기준은 prepare 자세다. RL 자세 기준 편차는 `r` 뒤에 따로 찍는다
+        # -- 단계마다 그 단계가 도달했어야 할 자세로 재야 경고가 경고로 남는다.
+        self._log_joint_deviation("at CUSTOM entry (vs prepare pose)", hold_q)
         # Gains are still the prepare ones; start_rl_gait_conditionally swaps
         # them for the policy gains at the same moment inference begins.
 
@@ -1368,15 +1380,46 @@ class Controller:
             time.monotonic() - wait_t0,
             time.monotonic() - getattr(self, "_custom_mode_entered_monotonic", wait_t0))
 
+        # ⛔ prepare 자세 -> RL 자세로 옮기는 것은 **여기**다.
+        #
+        # 진입(`b`)이 붙잡는 것은 hip+knee+ankle = 0 인 prepare 자세다. 그 구간에는
+        # 균형을 닫는 주체가 없어서 개루프로 설 수 있어야 하기 때문이다. RL 자세는
+        # 합이 -0.05 라 개루프로는 앞으로 기운다(2026-08-07 실기 tilt 4.9-13.8도).
+        #
+        # 그래서 그 이동을 **정책이 루프를 닫기 직전**으로 미룬다. 여기서는
+        # 오퍼레이터가 이미 `r` 을 눌렀으므로 곧바로 추론이 시작된다.
+        #
+        # 램프는 `dof_target` 만 움직인다 -- 발행 스레드가 500 Hz 로 그것을 읽어
+        # 내보내므로 low_cmd 를 여기서 직접 쓰지 않는다(경합이 없다).
+        rec = self.cfg.get("safety", {}).get("recovery", {})
+        hold_q = np.asarray(self.cfg["prepare"]["default_qpos"], dtype=np.float32)
+        rl_q = np.asarray(self.cfg["common"]["default_qpos"], dtype=np.float32)
+        legs = slice(self.policy.leg_start,
+                     self.policy.leg_start + self.policy.num_act)
+        travel = float(np.max(np.abs(rl_q[legs] - hold_q[legs])))
+        gait_ramp_s = float(rec.get("gait_entry_ramp_s", 1.0))
+        self.logger.info(
+            "[mode-timing] prepare -> RL 자세: 다리 최대 이동 %.4f rad, %.2f s",
+            travel, gait_ramp_s)
+        step_dt = 0.02
+        ramp_start = time.monotonic()
+        while True:
+            alpha = min(1.0, (time.monotonic() - ramp_start) / max(1e-6, gait_ramp_s))
+            blend = alpha * alpha * (3.0 - 2.0 * alpha)
+            self.dof_target[:] = (1 - blend) * hold_q + blend * rl_q
+            if alpha >= 1.0:
+                break
+            time.sleep(step_dt)
+        self.dof_target[:] = rl_q
+
         # Swap prepare gains for the policy gains, holding the current position.
-        # The pose is already the policy default from the entry ramp; only the
-        # gains change, and they change exactly when the policy starts closing
-        # the loop that those gains assume.
-        self._fill_low_cmd(self.filtered_dof_target,
+        # The pose is now the policy default from the ramp above; only the gains
+        # change, and they change exactly when the policy starts closing the loop
+        # that those gains assume.
+        self._fill_low_cmd(self.dof_target,
                            np.asarray(self.cfg["common"]["stiffness"], dtype=np.float32),
                            np.asarray(self.cfg["common"]["damping"], dtype=np.float32))
         self._send_cmd(self.low_cmd)
-        rl_q = np.asarray(self.cfg["common"]["default_qpos"], dtype=np.float64)
         self._log_joint_deviation("at RL-gait start (vs rl pose)", rl_q)
         self.next_inference_time = self.timer.get_time()
         self.next_publish_time = self.timer.get_time()
