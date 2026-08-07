@@ -164,12 +164,38 @@ safety:
     # Measured on hardware: HAS_FALLEN -> IS_READY took 8.0 s.
     getup_timeout_s: 20.0
     getup_blind_wait_s: 12.0
+    # ⛔ get-up 완료 판정. IS_READY 만으로는 이르다 -- 그 뒤에 다리를 오므려
+    # 서기까지가 남아 있다. 2026-08-07 실기에서 하드코딩된 2 s 때문에 4.9 s 에
+    # 재진입해 오므리는 중간 자세에서 관절을 가져갔고, 거기서 RL 자세로 1.59-1.68
+    # rad 을 끌다가 펌웨어 관절 보호(빨간불)가 걸려 DAMPING 으로 떨어졌다.
+    # 실측 get-up 이 8.0 s 이므로 그것을 최소 대기의 바닥으로 쓴다.
+    getup_min_wait_s: 8.0
+    # 시간보다 정확한 신호: 오므리는 동작이 끝나면 다리 관절 속도가 0 으로 간다.
+    # LowState 에서 직접 읽으므로 /robot_states 가 없는 빌드에서도 동작한다.
+    getup_quiet_dof_vel_rps: 0.15
+    getup_quiet_hold_s: 0.5
+    # 직립 조건. /fall_down 은 ~1 Hz 라 DAMPING 직후에도 낡은 IS_READY 를 들고 있을
+    # 수 있고, 그때 다리는 힘이 빠져서 오히려 조용하다. tilt 는 LowState 에서
+    # 500 Hz 로 오므로 그 창이 없다. 정상 서기의 실측 tilt 는 4.9-13.8도였다.
+    getup_upright_tilt_rad: 0.35   # 20도
     # kPrepare IS the standing mode. Read the real mode from /robot_states;
     # ChangeMode's return code is not reliable (rc=100 after a 1.000 s timeout
     # on transitions that had taken effect).
     require_standing_before_custom: true
     prepare_timeout_s: 15.0
     prepare_settle_s: 1.0
-    # Measured pose -> prepare pose blend at CUSTOM entry, smoothstep.
-    # 2.0 s matches the verified E1 wrapper.
+    # Measured pose -> RL pose blend at CUSTOM entry, smoothstep.
+    #
+    # ⛔ 이 값은 이제 **하한**이다. 고정 시간은 거리를 무시한다 -- 2026-08-07
+    # 실기에서 최초 진입 0.4894 rad, get-up 뒤 재진입 1.5934 / 1.6773 rad 이
+    # 전부 같은 2 s 였고, 뒤의 둘은 0.8 rad/s(96도를 2초)였다. 균형을 닫는 주체가
+    # 없는 구간이라 그 속도가 관절 보호를 유발한다.
+    #
+    # 실제 램프 시간 = clamp(다리 최대 이동량 / custom_entry_max_rate_rps,
+    #                        custom_entry_ramp_s, custom_entry_ramp_max_s)
+    # 예) 1.68 rad -> 5.6 s,  0.49 rad -> 2.0 s(하한),  0.05 rad -> 2.0 s(하한)
     custom_entry_ramp_s: 2.0
+    custom_entry_max_rate_rps: 0.3
+    # 상한. 비례식만 두면 아주 큰 이동에서 램프가 길어져 그동안 로봇이 무방비로
+    # 서 있게 된다.
+    custom_entry_ramp_max_s: 8.0

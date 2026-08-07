@@ -266,10 +266,33 @@ class ModeMonitor:
         try:
             import rclpy
             from rclpy.node import Node
-            from booster_interface.msg import RobotStatesMsg
         except ImportError as exc:
             self.logger.warning("ModeMonitor disabled (%s); CUSTOM entry cannot "
                                 "verify the robot is standing first.", exc)
+            return
+        # ⛔ 이 빌드의 `booster_interface/msg/__init__.py` 는 RobotStatesMsg 를
+        # export 하지 않는다. 그런데 `ros2 topic info /robot_states` 는 타입이
+        # 정확히 `booster_interface/msg/RobotStatesMsg` 라고 답한다 -- 메시지는
+        # 생성돼 있고 패키지의 __init__ 만 그것을 빼먹은 것이다.
+        #
+        # 2026-08-07 실기에서 이 import 실패 하나가 서 있는지 확인하는 게이트를
+        # 통째로 무력화했고(경고만 찍고 통과한다), 그 상태로 get-up 중간에 CUSTOM
+        # 에 재진입해 펌웨어 관절 보호가 걸렸다. 그래서 공개 경로가 실패하면
+        # 생성된 모듈을 직접 집는다.
+        RobotStatesMsg = None
+        for mod, name in (("booster_interface.msg", "RobotStatesMsg"),
+                          ("booster_interface.msg._robot_states_msg", "RobotStatesMsg")):
+            try:
+                RobotStatesMsg = getattr(__import__(mod, fromlist=[name]), name)
+                break
+            except (ImportError, AttributeError):
+                continue
+        if RobotStatesMsg is None:
+            self.logger.warning(
+                "ModeMonitor disabled: booster_interface 에서 RobotStatesMsg 를 "
+                "찾지 못했다 (__init__ 도 _robot_states_msg 도 실패). CUSTOM 진입이 "
+                "로봇이 서 있는지 확인하지 못한다 -- 복구 재진입은 관절 정지 조건에 "
+                "의존한다.")
             return
         if not rclpy.ok():
             rclpy.init(args=None)
@@ -420,6 +443,13 @@ class Controller:
         self._recovery_count = 0
         self._fall_events = []
         self._latest_rpy = np.zeros(3, dtype=np.float32)
+        # get-up 이 정말 끝났는지의 신호. IS_READY 는 이르다 -- 다리를 오므려
+        # 서기까지가 남아 있다. 그 동작이 끝나면 다리 관절 속도가 0 으로 간다.
+        self._legs_quiet_since = 0.0
+        self._last_getup_wait_log = 0.0
+        # GetUp 을 실제로 불렀는가. 이미 서 있어서 건너뛴 경우에는 최소 대기를
+        # 걸 이유가 없다 -- 기다릴 동작 자체가 없다.
+        self._getup_called = False
 
         with open(cfg_file, "r", encoding="utf-8") as f:
             self.cfg = yaml.load(f.read(), Loader=yaml.FullLoader)
@@ -866,13 +896,20 @@ class Controller:
 
         Latching the *measured* pose makes commanded == measured at t=0, so the
         step is structurally zero no matter what pose we come from -- standing,
-        or straight out of a get-up. The move to the RL default pose and RL
-        gains then happens as a controlled ramp instead of a snap. Aligning the
-        static `prepare` block to the RL block would only help when the robot
-        happens to be in exactly that pose; this always helps.
+        or straight out of a get-up. The move to the RL default pose then
+        happens as a controlled ramp instead of a snap. Aligning the static
+        `prepare` block to the RL block would only help when the robot happens
+        to be in exactly that pose; this always helps.
+
+        게인은 램프 내내 prepare 값이다 -- 정책 게인으로의 교체는
+        `start_rl_gait_conditionally` 가 추론을 시작하는 그 순간에 한다.
+        (아래 램프 루프의 주석 참조: 여기서 게인을 내렸더니 아무도 루프를 닫지
+        않는 상태로 100/50 에 웅크리고 있다가 앞으로 넘어갔다.)
+
+        램프 시간은 고정이 아니라 **이동량에 비례**한다. 이유는 아래 참조.
         """
         rec = self.cfg.get("safety", {}).get("recovery", {})
-        ramp_s = float(rec.get("custom_entry_ramp_s", 0.6)) if ramp_s is None else ramp_s
+        requested_ramp_s = ramp_s
 
         self._ensure_standing_before_custom()
         self._require_fresh_low_state("before latched CUSTOM entry")
@@ -883,6 +920,29 @@ class Controller:
         rl_stiff = np.asarray(self.cfg["common"]["stiffness"], dtype=np.float32)
         rl_damp = np.asarray(self.cfg["common"]["damping"], dtype=np.float32)
         rl_q = np.asarray(self.cfg["common"]["default_qpos"], dtype=np.float32)
+
+        # ⛔ 램프 시간을 **이동량에 비례**시킨다. 고정 시간은 거리를 무시한다:
+        # 2026-08-07 실기에서 최초 진입은 0.4894 rad, get-up 뒤 재진입은 1.5934 /
+        # 1.6773 rad 이었는데 셋 다 같은 2 s 였다. 마지막 둘은 0.8 rad/s -- 균형을
+        # 닫는 주체가 없는 구간에서 96 도를 2 초에 끈 것이고, 거기서 펌웨어 관절
+        # 보호(빨간불)가 걸렸다.
+        #
+        # `custom_entry_ramp_s` 는 이제 **하한**이다(짧은 이동도 그보다 빨리 가지
+        # 않는다). 상한은 별도로 둔다 -- 비례식만 두면 아주 큰 이동에서 램프가
+        # 무한정 길어져 그동안 로봇이 무방비로 서 있게 된다.
+        legs = slice(self.policy.leg_start,
+                     self.policy.leg_start + self.policy.num_act)
+        travel = float(np.max(np.abs(rl_q[legs] - latched[legs])))
+        if requested_ramp_s is None:
+            floor_s = float(rec.get("custom_entry_ramp_s", 0.6))
+            max_rate = float(rec.get("custom_entry_max_rate_rps", 0.3))
+            cap_s = float(rec.get("custom_entry_ramp_max_s", 8.0))
+            ramp_s = min(cap_s, max(floor_s, travel / max(max_rate, 1e-6)))
+        else:
+            ramp_s = float(requested_ramp_s)
+        self.logger.info(
+            "[mode-timing] entry ramp: 다리 최대 이동 %.4f rad -> %.2f s (%.2f rad/s)",
+            travel, ramp_s, travel / max(ramp_s, 1e-6))
 
         init_Cmd_T1(self.low_cmd, self.joint_cnt)
         self._fill_low_cmd(latched, prep_stiff, prep_damp)
@@ -1113,6 +1173,30 @@ class Controller:
     def in_recovery(self):
         return self._recovery_phase != "none"
 
+    def _legs_quiet_for(self, thresh_rps, need_s):
+        """다리 12관절이 임계 아래로 연속 `need_s` 초 동안 조용했는가.
+
+        ⛔ 왜 시간이 아니라 이것인가: SDK 의 `IS_READY` 는 get-up 의 **완료가
+        아니다.** 2026-08-07 실기에서 IS_READY 를 보고 4.9 s 에 재진입했는데,
+        로봇은 아직 다리를 오므려 서기를 하는 중이었다. 그 중간 자세를 래치하고
+        RL 자세로 1.6 rad 을 끌다가 펌웨어 관절 보호가 걸렸다.
+
+        오므리는 동작이 끝나면 다리 관절 속도가 0 으로 간다. 그것은 상태 토픽이
+        아니라 LowState 에서 직접 읽히므로, `/robot_states` 가 없는 빌드에서도
+        쓸 수 있다. 실측 get-up 은 8.0 s 였고 우리는 4.9 s 에 들어갔다 --
+        시간 상수를 추측하는 대신 로봇이 멈추는 것을 본다.
+        """
+        legs = slice(self.policy.leg_start,
+                     self.policy.leg_start + self.policy.num_act)
+        peak = float(np.max(np.abs(self.dof_vel[legs])))
+        now = time.monotonic()
+        if peak > thresh_rps:
+            self._legs_quiet_since = 0.0
+            return False, peak
+        if not self._legs_quiet_since:
+            self._legs_quiet_since = now
+        return (now - self._legs_quiet_since) >= need_s, peak
+
     def _step_recovery(self):
         """One tick of the fall-recovery sequence.
 
@@ -1147,6 +1231,21 @@ class Controller:
             # Prefer the SDK's own judgement of whether a get-up will work.
             # Without the monitor we can only wait out the settle time and try.
             if self.fall_monitor and self.fall_monitor.available and fall_age < 5.0:
+                # ⛔ IS_READY 는 "일으킬 수 없다"가 아니라 "일으킬 것이 없다"이다.
+                # 이미 서 있으면 SDK 가 is_recovery_available=False 로 답하는 것이
+                # 정상인데, 예전 코드는 그것을 실패로 읽고 10 초 뒤 중단했다
+                # (2026-08-07: "get-up never became available (state=IS_READY)").
+                # GetUp 을 건너뛰고 완료 판정으로 바로 넘어간다 -- 거기서 다리가
+                # 조용해질 때까지 기다리므로 이르게 진입하지 않는다.
+                if state == FallState.IS_READY:
+                    self.logger.warning(
+                        "[recovery] state=IS_READY -- 이미 서 있다. GetUp 을 건너뛰고 "
+                        "관절 정지 확인으로 넘어간다")
+                    self._recovery_phase = "getup"
+                    self._recovery_t0 = time.monotonic()
+                    self._legs_quiet_since = 0.0
+                    self._getup_called = False
+                    return
                 if not recov_ok:
                     if elapsed > float(rec.get("recovery_wait_timeout_s", 10.0)):
                         self.logger.error(
@@ -1169,27 +1268,66 @@ class Controller:
                 return
             self._recovery_phase = "getup"
             self._recovery_t0 = time.monotonic()
+            self._legs_quiet_since = 0.0
+            self._getup_called = True
             return
 
         if phase == "getup":
             timeout = float(rec.get("getup_timeout_s", 20.0))
-            standing = False
+            # ⛔ 완료 판정은 **두 조건이 모두** 맞아야 한다.
+            #
+            #   (1) 상태가 IS_READY 이고 최소 시간이 지났다
+            #   (2) 다리 12관절이 멈췄다
+            #
+            # (1)만 보던 것이 2026-08-07 사고였다. 실측 get-up 은 HAS_FALLEN ->
+            # IS_READY 8.0 s 인데 하드코딩된 `elapsed > 2.0` 때문에 4.9 s 에
+            # 재진입했고, 다리를 오므리는 중간 자세에서 관절을 가져갔다.
+            # (2)가 본질이다 -- 오므리는 동작이 끝나야 속도가 0 이 된다.
+            min_wait = (float(rec.get("getup_min_wait_s", 8.0))
+                        if self._getup_called else 0.0)
+            quiet_rps = float(rec.get("getup_quiet_dof_vel_rps", 0.15))
+            quiet_hold = float(rec.get("getup_quiet_hold_s", 0.5))
+            quiet, peak = self._legs_quiet_for(quiet_rps, quiet_hold)
+
+            # ⛔ 직립은 **어느 경로에서도** 요구한다. /fall_down 은 ~1 Hz 라
+            # 방금 DAMPING 으로 관절을 놓은 직후에도 낡은 IS_READY 를 들고 있을 수
+            # 있고, 그때 다리는 힘이 빠져서 오히려 조용하다. 즉 "IS_READY + 조용함"
+            # 만으로는 무너지는 중인 로봇을 서 있다고 읽을 수 있다. tilt 는
+            # LowState 에서 500 Hz 로 오므로 그 창이 없다.
+            upright_lim = float(rec.get("getup_upright_tilt_rad", 0.35))
+            upright = self._latest_tilt < upright_lim
             if self.fall_monitor and self.fall_monitor.available and fall_age < 5.0:
-                standing = state == FallState.IS_READY and elapsed > 2.0
+                state_ok = (state == FallState.IS_READY and elapsed > min_wait
+                            and upright)
             else:
-                # No fall topic: fall back to the IMU. Upright and quiet is the
-                # best signal available.
-                upright = (abs(self._latest_rpy[0]) < 0.3 and abs(self._latest_rpy[1]) < 0.3)
-                standing = upright and elapsed > float(rec.get("getup_blind_wait_s", 8.0))
-            if standing:
-                self.logger.warning("[recovery] standing again after %.1f s; re-entering CUSTOM",
-                                    elapsed)
+                # No fall topic: fall back to the IMU alone.
+                state_ok = upright and elapsed > max(
+                    min_wait, float(rec.get("getup_blind_wait_s", 8.0)))
+
+            if state_ok and quiet:
+                self.logger.warning(
+                    "[recovery] standing again after %.1f s (다리 정지 %.1f s, "
+                    "peak |dq| %.3f rad/s); re-entering CUSTOM",
+                    elapsed, quiet_hold, peak)
                 self._recovery_phase = "reenter"
                 self._recovery_t0 = time.monotonic()
                 return
+            # 상태는 됐는데 아직 움직이는 중이면 그 사실을 남긴다. 예전에는 여기서
+            # 그냥 들어갔다.
+            now = time.monotonic()
+            if state_ok and not quiet and now - self._last_getup_wait_log > 1.0:
+                self._last_getup_wait_log = now
+                self.logger.info(
+                    "[recovery] 상태는 준비됐지만 다리가 아직 움직인다 "
+                    "(peak |dq| %.3f > %.3f rad/s) -- 기다린다 (%.1f s)",
+                    peak, quiet_rps, elapsed)
             if elapsed > timeout:
-                self.logger.error("[recovery] get-up did not complete in %.0f s; stopping.",
-                                  timeout)
+                self.logger.error(
+                    "[recovery] get-up did not complete in %.0f s "
+                    "(state_ok=%s, upright=%s tilt=%.0fdeg, legs_quiet=%s, "
+                    "peak |dq| %.3f rad/s); stopping.",
+                    timeout, state_ok, upright, np.degrees(self._latest_tilt),
+                    quiet, peak)
                 self.running = False
                 self._recovery_phase = "none"
             return

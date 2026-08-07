@@ -38,6 +38,11 @@ if [ $# -eq 0 ]; then
     exit 1
 fi
 
+# ⛔ 채점이 한 건도 성공하지 못해도 이 스크립트가 rc0 를 내면 큐는 "정상 완료"로
+# 기록한다. 실제로 040-eval_NA_histzero 가 그렇게 "rc=0 0분"으로 남았다 --
+# 모든 arm 이 state_dict 크기 불일치로 죽었는데 실패 신호가 새어 나가지 않았다.
+SCORED=0; FAILED=0
+
 echo "라운드 채점 시작  device=$DEV  공통 config=$COMMON_CFG"
 echo "출력: $OUTROOT"
 echo
@@ -53,7 +58,7 @@ for RUN in "$@"; do
     # 이름으로 채점했다.** 죽지 않고 틀린 숫자를 내는 쪽이 훨씬 나쁘다.
     NCK=$(ls "$RUN"/nn/model_*.pth 2>/dev/null | wc -l)
     if [ "$NCK" -lt 2 ]; then
-        echo "!! $NAME: 체크포인트가 ${NCK}개뿐이다(스모크/중단 run). 건너뛴다."; continue
+        echo "!! $NAME: 체크포인트가 ${NCK}개뿐이다(스모크/중단 run). 건너뛴다."; FAILED=$((FAILED+1)); continue
     fi
     echo "===================================================================="
     echo "== $NAME"
@@ -66,7 +71,7 @@ for RUN in "$@"; do
     CFG="$OUTROOT/$NAME.cfg.yaml"
     if ! python -u tools/make_eval_cfg.py --common "$COMMON_CFG" \
             --run "$RUN" --out "$CFG"; then
-        echo "!! $NAME: 평가 config 생성 실패. 건너뛴다."; continue
+        echo "!! $NAME: 평가 config 생성 실패. 건너뛴다."; FAILED=$((FAILED+1)); continue
     fi
 
     # --- 1단계: 최고 체크포인트 고르기 (공통 정확도 프로토콜) -------------
@@ -81,7 +86,7 @@ for RUN in "$@"; do
         --sim_device "$DEV" --rl_device "$DEV" \
         --out "$SEL" --link_best 2>&1 | tail -40
     rc=$?
-    if [ $rc -ne 0 ]; then echo "!! $NAME 선택기 실패 rc=$rc"; continue; fi
+    if [ $rc -ne 0 ]; then echo "!! $NAME 선택기 실패 rc=$rc"; FAILED=$((FAILED+1)); continue; fi
 
     BEST="$RUN/nn/best.pth"
     if [ ! -e "$BEST" ]; then
@@ -95,6 +100,8 @@ for RUN in "$@"; do
         --checkpoint "$BEST" --terrain plane --duration_s 120 \
         --sim_device "$DEV" --rl_device "$DEV" \
         --out "$OUTROOT/$NAME.accuracy" 2>&1 | tail -25
+    if [ -f "$OUTROOT/$NAME.accuracy/report.json" ]; then SCORED=$((SCORED+1));
+    else echo "!! $NAME 정확도 채점이 report.json 을 못 남겼다"; FAILED=$((FAILED+1)); fi
 
     # --- 3단계: 지속 보행 (그동안 아무도 재지 않은 축) --------------------
     echo "-- 3/4 지속 보행 (forward_hold, 120 s)"
@@ -130,3 +137,8 @@ echo "===================================================================="
 python -u tools/round_table.py "$OUTROOT" 2>&1 || echo "(요약 표 생성 실패 -- report.json 을 직접 읽어라)"
 echo
 echo "결과 위치: $OUTROOT"
+echo "채점 성공 $SCORED 건, 실패 $FAILED 건."
+if [ "$SCORED" -eq 0 ]; then
+    echo "⛔ 한 건도 채점하지 못했다. 큐에 실패로 기록되도록 rc1 로 끝낸다."
+    exit 1
+fi
