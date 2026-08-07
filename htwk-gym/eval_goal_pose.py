@@ -621,6 +621,7 @@ HELD_OUT_FORCE = {
 def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
                 record_video=False, keep_perturbations=False, no_noise=False,
                 stress=None, goal_pattern=None, force_visualization_probe=False,
+                joint_zero_probe_deg=None, joint_zero_probe_modes="iid",
                 force_profile=None, terrain=None,
                 joint_encoder_bias_rad=None, joint_target_offset_rad=None,
                 init_dof_std_rad=None):
@@ -635,6 +636,23 @@ def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
     cfg["viewer"]["record_video"] = bool(record_video)
     cfg["viewer"]["record_env_idx"] = 0
     _apply_hbatch_common_eval(cfg, task)
+    if joint_zero_probe_deg is not None:
+        # 학습 때 이 축이 꺼져 있던 arm 에도 **똑같이** 건다. 커리큘럼은 끄고
+        # level 을 1.0 에 고정해서 모든 arm 이 정확히 같은 크기를 받게 한다.
+        rz = cfg.setdefault("randomization", {}).setdefault("joint_zero", {})
+        rz.update({
+            "enabled": True,
+            "max_deg": float(joint_zero_probe_deg),
+            "curriculum": False,
+            "init_level": 1.0,
+            "min_level": 1.0,
+            "step": 0.0,
+            "modes": {m: (1.0 if m == joint_zero_probe_modes else 0.0)
+                      for m in ("iid", "single", "leg_common", "anti_mirror", "mirror")},
+        })
+        cfg.setdefault("evaluation", {})["joint_zero_probe"] = {
+            "deg": float(joint_zero_probe_deg), "mode": joint_zero_probe_modes}
+
     joint_dr_probe = _apply_joint_dr_probe(
         cfg, joint_encoder_bias_rad=joint_encoder_bias_rad,
         joint_target_offset_rad=joint_target_offset_rad,
@@ -760,6 +778,8 @@ def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
         "record_video": bool(record_video),
         "force_visualization_probe": bool(force_visualization_probe),
         "joint_dr_probe": copy.deepcopy(joint_dr_probe),
+        "joint_zero_probe": copy.deepcopy(
+            cfg.get("evaluation", {}).get("joint_zero_probe")),
     }
     evaluation = cfg.setdefault("evaluation", {})
     evaluation["effective_eval_protocol_sha"] = _stable_protocol_sha(
@@ -4105,6 +4125,18 @@ def main():
         help="video-only HBatch protocol: path-only goals plus a guaranteed early support force")
     parser.add_argument("--feasible_speed", type=float, help="override evaluation.feasible_speed_mps (m/s) used by the feasibility check")
     parser.add_argument("--stress", choices=["jitter"], help="robustness stress mode instead of a gate evaluation. 'jitter': the true goal is redrawn uniformly in a +-3 m box every control step (50 Hz), modelling BT thrash / ball re-detection. Scored on falls and body oscillation -- position error is undefined in this mode.")
+    parser.add_argument(
+        "--joint_zero_probe_deg", type=float, default=None,
+        help="모든 arm 에 **같은** 관절 영점 오차를 걸어 강건성을 잰다(도). "
+             "기존 --joint_encoder_bias_rad/--joint_target_offset_rad 는 legacy 키를 "
+             "쓰는데 그 둘은 독립 추첨이라 실기 영점 오차(encoder=+b, target=-b)가 "
+             "재현되지 않는다(ibatch 8-46). 이 플래그는 randomization.joint_zero 를 "
+             "켜고 커리큘럼을 끈 뒤 level 을 1.0 에 고정해 정확한 등가를 만든다. "
+             "학습 때 이 축이 꺼져 있던 arm 도 같은 시험을 받는다 -- 그래야 "
+             "'영점 랜덤화가 강건성을 준다'를 대조군과 비교할 수 있다.")
+    parser.add_argument(
+        "--joint_zero_probe_modes", default="iid",
+        help="스트레스 프로브의 고장 모드. iid / single / leg_common / mirror / anti_mirror")
     parser.add_argument("--goal_pattern", choices=["lateral", "reverse", "forward_hold"],
                         help="force abrupt robot-local side or rear waypoint goals")
     parser.add_argument("--exploratory", action="store_true", help="label this run as a non-authoritative preview rather than an official gate evaluation")
@@ -4137,6 +4169,8 @@ def main():
                 force_profile=args.force_profile, terrain=args.terrain,
                 no_noise=args.no_noise, stress=args.stress, goal_pattern=args.goal_pattern,
                 force_visualization_probe=args.force_visualization_probe,
+                joint_zero_probe_deg=args.joint_zero_probe_deg,
+                joint_zero_probe_modes=args.joint_zero_probe_modes,
                 joint_encoder_bias_rad=args.joint_encoder_bias_rad,
                 joint_target_offset_rad=args.joint_target_offset_rad,
                 init_dof_std_rad=args.init_dof_std_rad)
