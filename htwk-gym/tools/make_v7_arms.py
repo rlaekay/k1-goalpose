@@ -906,6 +906,49 @@ ND_ARMS = {
 N_ARMS.update(ND_ARMS)
 
 
+# ---- NF: dwell 중에 보행 시계를 얼린다 (2026-08-08) --------------------------
+#
+# ⛔ 이 arm 이 ND_dwell 을 **대체한다**. ND 는 방향이 반대였다.
+#
+# 근거 — 자연실험 하나가 도착 소멸의 원인을 특정했다(7축 감사 A3, AUDIT §2-1):
+# `goal_categories` 의 `stand` 와 `turn` 은 **둘 다 목표가 로봇의 현재 위치**다
+# (dx=dy=0). 환경상 차이는 `gait_frequency` **하나뿐**이다 -- stand 만 클럭을 얼린다
+# (`goal_pose.py:684`).
+#
+#   | N1_path it100 -> it6000 | stand(클럭 정지) 1.6 -> 2.3 cm
+#   |                         | turn (클럭 가동) 8.3 -> 47.4 cm, arrived_then_left 100 %
+#   | N0_ctrl it6000          | stand 1.6 cm / turn 3.8 cm
+#
+# 즉 잃은 것은 목표 인지도 정지 능력도 아니다 -- **"보행 시계가 도는 동안 제자리를
+# 지키는 능력" 하나**다. 로봇은 자기가 딛고 선 목표에서 47 cm 를 걸어 나간 뒤 멈춘다.
+#
+# ⛔ 그런데 `pause_gait_during_dwell` 이 기본 False 이고 **저장소의 어떤 config 에도
+# 없다**(코드 두 지점에만 존재: `goal_pose_v7.py:338`, `:687`). 그래서 dwell 중에도
+# 클럭이 돈다 -- **dwell 이 만드는 상태가 정책이 100 % 실패하는 `turn` 상태**이지
+# 한 번도 실패한 적 없는 `stand` 상태가 아니다.
+#
+# 그러면 duty 를 올리는 것(ND_dwell 22.4 % -> 39.9 %)은 **결손 상태를 더 만드는 것**이다.
+# 방향이 반대라, 2026-08-08 에 ND 를 900/6000 에서 중단하고 이 arm 으로 갈았다.
+#
+# 레버는 하나다: `pause_gait_during_dwell: true`. dwell interval/duration 은
+# **N1_path 와 같게 둔다**([12,24]/[3,5], duty 22.4 %) -- ND 처럼 duty 까지 같이
+# 바꾸면 레버가 둘이 된다.
+#
+# 판정 기준 (사후에 고르지 않기 위해 미리 적는다):
+#   - 1차: `per_category` 의 **turn 범주 위치오차**. N1 은 it6000 에서 47.4 cm 였다.
+#     그것이 stand 수준(2~4 cm)으로 내려오면 M3(시계 결합)가 원인이었다는 확증이다.
+#   - 2차: 전체 `pos_err_m.median` 과 `failure_modes.never_arrived`
+#     (N1 model_6000: 47.70 cm / 62 %).
+#   - 보행 축은 `forward_hold` 로 같이 잰다. dwell 중 클럭을 얼리므로 순항 속도가
+#     떨어질 수 있다 -- 떨어지면 그 크기가 이 레버의 대가다.
+#   - ⚠️ 도착이 안 돌아오면 M3 는 기각이고 남는 것은 M1(관측 동일성)·M2(신호 비대칭)다.
+NF_ARMS = {
+    "NF_dwellclock": merge(_N_BASE, _PATH_ON,
+                           {"commands.path.pause_gait_during_dwell": True}),
+}
+N_ARMS.update(NF_ARMS)
+
+
 # ---- NE: 계보 B 의 대조군 (2026-08-07) --------------------------------------
 #
 # ⛔ 왜 필요한가. `stage_obs_arms.sh` 가 warm start 로 `best.pth` 를 썼는데 그건
@@ -1052,6 +1095,7 @@ GPU_OF = {
     "NC_actfilter": "cuda:1",
     "ND_dwell": "cuda:0",
     "NE_ctrl100": "cuda:0",
+    "NF_dwellclock": "cuda:0",
 }
 
 

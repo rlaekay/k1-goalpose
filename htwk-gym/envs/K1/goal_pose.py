@@ -413,6 +413,25 @@ class GoalPose(BaseTask):
         self.feet_air_time[env_ids] = 0.0
 
         self.delay_steps[env_ids] = torch.randint(0, self.cfg["control"]["decimation"], (len(env_ids),), device=self.device)
+
+        # ⛔ 관측 지연 재추첨 -- **에피소드 경계에서만** 한다 (2026-08-08).
+        #
+        # 이 두 줄은 `_resample_goals` 안에 있었다. 그 함수는 목표가 재추첨되는 env
+        # 전부에 대해 돌고(4-8 초마다) 리셋 env 는 그 진부분집합이라, "그 로봇의
+        # 성질이므로 에피소드 안에서는 고정한다"는 주석과 코드가 달랐다 --
+        # 실제로는 6 초마다 다시 뽑혔다. 실기에서는 그 로봇의 파이프라인 지연이
+        # 보행 중에 바뀌지 않는다.
+        cfg = self.cfg["noise"].get("obs_delay_steps")
+        if cfg and int(cfg[1]) > 0 and hasattr(self, "_obs_delay"):
+            self._obs_delay[env_ids] = torch.randint(
+                int(cfg[0]), int(cfg[1]) + 1, (len(env_ids),), device=self.device)
+
+        # 이력/지연 버퍼를 새 프레임으로 채우라는 **표식**. 실제 채우기는
+        # `_compute_observations` 가 새 프레임을 만든 뒤 `_prime_obs_buffers()` 가 한다
+        # -- 여기서 채우면 리셋 **전**(넘어지기 직전) 프레임을 넣게 된다.
+        # 표식을 여기 두는 것이 핵심이다: 리셋 env 만 담기고, 목표 재추첨 env 는 안 담긴다.
+        self._obs_prime_ids = env_ids
+
         self.extras["time_outs"] = self.time_out_buf
 
     # ---- 관절 영점 오차 --------------------------------------------------
@@ -716,34 +735,23 @@ class GoalPose(BaseTask):
         self.goal_obs_bias[env_ids, 0:2] = apply_randomization(torch.zeros(len(env_ids), 2, device=self.device), bias_pos_cfg)
         self.goal_obs_bias[env_ids, 2] = apply_randomization(torch.zeros(len(env_ids), device=self.device), bias_head_cfg)
         self.goal_obs_hold_counter[env_ids] = 0
-        # 관측 지연은 그 로봇의 성질이지 매 스텝 흔들리는 값이 아니다. 에피소드마다
-        # 다시 뽑되 에피소드 안에서는 고정한다. 히스토리도 같이 지워야 한다 --
-        # 안 지우면 리셋된 env가 넘어지기 직전의 관측을 물려받는다(swing_apex를
-        # done에서 리셋하지 않았던 것과 같은 부류의 실수다).
-        cfg = self.cfg["noise"].get("obs_delay_steps")
-        if cfg and int(cfg[1]) > 0 and hasattr(self, "_obs_delay"):
-            self._obs_delay[env_ids] = torch.randint(
-                int(cfg[0]), int(cfg[1]) + 1, (len(env_ids),), device=self.device)
-        # ⛔ 이력/지연 버퍼를 **여기서 채우지 않는다**(2026-08-07 감사).
+        # ⛔ 관측 지연 재추첨과 이력/지연 버퍼 prime 은 **여기 있으면 안 된다**
+        #    (2026-08-08 감사 후속). 둘 다 `_reset_idx` 로 옮겼다.
         #
-        # 여기는 `_resample_goals` 안이고 두 가지가 어긋나 있었다:
+        # `_resample_goals` 는 **목표가 재추첨되는 env 전부**에 대해 돈다
+        # (`episode_length_buf == cmd_resample_time`, 4-8 초마다). 리셋 env 는 그
+        # **진부분집합**일 뿐이다 -- `_reset_idx` 가 `episode_length_buf`(:408)와
+        # `cmd_resample_time`(:411)을 둘 다 0 으로 놓기 때문이다.
         #
-        #   1. **잘못된 이벤트다.** 이 함수는 목표가 재추첨되는 env 전부에 대해 돈다
-        #      (`episode_length_buf == cmd_resample_time`). 리셋 env 는 그 부분집합일
-        #      뿐이라, 정상 주행 중인 env 의 이력도 목표 경계마다(4-8초) 지워졌다.
-        #      에피소드 30초 기준 호출의 약 80 %가 의도치 않은 것이었고, 걷는 중
-        #      로봇의 100 ms 이력이 6초마다 한 프레임 복제로 평탄화됐다.
-        #      배포는 그러지 않는다 -- `policy_goal_pose.py` 는 최초 1회만 prime 한다.
-        #
-        #   2. **잘못된 값이다.** step() 의 순서가
-        #         _reset_idx -> _resample_goals -> _compute_observations
-        #      이므로, 여기서 읽는 `self.obs_buf` 는 **직전 스텝**의 관측 -- 곧
-        #      "넘어지기 직전" 프레임이다. 이 코드가 막겠다고 적어 둔 바로 그것을
-        #      대신 집어넣고 있었다.
-        #
-        # 그래서 표식만 남기고, 실제 채우기는 새 프레임이 만들어진 뒤
-        # `_prime_obs_buffers()` 가 한다.
-        self._obs_prime_ids = env_ids
+        # 그래서 여기 두면 두 가지가 어긋난다:
+        #   1. **잘못된 이벤트.** 에피소드 30 초 기준 호출의 약 80 %가 리셋이 아니다.
+        #      걷는 중 로봇의 100 ms 이력이 6.6 초마다 한 프레임 복제로 평탄화됐고,
+        #      관측 지연은 "에피소드 안에서는 고정"이라고 적어 놓고 6 초마다 다시
+        #      뽑히고 있었다. 배포는 그러지 않는다 -- `policy_goal_pose.py` 는
+        #      최초 1 회만 prime 하고 지연은 그 로봇의 성질로 고정이다.
+        #   2. (prime 한정) **잘못된 값.** 여기서 읽는 `self.obs_buf` 는 **직전 스텝**의
+        #      관측 -- 곧 "넘어지기 직전" 프레임이다. 막겠다고 적어 둔 바로 그것을
+        #      대신 집어넣고 있었다. (이 절반은 2026-08-07 `2076c49` 가 고쳤다.)
 
     def _update_goal_state(self):
         """Recompute the goal position/heading relative to the robot's current local

@@ -236,6 +236,30 @@ commands:
       # goal_reached (+1/step under 0.1 m AND 0.1 m/s) to actually accumulate.
       interval_s: [12.0, 24.0]  # duty ~20%, measured 19.5%
       duration_s: [3.0, 5.0]    # measured 26% of dwelling steps reach the carrot
+
+    # ⛔ dwell 중에 보행 시계를 얼릴 것인가. 기본 false = **지금까지 한 번도 켜진 적 없다.**
+    #
+    # 코드는 `goal_pose_v7.py:338` 과 `:687` 두 곳에 있는데 저장소의 어떤 config 에도
+    # 이 키가 없었다. 여기 no-op(false)으로 선언해 두는 것은 `joint_encoder_bias` 와
+    # 같은 이유다 -- `set_dotted` 가 base 에 없는 경로를 거부하므로, 선언이 없으면
+    # arm 이 이 레버를 켤 수 없다.
+    #
+    # 왜 중요한가 (2026-08-08, 7축 감사 A3):
+    # `goal_categories` 의 stand 와 turn 은 둘 다 목표가 로봇의 현재 위치(dx=dy=0)이고
+    # 환경상 차이는 `gait_frequency` 하나뿐이다(stand 만 클럭을 얼린다, goal_pose.py:684).
+    #   N1_path it100 -> it6000 :  stand 1.6 -> 2.3 cm  /  turn 8.3 -> **47.4 cm**
+    # 즉 path 학습이 깨뜨리는 것은 **"클럭이 도는 동안 제자리를 지키는 능력"** 하나다.
+    #
+    # 그런데 이 키가 false 라 **dwell 중에도 클럭이 돈다** -- dwell 이 만드는 상태가
+    # 정책이 100 % 실패하는 turn 상태이지, 한 번도 실패하지 않은 stand 상태가 아니다.
+    # dwell 은 "path 모드가 waypoint 와 같은 arrive-and-stop 으로 끝나게" 하려고 있는데
+    # (위 주석), 정작 그 arrive-and-stop 의 정의적 조건인 클럭 정지가 빠져 있었다.
+    #
+    # true 로 켜면: dwell 시작 시 gait_frequency 를 저장하고 0 으로, 해제 시 복원한다.
+    # gait_process 가 적분기라 클럭이 얼면 위상도 언다 -- stand 범주와 같은 상태가 된다.
+    # `NF_dwellclock` arm 이 이 레버 하나만 켠다.
+    pause_gait_during_dwell: false
+
     lookahead_max_m: 3.5         # leash: goal never runs further ahead than this
     speed_range_mps: [0.3, 1.6]  # commanded path speed; top end scaled by curriculum
     speed_curriculum: true       # scalar fallback; ignored when speed_grid.enabled

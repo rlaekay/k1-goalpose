@@ -510,10 +510,26 @@ class Controller:
         # channels: InitChannel may deliver LowState immediately.
         self.publish_runner = None
         self.running = True
+        # ⛔ `low_cmd` 를 만지는 **모든** 경로가 이 락 뒤에 있어야 한다.
+        #
+        # 2026-08-07 감사: 이 락은 여기서 만들어지고 **어디에서도 쓰이지 않았다.**
+        # 그 사이 진입 램프(50 Hz)와 발행 스레드(LowState 1건당 1회, ~500 Hz)가
+        # 같은 `low_cmd.motor_cmd[i].q` 를 동시에 쓰고 둘 다 `_send_cmd` 를 불렀다.
+        # 최초 진입에서는 발행 스레드가 아직 없어서 드러나지 않았고,
+        # **낙상 복구 재진입에서만** 터진다 -- 그 구간의 실측 이동량이
+        # 1.5934 / 1.6773 rad 이므로 램프 자세와 시작 자세가 번갈아 나가면
+        # 진폭 ~96도의 사각파가 모터로 간다. 균형을 닫는 주체가 없는 바로 그
+        # 구간이고, 실제로 펌웨어 관절 보호(빨간불)가 걸린 구간이다
+        # (HANDOFF_DEPLOY_ENTRY_20260807.md §3).
         self.publish_lock = threading.Lock()
         self._cleanup_lock = threading.Lock()
         self._cleaned_up = False
         self._custom_mode_started = False
+        # 지금 `low_cmd` 에 실려 있는 게인이 **정책 게인**인가(common), 아니면
+        # **prepare 게인**인가. `--parallel-torque` 의 토크 변환이
+        # `common.stiffness`(발목 50)를 쓰므로, prepare 게인(발목 250)으로
+        # 붙잡는 진입·복구 구간에 그것을 적용하면 게인 집합이 섞인다.
+        self._policy_gains_active = False
         self._last_low_state_monotonic = 0.0
         self._last_debug_monotonic = 0.0
         self._last_goal = (0.0, 0.0, 0.0)
@@ -864,12 +880,38 @@ class Controller:
             self.low_cmd.motor_cmd[i].kp = float(kp[i])
             self.low_cmd.motor_cmd[i].kd = float(kd[i])
 
+    def _publish_thread_alive(self):
+        """발행 스레드가 이미 `low_cmd` 를 소유하고 있는가.
+
+        최초 진입에서는 False 다 -- 스레드는 `_enter_custom_latched` **끝**에서
+        시작된다. 복구 재진입에서는 True 다 -- 스레드는 `cleanup()` 에서만
+        join 되므로 낙상·DAMPING·get-up 내내 살아 있다.
+        """
+        return self.publish_runner is not None and self.publish_runner.is_alive()
+
+    def _emit_low_cmd(self, q_target, kp, kd):
+        """한 프레임을 채워서 보낸다 -- 발행 스레드와 **원자적으로** 배타.
+
+        채우기와 보내기가 갈라지면 발행 스레드가 그 사이에 끼어들어 절반만 바뀐
+        프레임을 내보낸다. 락을 프레임 단위로 잡아 그것을 막는다.
+        ⚠️ 이 안에서 절대 sleep 하지 마라 -- 발행 스레드가 그만큼 굶는다.
+        """
+        with self.publish_lock:
+            self._fill_low_cmd(q_target, kp, kd)
+            self._send_cmd(self.low_cmd)
+
     def _wait_for_low_state_after_custom(self, hold_target, kp, kd):
         """Hold the entry pose until LowState resumes after the mode change.
 
         ChangeMode can interrupt LowState. Ramping across that gap would compute
         targets from a stale measurement, so hold still until fresh state is
         back and refuse to continue if it never is. From the E1 wrapper.
+
+        ⛔ 여기만은 `dof_target` 경로로 못 바꾼다. 발행 스레드의 데드라인이
+        `Timer` 카운터인데 그 카운터는 **LowState 콜백에서만** 증가한다
+        (`utils/timer.py`, `_low_state_handler`). 즉 LowState 가 끊긴 동안
+        발행 스레드는 아무것도 안 보낸다 -- 이 구간을 메우는 것이 이 루프의
+        존재 이유다. 그래서 직접 보내되 **락 안에서** 보낸다.
         """
         timeout_s = 3.0
         deadline = time.monotonic() + timeout_s
@@ -878,8 +920,7 @@ class Controller:
             age = time.monotonic() - self._last_low_state_monotonic
             if self._last_low_state_monotonic > 0.0 and age <= low_state_timeout:
                 return
-            self._fill_low_cmd(hold_target, kp, kd)
-            self._send_cmd(self.low_cmd)
+            self._emit_low_cmd(hold_target, kp, kd)
             time.sleep(0.02)
         raise RuntimeError(
             "LowState did not resume within %.1fs after entering CUSTOM; "
@@ -953,11 +994,38 @@ class Controller:
             "[mode-timing] entry ramp: 다리 최대 이동 %.4f rad -> %.2f s (%.2f rad/s)",
             travel, ramp_s, travel / max(ramp_s, 1e-6))
 
-        init_Cmd_T1(self.low_cmd, self.joint_cnt)
-        self._fill_low_cmd(latched, prep_stiff, prep_damp)
-        self.dof_target[:] = latched
-        self.filtered_dof_target[:] = latched
-        self._send_cmd(self.low_cmd)
+        # ⛔ 최초 진입과 복구 재진입은 **동시성 조건이 다르다.**
+        #
+        #   최초 진입  : 발행 스레드가 아직 없다(이 함수 끝에서 시작한다).
+        #                이 함수가 유일한 기록자다.
+        #   복구 재진입: 발행 스레드가 **이미 살아 있다**(`cleanup()` 에서만 join).
+        #                아래 램프와 500 Hz 로 같은 `low_cmd` 를 두고 경합한다.
+        #
+        # 재진입에서 그 경합이 만드는 것: 램프는 blend 된 자세를 쓰고 발행
+        # 스레드는 `filtered_dof_target`(= 램프가 끝날 때까지 `latched` 에 고정)
+        # 을 쓴다. 두 프레임이 번갈아 나가므로 로봇은 **부드러운 램프가 아니라
+        # 램프 자세와 시작 자세를 오가는 사각파**를 받는다. 실측 재진입 이동량이
+        # 1.5934 / 1.6773 rad 이므로 진폭이 ~96도다.
+        streaming = self._publish_thread_alive()
+
+        # 이 구간의 게인은 **prepare** 다. `--parallel-torque` 는 `common.stiffness`
+        # 를 쓰므로 여기서 적용되면 게인 집합이 섞인다(발목 250 대 50).
+        self._policy_gains_active = False
+
+        with self.publish_lock:
+            # ⛔ `init_Cmd_T1` 은 `low_cmd.motor_cmd` **벡터를 통째로 교체**한다.
+            # 발행 스레드가 그 안으로 인덱싱하는 중이면 프레임이 찢어진다.
+            # 재진입에서는 필요하지도 않다 -- `cmd_type` 과 `weight` 는 최초
+            # 진입에서 설정된 뒤 아무도 안 바꾸고, 나머지 필드는 바로 아래
+            # `_fill_low_cmd` 가 전부 덮는다.
+            if not streaming:
+                init_Cmd_T1(self.low_cmd, self.joint_cnt)
+            # 발행 스레드가 읽는 두 배열을 먼저 맞춘다. 이걸 프레임보다 먼저
+            # 해야 스레드가 끼어들어도 같은 값(latched)을 내보낸다.
+            self.dof_target[:] = latched
+            self.filtered_dof_target[:] = latched
+            self._fill_low_cmd(latched, prep_stiff, prep_damp)
+            self._send_cmd(self.low_cmd)
 
         self._custom_mode_started = True
         t0 = time.monotonic()
@@ -995,16 +1063,34 @@ class Controller:
             # which are the gains the policy closes its own loop with -- with
             # nobody closing it, the ankles could not hold and it went over
             # forwards.
-            self._fill_low_cmd((1 - blend) * latched + blend * hold_q,
-                               prep_stiff, prep_damp)
-            self._send_cmd(self.low_cmd)
+            q_cmd = (1 - blend) * latched + blend * hold_q
+            if streaming:
+                # ⛔ 기록자를 **하나로** 유지한다. 발행 스레드가 이미 500 Hz 로
+                # `low_cmd` 를 쓰고 있으므로, 여기서는 그것이 읽는 `dof_target`
+                # 만 움직이고 프레임은 그쪽이 낸다.
+                # `start_rl_gait_conditionally` 의 램프가 쓰는 방식과 같다
+                # (그 함수 주석: "램프는 dof_target 만 움직인다 ... 경합이 없다").
+                #
+                # 저역통과를 한 번 더 지나지만 무해하다: 500 Hz 에서 시정수가
+                # 8.96 ms 이고 램프는 최소 0.6 s -- 지연이 램프의 1.5 % 미만이다.
+                # 그리고 위에서 `filtered_dof_target` 을 `latched` 로 맞춰 뒀으므로
+                # 시작 계단이 없다.
+                # 게인은 진입 프레임에서 이미 prepare 로 실렸고 발행 스레드는
+                # `q` 만 쓰므로 램프 내내 유지된다.
+                #
+                # LowState 가 끊기면 발행 스레드도 같이 멈추지만(카운터 Timer),
+                # 그 경우 루프 첫 줄의 `_require_fresh_low_state` 가 먼저 raise 한다.
+                self.dof_target[:] = q_cmd
+            else:
+                self._emit_low_cmd(q_cmd, prep_stiff, prep_damp)
             if alpha >= 1.0:
                 break
             next_send += step_dt
             time.sleep(max(0.0, next_send - time.monotonic()))
 
-        self.dof_target[:] = hold_q
-        self.filtered_dof_target[:] = hold_q
+        with self.publish_lock:
+            self.dof_target[:] = hold_q
+            self.filtered_dof_target[:] = hold_q
         self._prepare_q = latched
         # 이 단계의 기준은 prepare 자세다. RL 자세 기준 편차는 `r` 뒤에 따로 찍는다
         # -- 단계마다 그 단계가 도달했어야 할 자세로 재야 경고가 경고로 남는다.
@@ -1226,6 +1312,9 @@ class Controller:
         if phase == "stopping":
             # Stop driving joints first, before anything else.
             self.running_policy = False
+            # 정책 게인은 여기서 내려온다. 재진입은 prepare 게인으로 시작하고
+            # `start_rl_gait_conditionally` 가 다시 세울 때까지 그대로다.
+            self._policy_gains_active = False
             self.logger.warning("[recovery] damping")
             try:
                 self.client.ChangeMode(RobotMode.kDamping)
@@ -1416,10 +1505,17 @@ class Controller:
         # The pose is now the policy default from the ramp above; only the gains
         # change, and they change exactly when the policy starts closing the loop
         # that those gains assume.
-        self._fill_low_cmd(self.dof_target,
-                           np.asarray(self.cfg["common"]["stiffness"], dtype=np.float32),
-                           np.asarray(self.cfg["common"]["damping"], dtype=np.float32))
-        self._send_cmd(self.low_cmd)
+        #
+        # 발행 스레드가 여기서도 살아 있으므로 프레임을 락 안에서 만든다.
+        # `_policy_gains_active` 도 **같은 락 안에서** 세운다 -- 그래야
+        # `--parallel-torque` 의 kp=0 이 정책 게인이 실린 뒤에만 적용된다.
+        with self.publish_lock:
+            self._fill_low_cmd(
+                self.dof_target,
+                np.asarray(self.cfg["common"]["stiffness"], dtype=np.float32),
+                np.asarray(self.cfg["common"]["damping"], dtype=np.float32))
+            self._policy_gains_active = True
+            self._send_cmd(self.low_cmd)
         self._log_joint_deviation("at RL-gait start (vs rl pose)", rl_q)
         self.next_inference_time = self.timer.get_time()
         self.next_publish_time = self.timer.get_time()
@@ -1636,53 +1732,73 @@ class Controller:
                     self._pub_dt.pop(0)
             self._pub_last = _pub_now
 
-            if self._rate_fixed_filter:
-                # ⛔ 근본 수정: 필터를 **루프 속도와 무관**하게 만든다.
-                #
-                # 고정 계수 0.2는 500 Hz 발행을 가정하고 고른 값이라 시정수 10 ms를
-                # 의도한 것이다. 루프가 느려지면 같은 계수가 훨씬 긴 시정수를 만들고,
-                # 그러면 필터가 보행 자체를 깎는다:
-                #     500 Hz -> tau  10 ms, 2 Hz 감쇠 0.99
-                #      50 Hz -> tau 100 ms,          0.66
-                # 2026-08-06 MuJoCo에서 이것을 재현했다 -- 필터를 50 Hz로 돌리면
-                # 추종률이 0.93 -> 0.64로 떨어지고(실기 0.61) 낙상이 0 -> 60/분이 된다.
-                #
-                # 실측 dt로 계수를 매번 다시 계산하면 시정수가 의도대로 고정된다.
-                # dt가 튀는 순간에도 alpha가 1을 넘지 않으므로 발산하지 않는다.
-                alpha = 1.0 - math.exp(-max(_dt, 1e-6) / self._filter_tau_s)
-                alpha = min(alpha, 1.0)
-                self.filtered_dof_target = (self.filtered_dof_target * (1.0 - alpha)
-                                            + self.dof_target * alpha)
-            else:
-                self.filtered_dof_target = self.filtered_dof_target * 0.8 + self.dof_target * 0.2
-
-            for i in range(self.joint_cnt):
-                self.low_cmd.motor_cmd[i].q = self.filtered_dof_target[i]
-
-            # 기본은 위치 제어다. 검증된 E1 wrapper가 22관절 전부를 위치로 명령했고,
-            # codex의 토크 피드포워드 변형은 이 로봇에서 **하중에 천천히 접히는
-            # 발목**을 만들었다. 그런데 2026-08-05 실기 대조에서 나온 증상이
-            # 정확히 그것이다 -- 발목 토크가 sim의 0.6-0.7배인데 궤적은 1.3배다.
-            # 즉 지금의 위치 제어도 같은 문제를 겪고 있을 수 있다는 뜻이라,
-            # 되돌려 비교할 수 있게 스위치로 남긴다. 기본은 꺼짐.
-            #
-            # 켜면 base_walk와 같은 처리를 한다(deploy_base_walk.py:181):
-            # P 항을 드라이버에서 소프트웨어로 옮기고(kp=0), 관절 공간에서 계산한
-            # 토크를 피드포워드로 보낸다. 이것은 액추에이터 공간 변환이 아니다 --
-            # 관절->액추에이터 매핑은 SDK가 처리한다(아니면 관절각 명령이 안 먹는다).
-            if self._parallel_torque:
-                mech = self.cfg.get("mech", {}).get("parallel_mech_indexes", [])
-                stiff = self.cfg["common"]["stiffness"]
-                tlim = self.cfg["common"]["torque_limit"]
-                for i in mech:
-                    self.low_cmd.motor_cmd[i].q = self.dof_pos_latest[i]
-                    self.low_cmd.motor_cmd[i].tau = float(np.clip(
-                        (self.filtered_dof_target[i] - self.dof_pos_latest[i]) * stiff[i],
-                        -tlim[i], tlim[i]))
-                    self.low_cmd.motor_cmd[i].kp = 0.0
-
-            self._send_cmd(self.low_cmd)
+            # ⛔ 여기부터 `_send_cmd` 까지가 임계 구역이다. 진입·복구 램프가
+            # 같은 `low_cmd` 를 만지므로, 프레임을 절반만 바꾼 채 내보내면
+            # 관절마다 다른 시점의 목표가 섞여 나간다. sleep 은 락 **밖**이다.
+            with self.publish_lock:
+                self._publish_one_frame(_dt)
             time.sleep(0.001)
+
+    def _publish_one_frame(self, _dt):
+        """저역통과 한 스텝 + `low_cmd` 채우기 + 발행.
+
+        ⛔ **`self.publish_lock` 을 쥔 채로만 부른다.** 여기서 sleep 하지 마라.
+        """
+        if self._rate_fixed_filter:
+            # ⛔ 근본 수정: 필터를 **루프 속도와 무관**하게 만든다.
+            #
+            # 고정 계수 0.2는 500 Hz 발행을 가정하고 고른 값이라 시정수 10 ms를
+            # 의도한 것이다. 루프가 느려지면 같은 계수가 훨씬 긴 시정수를 만들고,
+            # 그러면 필터가 보행 자체를 깎는다:
+            #     500 Hz -> tau  10 ms, 2 Hz 감쇠 0.99
+            #      50 Hz -> tau 100 ms,          0.66
+            # 2026-08-06 MuJoCo에서 이것을 재현했다 -- 필터를 50 Hz로 돌리면
+            # 추종률이 0.93 -> 0.64로 떨어지고(실기 0.61) 낙상이 0 -> 60/분이 된다.
+            #
+            # 실측 dt로 계수를 매번 다시 계산하면 시정수가 의도대로 고정된다.
+            # dt가 튀는 순간에도 alpha가 1을 넘지 않으므로 발산하지 않는다.
+            alpha = 1.0 - math.exp(-max(_dt, 1e-6) / self._filter_tau_s)
+            alpha = min(alpha, 1.0)
+            self.filtered_dof_target = (self.filtered_dof_target * (1.0 - alpha)
+                                        + self.dof_target * alpha)
+        else:
+            self.filtered_dof_target = self.filtered_dof_target * 0.8 + self.dof_target * 0.2
+
+        for i in range(self.joint_cnt):
+            self.low_cmd.motor_cmd[i].q = self.filtered_dof_target[i]
+
+        # 기본은 위치 제어다. 검증된 E1 wrapper가 22관절 전부를 위치로 명령했고,
+        # codex의 토크 피드포워드 변형은 이 로봇에서 **하중에 천천히 접히는
+        # 발목**을 만들었다. 그런데 2026-08-05 실기 대조에서 나온 증상이
+        # 정확히 그것이다 -- 발목 토크가 sim의 0.6-0.7배인데 궤적은 1.3배다.
+        # 즉 지금의 위치 제어도 같은 문제를 겪고 있을 수 있다는 뜻이라,
+        # 되돌려 비교할 수 있게 스위치로 남긴다. 기본은 꺼짐.
+        #
+        # 켜면 base_walk와 같은 처리를 한다(deploy_base_walk.py:181):
+        # P 항을 드라이버에서 소프트웨어로 옮기고(kp=0), 관절 공간에서 계산한
+        # 토크를 피드포워드로 보낸다. 이것은 액추에이터 공간 변환이 아니다 --
+        # 관절->액추에이터 매핑은 SDK가 처리한다(아니면 관절각 명령이 안 먹는다).
+        #
+        # ⛔ `_policy_gains_active` 로 게이트한다(2026-08-07 감사).
+        # 이 블록은 `common.stiffness`(발목 50)로 토크를 만들고 `kp` 를 0 으로
+        # 내린다. 그런데 `b`~`r` 구간과 복구 재진입은 **prepare 게인**(발목 250)
+        # 으로 붙잡는 구간이다. 게이트가 없으면 그 구간에서 위치 서보가
+        # 사라지고 5배 약한 피드포워드만 남는다 -- 균형을 닫는 주체가 없는
+        # 바로 그 구간에서. 게다가 이 코드는 `kp` 를 **되돌리지 않으므로**
+        # 진입 램프가 매 프레임 250 으로 복구하고 여기가 매 프레임 0 으로
+        # 내리는 왕복이 됐다.
+        if self._parallel_torque and self._policy_gains_active:
+            mech = self.cfg.get("mech", {}).get("parallel_mech_indexes", [])
+            stiff = self.cfg["common"]["stiffness"]
+            tlim = self.cfg["common"]["torque_limit"]
+            for i in mech:
+                self.low_cmd.motor_cmd[i].q = self.dof_pos_latest[i]
+                self.low_cmd.motor_cmd[i].tau = float(np.clip(
+                    (self.filtered_dof_target[i] - self.dof_pos_latest[i]) * stiff[i],
+                    -tlim[i], tlim[i]))
+                self.low_cmd.motor_cmd[i].kp = 0.0
+
+        self._send_cmd(self.low_cmd)
 
     def __enter__(self) -> "Controller":
         return self
