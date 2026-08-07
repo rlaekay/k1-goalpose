@@ -157,6 +157,35 @@ class GoalPosePolicy:
     def _wrap_pi(a):
         return (a + np.pi) % (2.0 * np.pi) - np.pi
 
+    def reset(self):
+        """낙상 복구 뒤 정책 내부 상태를 진입 직후와 같게 되돌린다.
+
+        ⛔ 2026-08-08. 배포 쪽은 재진입에서 이미
+        ``self.policy.reset() if hasattr(self.policy, "reset") else None`` 을
+        부르고 있었는데 **이 클래스에 `reset` 이 없었다.** 즉 그 줄은 처음부터
+        영구 no-op 이었고, 독립 감사 3회가 전부 같은 지적을 했다.
+
+        그래서 낙상을 건너 살아남던 것:
+          * ``actions`` -- 관측 채널 42:54 로 되먹임된다. 넘어지는 중에 만든
+            마지막 행동(포화됐을 가능성이 크다)이 재개 첫 프레임의 입력이 된다.
+          * ``gait_process`` / ``_last_time`` -- 보행 위상. 복구는 10~30 s 걸리고
+            ``advance_gait_clock`` 의 dt 클램프가 위상 감김은 막지만, 재개 위상이
+            낙상 순간의 값이라 지지발이 임의로 정해진다.
+          * ``_hist`` / ``_hist_primed`` -- ``history_steps > 1`` 인 정책에서
+            **넘어지는 프레임들이 그대로 이력에 남는다.** 학습 쪽은 같은 이유로
+            ``goal_pose.py`` 의 리셋 경로에서 이력을 지운다.
+
+        ``dof_targets`` 는 되돌리지 않는다 -- 배포 쪽이 재진입 램프에서 자세를
+        이미 RL 기본자세로 옮겨 놓고, 그 값을 ``dof_target`` 으로 따로 들고 있다.
+        여기서 또 건드리면 두 주체가 같은 양을 쓰게 된다.
+        """
+        self.actions[:] = 0.0
+        self.gait_process = 0.0
+        self._last_time = None
+        self._hist[:] = 0.0
+        self._hist_primed = False
+        self.obs[:] = 0.0
+
     def advance_gait_clock(self, time_now):
         """Integrate the gait phase, as goal_pose.py:621 does.
 

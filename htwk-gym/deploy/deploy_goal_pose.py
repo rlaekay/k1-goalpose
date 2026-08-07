@@ -1313,7 +1313,10 @@ class Controller:
             # Stop driving joints first, before anything else.
             self.running_policy = False
             # 정책 게인은 여기서 내려온다. 재진입은 prepare 게인으로 시작하고
-            # `start_rl_gait_conditionally` 가 다시 세울 때까지 그대로다.
+            # `_start_policy_control()` 이 다시 세운다 -- 그 호출이 "reenter"
+            # 분기에 **있다**. (2026-08-08 이전 이 주석은 `start_rl_gait_conditionally`
+            # 를 가리켰는데, 그 함수는 `__main__` 에서 1회만 불려 재진입 경로를
+            # 지나지 않았다. 주석이 버그를 사양으로 적고 있었다.)
             self._policy_gains_active = False
             self.logger.warning("[recovery] damping")
             try:
@@ -1441,9 +1444,27 @@ class Controller:
                 self.running = False
                 self._recovery_phase = "none"
                 return
-            self.next_inference_time = self.timer.get_time()
-            self.next_publish_time = self.timer.get_time()
-            self.policy.reset() if hasattr(self.policy, "reset") else None
+            # ⛔ 진입과 **정확히 같은 경로**로 정책 구동을 시작한다. 예전에는
+            # 여기서 타이머만 되감고 곧바로 추론을 켰다 -- prepare 게인 위에서,
+            # 자세 램프 없이. 독립 감사 3회가 전부 이것을 1순위로 짚었다.
+            try:
+                self._start_policy_control(reason="recovery re-entry")
+            except Exception as exc:
+                self.logger.error(
+                    "[recovery] policy control restart failed: %s", exc)
+                self.running = False
+                self._recovery_phase = "none"
+                return
+            # 정책 내부 상태(actions / gait_process / 관측 이력)는 낙상을 건너
+            # 살아 있으면 안 된다. `hasattr` 로 감싸면 메서드가 없을 때 **조용히**
+            # 아무 일도 안 하므로, 있는지를 여기서 명시적으로 본다.
+            reset = getattr(self.policy, "reset", None)
+            if callable(reset):
+                reset()
+            else:
+                self.logger.warning(
+                    "[recovery] policy has no reset(); actions/gait_process/"
+                    "observation history carry across the fall")
             self.running_policy = True
             self._recovery_phase = "none"
             self.logger.warning(
@@ -1452,34 +1473,31 @@ class Controller:
                 self._recovery_count, time.monotonic() - self._recovery_t0)
             return
 
-    def start_rl_gait_conditionally(self):
-        print(f"{self.remoteControlService.get_rl_gait_operation_hint()}")
-        wait_t0 = time.monotonic()
-        while True:
-            if self.remoteControlService.start_rl_gait():
-                break
-            if self._abort_requested("RL-gait prompt"):
-                raise KeyboardInterrupt("abort file")
-            # The publish thread has been streaming since CUSTOM entry, so the
-            # robot is held properly for however long this prompt waits.
-            time.sleep(0.1)
-        self.logger.info(
-            "[mode-timing] operator wait at RL-gait prompt: %.2f s "
-            "(CUSTOM entered %.2f s ago)",
-            time.monotonic() - wait_t0,
-            time.monotonic() - getattr(self, "_custom_mode_entered_monotonic", wait_t0))
+    def _start_policy_control(self, reason):
+        """prepare 자세/게인 -> RL 자세/게인. **정책이 루프를 닫기 직전에** 부른다.
 
-        # ⛔ prepare 자세 -> RL 자세로 옮기는 것은 **여기**다.
-        #
-        # 진입(`b`)이 붙잡는 것은 hip+knee+ankle = 0 인 prepare 자세다. 그 구간에는
-        # 균형을 닫는 주체가 없어서 개루프로 설 수 있어야 하기 때문이다. RL 자세는
-        # 합이 -0.05 라 개루프로는 앞으로 기운다(2026-08-07 실기 tilt 4.9-13.8도).
-        #
-        # 그래서 그 이동을 **정책이 루프를 닫기 직전**으로 미룬다. 여기서는
-        # 오퍼레이터가 이미 `r` 을 눌렀으므로 곧바로 추론이 시작된다.
-        #
-        # 램프는 `dof_target` 만 움직인다 -- 발행 스레드가 500 Hz 로 그것을 읽어
-        # 내보내므로 low_cmd 를 여기서 직접 쓰지 않는다(경합이 없다).
+        ⛔ 2026-08-08. 이 블록은 원래 `start_rl_gait_conditionally` 안에 인라인으로
+        있었고, 그 함수의 호출자는 `__main__` **하나**였다. 그래서 낙상 복구
+        재진입(`_step_recovery` 의 "reenter")은 여기를 **한 번도 지나지 않았다**:
+
+          * 게인이 prepare 인 채로 정책이 돈다. hip/knee kp 350 (학습 100),
+            ankle kp 250 (학습 50) = **5배**. 정책은 자기가 가정한 임피던스가
+            아닌 곳에서 구동된다 -- 첫 낙상 이후 **영구히**.
+          * prepare->RL 자세 램프가 없어 첫 추론이 자세 계단을 만든다.
+          * `_policy_gains_active` 가 True 로 돌아올 길이 없어 `--parallel-torque`
+            가 첫 낙상 이후 조용히 자기무력화된다. (이건 `8d763fb` 가 만든 회귀다 --
+            그 이전 판에는 게이트 자체가 없어 복구 뒤에도 계속 작동했다.)
+
+        독립 감사 3회가 전부 이 결함을 1순위로 지목했다(⛔1/⛔-1/⛔1).
+
+        진입(`b`)이 붙잡는 것은 hip+knee+ankle = 0 인 prepare 자세다. 그 구간에는
+        균형을 닫는 주체가 없어서 개루프로 설 수 있어야 하기 때문이다. RL 자세는
+        합이 -0.05 라 개루프로는 앞으로 기운다(2026-08-07 실기 tilt 4.9-13.8도).
+        그래서 그 이동을 여기까지 미룬다.
+
+        램프는 `dof_target` 만 움직인다 -- 발행 스레드가 500 Hz 로 그것을 읽어
+        내보내므로 low_cmd 를 여기서 직접 쓰지 않는다(경합이 없다).
+        """
         rec = self.cfg.get("safety", {}).get("recovery", {})
         hold_q = np.asarray(self.cfg["prepare"]["default_qpos"], dtype=np.float32)
         rl_q = np.asarray(self.cfg["common"]["default_qpos"], dtype=np.float32)
@@ -1488,8 +1506,8 @@ class Controller:
         travel = float(np.max(np.abs(rl_q[legs] - hold_q[legs])))
         gait_ramp_s = float(rec.get("gait_entry_ramp_s", 1.0))
         self.logger.info(
-            "[mode-timing] prepare -> RL 자세: 다리 최대 이동 %.4f rad, %.2f s",
-            travel, gait_ramp_s)
+            "[mode-timing] prepare -> RL 자세 (%s): 다리 최대 이동 %.4f rad, %.2f s",
+            reason, travel, gait_ramp_s)
         step_dt = 0.02
         ramp_start = time.monotonic()
         while True:
@@ -1516,9 +1534,28 @@ class Controller:
                 np.asarray(self.cfg["common"]["damping"], dtype=np.float32))
             self._policy_gains_active = True
             self._send_cmd(self.low_cmd)
-        self._log_joint_deviation("at RL-gait start (vs rl pose)", rl_q)
+        self._log_joint_deviation("at %s (vs rl pose)" % reason, rl_q)
         self.next_inference_time = self.timer.get_time()
         self.next_publish_time = self.timer.get_time()
+
+    def start_rl_gait_conditionally(self):
+        print(f"{self.remoteControlService.get_rl_gait_operation_hint()}")
+        wait_t0 = time.monotonic()
+        while True:
+            if self.remoteControlService.start_rl_gait():
+                break
+            if self._abort_requested("RL-gait prompt"):
+                raise KeyboardInterrupt("abort file")
+            # The publish thread has been streaming since CUSTOM entry, so the
+            # robot is held properly for however long this prompt waits.
+            time.sleep(0.1)
+        self.logger.info(
+            "[mode-timing] operator wait at RL-gait prompt: %.2f s "
+            "(CUSTOM entered %.2f s ago)",
+            time.monotonic() - wait_t0,
+            time.monotonic() - getattr(self, "_custom_mode_entered_monotonic", wait_t0))
+
+        self._start_policy_control(reason="RL-gait start")
         if self.goal_source_mode == "stdin":
             self.goal_source.start_stdin_reader(self.logger)
         # The publisher already started at CUSTOM entry; do not start a second one.
@@ -1813,6 +1850,13 @@ if __name__ == "__main__":
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
+    # ⛔ 2026-08-08. SIGTERM 에 핸들러가 없었다. `kill <pid>` 는 기본 처분이
+    # 즉시 종료라 `__exit__` -> `cleanup()` 이 안 돌고, 그 안의
+    # `ChangeMode(kDamping)` 도 안 나간다 -- **CUSTOM 인 채로 프로세스만 사라지고
+    # 마지막 LowCmd 프레임이 모터에 걸린 채 남는다.** 이 파일의 주석은 그 증상을
+    # sshkeyboard 탓으로 적어 뒀지만 원인은 핸들러 부재였다.
+    # `sys.exit` 는 SystemExit 를 올리므로 `with` 의 `__exit__` 가 돈다.
+    signal.signal(signal.SIGTERM, signal_handler)
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="Goal_Pose_E0.yaml", type=str,
