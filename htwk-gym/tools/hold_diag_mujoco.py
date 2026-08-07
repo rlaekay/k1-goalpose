@@ -119,6 +119,24 @@ def settle_height(model, data, q0, nj):
     return 1.0 - lo
 
 
+def anchor_welds(model, data):
+    """weld 의 목표 상대자세를 **지금 자세**로 다시 잡는다.
+
+    MuJoCo 의 weld 는 기본적으로 `qpos0` 기준 상대자세를 강제한다. 그대로 두면
+    내가 세운 자세가 아니라 모델 기본자세로 끌어당겨 PD 를 압도한다 -- 첫 시도에서
+    관절 추종오차 90 deg, 수직력이 체중의 4 배로 나온 것이 그 증상이었다.
+    body2 를 안 줬으므로 상대자세 = 그 body 의 월드 자세다.
+    """
+    for e in range(model.neq):
+        if model.eq_type[e] != mujoco.mjtEq.mjEQ_WELD:
+            continue
+        b1 = model.eq_obj1id[e]
+        model.eq_data[e, 0:3] = 0.0                 # anchor (body1 로컬)
+        model.eq_data[e, 3:6] = data.xpos[b1]       # relpose 위치
+        model.eq_data[e, 6:10] = data.xquat[b1]     # relpose 자세
+        model.eq_data[e, 10] = 1.0                  # torquescale
+
+
 def run(model, q_hold, kp, kd, lim, nj, duration, dt_log=0.02):
     data = mujoco.MjData(model)
     data.qpos[:] = 0.0
@@ -126,6 +144,9 @@ def run(model, q_hold, kp, kd, lim, nj, duration, dt_log=0.02):
     data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
     data.qpos[7:7 + nj] = q_hold[:nj]
     mujoco.mj_forward(model, data)
+    if model.neq:
+        anchor_welds(model, data)
+        mujoco.mj_forward(model, data)
 
     steps = int(duration / model.opt.timestep)
     every = max(1, int(dt_log / model.opt.timestep))
