@@ -90,15 +90,27 @@ while true; do
         continue
     fi
 
-    if [ "$idle" -ge "$PROMOTE_AFTER" ]; then
+    # ⛔ 승격을 **카드별 유휴**로 판단한다(2026-08-07 감사 S1-1). 전역 유휴를 쓰면
+    # 다른 카드가 6시간짜리 학습을 도는 동안 이쪽 카드가 놀아도 발동하지 않는다 --
+    # plan/ 기구가 존재하는 바로 그 상황이다.
+    promote_any=0
+    for g in 0 1; do
+        ci=$(sed -n "s/.*\"idle_seconds_gpu$g\": *\([0-9]*\).*/\1/p" "$STATE" 2>/dev/null)
+        [ -z "$ci" ] && ci=0
+        [ "$ci" -ge "$PROMOTE_AFTER" ] && promote_any=1
+    done
+    if [ "$idle" -ge "$PROMOTE_AFTER" ] || [ "$promote_any" -eq 1 ]; then
         promoted=0
         for g in 0 1; do
+            ci=$(sed -n "s/.*\"idle_seconds_gpu$g\": *\([0-9]*\).*/\1/p" "$STATE" 2>/dev/null)
+            [ -z "$ci" ] && ci=0
+            [ "$ci" -lt "$PROMOTE_AFTER" ] && continue   # 이 카드는 아직 안 논다
             live_n=$(find "$ROOT/queue/gpu$g" -maxdepth 1 -name '*.sh' 2>/dev/null | wc -l | tr -d ' ')
             [ "$live_n" -gt 0 ] && continue          # 이미 대기 작업이 있으면 건드리지 않는다
             job=$(find "$PLAN/gpu$g" -maxdepth 1 -type f -name '*.sh' | sort | head -1)
             [ -z "$job" ] && continue
             if mv "$job" "$ROOT/queue/gpu$g/"; then
-                say "승격: gpu$g <- $(basename "$job")  (유휴 $((idle / 60))분)"
+                say "승격: gpu$g <- $(basename "$job")  (카드 유휴 $((ci / 60))분)"
                 promoted=$((promoted + 1))
             fi
         done

@@ -20,6 +20,8 @@ mkdir -p "$TMP/tools" "$TMP/queue/gpu0" "$TMP/queue/gpu1" \
 cp "$SRC/tools/autopilot.sh" "$TMP/tools/"
 
 pass=0; fail=0
+# 시험 시작 전 autopilot 프로세스 수. 끝에 같은지 단언한다 -- 유출도 시험 결과다.
+before_ap=$(pgrep -f "bash tools/autopilot.sh" 2>/dev/null | wc -l | tr -d ' ')
 chk() { if [ "$2" = "$3" ]; then echo "  ✅ $1"; pass=$((pass+1));
         else echo "  ⛔ $1  (기대 '$3', 실제 '$2')"; fail=$((fail+1)); fi; }
 
@@ -33,11 +35,16 @@ run_once() {   # autopilot 을 한 바퀴만 돌린다
     # `timeout` 을 쓰지 않는다 -- macOS 에 없어서(coreutils 의 gtimeout 뿐) 시험 전체가
     # 조용히 아무것도 실행하지 않고 "8건 실패"로 나왔다. 시험 하네스가 대상보다 먼저
     # 틀린 경우이고, 실패 원인이 대상에 있는 것처럼 보였다.
+    # ⛔ `&` 가 붙는 것은 `cd && bash ...` AND-list **전체**라, `$!` 는 중간 서브셸의
+    # PID 이고 autopilot 은 그 **자식**이다. 그래서 kill 이 서브셸만 죽이고 autopilot
+    # 은 고아로 남았다 -- 서버에 5개가 살아 있었고, `pgrep -f autopilot` 으로 생존을
+    # 확인하려는 사람에게 거짓 안심을 준다(진짜가 죽어도 6개가 보인다).
     ( cd "$TMP" && PROMOTE_AFTER="${PROMOTE_AFTER:-1800}" INTERVAL=600 \
         bash tools/autopilot.sh >/dev/null 2>&1 & echo $! > "$TMP/.pid" )
     sleep 3
-    kill "$(cat "$TMP/.pid" 2>/dev/null)" 2>/dev/null || true
-    sleep 0.3
+    p=$(cat "$TMP/.pid" 2>/dev/null)
+    [ -n "$p" ] && { pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; }
+    sleep 0.5
 }
 
 echo "== 1. 유휴가 아니면 아무것도 안 한다 =="
@@ -77,6 +84,11 @@ state 1900 400
 run_once
 chk "승격 대신 복구가 일어났다" "$(ls -1 "$TMP/queue/gpu0")" "031-orphan2.sh"
 chk "plan 은 안 건드렸다" "$(ls -1 "$TMP/queue/plan/gpu0" | wc -l | tr -d ' ')" "2"
+
+echo "== 6. 시험이 프로세스를 남기지 않는다 =="
+sleep 1
+after_ap=$(pgrep -f "bash tools/autopilot.sh" 2>/dev/null | wc -l | tr -d ' ')
+chk "autopilot 프로세스 유출 없음" "$after_ap" "$before_ap"
 
 echo
 echo "통과 $pass, 실패 $fail"

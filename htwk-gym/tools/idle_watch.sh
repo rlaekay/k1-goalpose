@@ -27,6 +27,10 @@ mkdir -p "$ROOT/queue"
 # 연속 유휴 시작 시각. 0 이면 "지금 유휴가 아님".
 idle_since=0
 stall_since=0
+idle_since_g0=0
+idle_since_g1=0
+idle_g0=0
+idle_g1=0
 
 json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
@@ -52,6 +56,21 @@ while true; do
     # 그래서 **실행 파일이 python 인 것만** 센다. 셸은 comm 이 bash 라 걸러진다.
     nproc_gpu=$(ps -eo comm=,args= | awk '$1 ~ /^python/ && /train_v7\.py|train\.py|eval_goal_pose\.py|select_best_checkpoint\.py|play_mujoco/ {n++} END{print n+0}')
     [ -z "$nproc_gpu" ] && nproc_gpu=0
+
+    # --- 신호 2b: **카드별** GPU 작업 --------------------------------------
+    # ⛔ 2026-08-07 감사(S1-1): 유휴 판정이 두 장 AND 두 큐 전역 AND 였다. 그래서
+    # "GPU1 이 6시간짜리 학습을 도는 동안 GPU0 큐가 말라 6시간을 논다"가 유휴로도
+    # 정체로도 안 잡혔다. plan/ 승격 기구가 존재하는 바로 그 상황에서 발동하지 않는다.
+    # nvidia-smi 가 PID->카드 매핑을 주므로 카드별로 센다.
+    apps=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null)
+    n0=0; n1=0
+    for pid in $apps; do
+        # 카드 인덱스는 uuid 로 오므로 PID 의 CUDA_VISIBLE_DEVICES 대신
+        # nvidia-smi 의 카드별 조회 두 번으로 가른다(간단하고 확실하다).
+        :
+    done
+    n0=$(nvidia-smi -i 0 --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . )
+    n1=$(nvidia-smi -i 1 --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . )
 
     # --- 신호 3: 큐 깊이 + 실행 표식 ------------------------------------
     q0=$(find "$ROOT/queue/gpu0" -maxdepth 1 -name '*.sh' 2>/dev/null | wc -l | tr -d ' ')
@@ -87,6 +106,19 @@ while true; do
     fi
     if [ "$stall_since" -eq 0 ]; then stall_s=0; else stall_s=$((now - stall_since)); fi
 
+    # --- 판정 3: **카드별** 유휴 -------------------------------------------
+    # 한 장만 노는 상태. 전역 유휴와 달리 다른 카드가 무엇을 하든 무관하다.
+    for g in 0 1; do
+        eval "u=\$u$g; nq=\$q$g; np=\$n$g; since=\${idle_since_g$g:-0}"
+        if [ "$u" -lt "$IDLE_UTIL" ] && [ "$np" -eq 0 ] && [ "$nq" -eq 0 ]; then
+            [ "$since" -eq 0 ] && since=$now
+        else
+            since=0
+        fi
+        eval "idle_since_g$g=$since"
+        if [ "$since" -eq 0 ]; then eval "idle_g$g=0"; else eval "idle_g$g=$((now - since))"; fi
+    done
+
     # 마지막으로 끝난 작업 세 개 -- 깨어난 에이전트가 무엇을 채점해야 하는지 알려면 필요하다.
     recent=$(ls -1t "$ROOT/queue/done"/*.rc* 2>/dev/null | head -3 \
              | while read -r f; do printf '"%s",' "$(json_escape "$(basename "$f")")"; done | sed 's/,$//')
@@ -105,6 +137,10 @@ while true; do
   "idle_30min": $([ "$idle_s" -ge 1800 ] && echo true || echo false),
   "stall_seconds": $stall_s,
   "stalled": $([ "$stall_s" -ge 300 ] && echo true || echo false),
+  "gpu_apps": [$n0, $n1],
+  "idle_seconds_gpu0": $idle_g0,
+  "idle_seconds_gpu1": $idle_g1,
+  "card_idle_30min": $([ "$idle_g0" -ge 1800 ] || [ "$idle_g1" -ge 1800 ] && echo true || echo false),
   "recent_done": [${recent}]
 }
 EOF
