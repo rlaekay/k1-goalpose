@@ -706,43 +706,52 @@ class Controller:
             # ⛔ 워치독은 여기서 **풀지 않는다.** `__init__` 이 rclpy 노드를 다
             # 세운 뒤에 `_disarm_init_watchdog()` 이 푼다. 이유는 그 함수 참조.
             self._arm_init_watchdog()
+
+            # ⛔⛔ 2026-08-09. **명령 채널을 구독자보다 먼저 연다. 순서를 바꾸지 마라.**
+            #
+            # 나는 이 순서를 뒤집었다가 되돌렸다. 뒤집은 이유는 §8-61 이었다 --
+            # LowState 가 안 오는 로봇의 명령 채널을 열었다 닫는 것이 관절 보호를
+            # 유발했을 수 있다고 봤다. 그래서 "LowState 확인 -> 그 다음 발행자" 로
+            # 바꿨는데, **그것이 데드락을 확정적으로 만들었다**(5/5 재시도 전부 실패).
+            #
+            # 스택이 원인을 말한다:
+            #   Thread A (DDS 콜백) : `_low_state_handler` 의 `motor_state_serial` 접근
+            #   Thread B (메인)     : `low_cmd_publisher.InitChannel()`
+            # `faulthandler` 는 **마지막 파이썬 프레임**을 찍으므로 A 는 그 줄에서
+            # pybind11 을 거쳐 C++ 안에 있다. A 는 participant 락을 쥔 채 GIL 을 들고
+            # 있고, B 는 같은 락을 쥔 채 GIL 을 기다린다 -- **두 락의 순환**이다.
+            # 콜백을 짧게 만들어도 안 풀린다. `InitChannel` 시점에 **살아 있는 구독
+            # 콜백이 없어야** 한다.
+            #
+            # 그래서 발행자를 먼저 연다. 이 시점에는 콜백이 아직 하나도 없다.
+            # §8-61 이 막으려던 것은 여기서 잃지만, 그것은 **미증명 가설**이고
+            # 이것은 **재현되는 차단**이다. 대신 아래에서 LowState 를 확인하고,
+            # 확인 전까지는 **아무것도 발행하지 않는다**(발행 스레드는 CUSTOM 진입
+            # 때 비로소 시작된다) -- 채널이 열려 있을 뿐이다.
+            self.low_cmd_publisher = B1LowCmdPublisher()
+            self.client = B1LocoClient()
+            self.low_cmd_publisher.InitChannel()
+            self.client.Init()
+
+            # 이제 구독자를 연다. 콜백이 여기서부터 돌기 시작한다.
             self.low_state_subscriber.InitChannel()
 
-            # ⛔⛔ 2026-08-09. **LowState 가 실제로 흐르는 것을 확인하기 전에는
-            # 명령 채널을 열지 않는다.**
-            #
-            # 무엇이 있었나: LowState 가 한 번도 안 들어오는 상태에서 이 함수가
-            # `low_cmd_publisher.InitChannel()` 과 `client.Init()` 까지 끝까지
-            # 갔다. 3초 뒤 `_require_fresh_low_state` 가 그것을 잡아 죽었고
-            # `cleanup()` 이 `CloseChannel()` 을 불렀다. 즉 **명령 채널에 발행자가
-            # 나타났다가 아무것도 안 싣고 사라졌다.** 그 실행에서 로봇이 힘이
-            # 풀리고 관절 보호(빨간불)에 들어갔다. 인과는 확정 못 했지만
-            # (유령 프로세스 없음 확인, 모션 스택은 떠 있었다) **상태가 안 오는
-            # 로봇의 명령 채널을 건드릴 이유가 애초에 없다.**
-            #
-            # `probe_ankle_mapping.py` 가 이미 배운 것과 같은 원칙이다(85621f8):
-            # **명령 경로를 검증한 뒤에만 다음 단계로 간다.** 그 교훈이 여기에는
-            # 들어와 있지 않았다.
-            #
-            # 순서: 구독자 열기 -> **LowState 도착 확인** -> 그 다음에만 발행자.
-            # 확인에 실패하면 `low_cmd_publisher`/`client` 를 **만들지도 않는다** --
-            # `cleanup()` 의 `hasattr` 가드가 그대로 통과하도록.
+            # LowState 가 실제로 흐르는지 확인한다. **채널을 여는 것은 이미 끝났고**
+            # (위 주석 참조 -- 순서를 뒤집으면 데드락이다) 여기서 막는 것은 그 다음
+            # 단계다. 실패하면 `__init__` 이 예외로 끝나고 `cleanup()` 이 채널을
+            # 닫는다. 이 시점까지 **발행된 프레임은 한 개도 없다** -- 발행 스레드는
+            # CUSTOM 진입 때 비로소 시작된다.
             deadline = time.monotonic() + self.LOWSTATE_GATE_S
             while self._last_low_state_monotonic <= 0.0 and time.monotonic() < deadline:
                 time.sleep(0.02)
             if self._last_low_state_monotonic <= 0.0:
                 raise RuntimeError(
-                    "LowState 가 %.1f 초 안에 한 번도 오지 않았다. 명령 채널을 열지 "
-                    "않고 중단한다. 로봇 전원과 모션 스택(booster_agent_manager)을 "
-                    "확인해라 -- `python3 tools/read_joint_live.py` 로 상태만 먼저 "
-                    "확인하는 것이 가장 싸다." % self.LOWSTATE_GATE_S)
-            self.logger.info("[init] LowState 확인됨 (%.2f s) -- 명령 채널을 연다",
+                    "LowState 가 %.1f 초 안에 한 번도 오지 않았다. 중단한다. "
+                    "로봇 전원과 모션 스택(booster_agent_manager)을 확인해라 -- "
+                    "`python3 tools/read_joint_live.py` 로 상태만 먼저 확인하는 것이 "
+                    "가장 싸다." % self.LOWSTATE_GATE_S)
+            self.logger.info("[init] LowState 확인됨 (%.2f s)",
                              self.LOWSTATE_GATE_S - (deadline - time.monotonic()))
-
-            self.low_cmd_publisher = B1LowCmdPublisher()
-            self.client = B1LocoClient()
-            self.low_cmd_publisher.InitChannel()
-            self.client.Init()
         except Exception as e:
             # ⛔ 워치독을 반드시 푼다. 안 풀면 12초 뒤 `_exit()` 하면서 데드락
             # 로그를 남기고, `run_e0.sh` 가 그것을 데드락으로 읽어 **5번 재시도**
