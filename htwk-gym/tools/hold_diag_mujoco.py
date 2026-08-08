@@ -137,7 +137,8 @@ def anchor_welds(model, data):
         model.eq_data[e, 10] = 1.0                  # torquescale
 
 
-def run(model, q_hold, kp, kd, lim, nj, duration, dt_log=0.02):
+def run(model, q_hold, kp, kd, lim, nj, duration, dt_log=0.02,
+        video=None, fps=30):
     data = mujoco.MjData(model)
     data.qpos[:] = 0.0
     data.qpos[2] = settle_height(model, data, q_hold, nj)
@@ -155,12 +156,27 @@ def run(model, q_hold, kp, kd, lim, nj, duration, dt_log=0.02):
              for n in ("Left_Ankle_Pitch", "Right_Ankle_Pitch")]
     ank_idx = [int(model.jnt_dofadr[j]) - 6 for j in ank_p if j >= 0]
 
+    # CLAUDE.md 규칙: eval 은 영상을 남긴다. 표에 안 나오는 것이 보인다 --
+    # 이 실험에서도 "앞으로 도는 모양"은 tilt 숫자만으로는 안 보였다.
+    renderer = frames = cam = None
+    if video:
+        renderer = mujoco.Renderer(model, height=480, width=640)
+        cam = mujoco.MjvCamera()
+        mujoco.mjv_defaultCamera(cam)
+        cam.distance, cam.elevation, cam.azimuth = 2.2, -12.0, 90.0
+        frames = []
+        frame_every = max(1, int(round(1.0 / (fps * model.opt.timestep))))
+
     for i in range(steps):
         q = data.qpos[7:7 + nj]
         dq = data.qvel[6:6 + nj]
         tau = np.clip(kp * (q_hold[:nj] - q) - kd * dq, -lim, lim)
         data.ctrl[:] = tau
         mujoco.mj_step(model, data)
+        if renderer is not None and i % frame_every == 0:
+            cam.lookat[:] = [float(data.qpos[0]), float(data.qpos[1]), 0.35]
+            renderer.update_scene(data, camera=cam)
+            frames.append(renderer.render())
         if i % every:
             continue
         # 발 접촉만 골라 CoP 와 수직력
@@ -187,6 +203,11 @@ def run(model, q_hold, kp, kd, lim, nj, duration, dt_log=0.02):
             "cop_x": (cop_num / fz) if fz > 1e-6 else float("nan"),
             "ank_tau": [float(tau[k]) for k in ank_idx],
         })
+    if video and frames:
+        import imageio
+        os.makedirs(os.path.dirname(video) or ".", exist_ok=True)
+        imageio.mimsave(video, frames, fps=fps, macro_block_size=1)
+        print("  영상: %s (%d 프레임)" % (video, len(frames)))
     return rows
 
 
@@ -217,6 +238,10 @@ def main():
     ap.add_argument("--xml", default=os.path.join(ROOT, "resources", "K1", "K1_serial_realmass.xml"))
     ap.add_argument("--weld-feet", action="store_true",
                     help="발 링크를 world 에 용접한다. 사용자가 발목을 눌러 잡은 조건.")
+    ap.add_argument("--video-dir", default=None,
+                    help="자세마다 <dir>/hold_<자세>.mp4 를 남긴다. CLAUDE.md 규칙상 "
+                         "판정에 쓰는 실행은 영상이 있어야 한다.")
+    ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--out", default=os.path.join(ROOT, "logs", "mujoco", "hold_diag.json"))
     a = ap.parse_args()
 
@@ -247,7 +272,11 @@ def main():
     }
     results = []
     for name, q in poses.items():
-        rows = run(model, q, kp, kd, lim, nj, a.duration)
+        vid = None
+        if a.video_dir:
+            tag = name.split("_")[0] + ("_weld" if a.weld_feet else "_free")
+            vid = os.path.join(a.video_dir, "hold_%s.mp4" % tag)
+        rows = run(model, q, kp, kd, lim, nj, a.duration, video=vid, fps=a.fps)
         s = summarize(name, rows, lim_ank)
         s["weld_feet"] = bool(a.weld_feet)
         results.append(s)
