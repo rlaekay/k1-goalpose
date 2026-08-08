@@ -80,6 +80,10 @@ def main():
                     help="볼 관절 인덱스, 쉼표 구분 (기본: 발목 roll 좌우)")
     ap.add_argument("--seconds", type=float, default=90.0)
     ap.add_argument("--hz", type=float, default=5.0, help="화면 갱신률")
+    ap.add_argument("--csv", default=None,
+                    help="⭐ 모든 LowState 표본을 CSV 로 남긴다(약 500 Hz). "
+                         "serial 과 parallel 을 **같은 행에** 적는다 -- 둘 중 어느 쪽이 "
+                         "튀는지가 계측 결함 판별의 핵심이다.")
     args = ap.parse_args()
 
     idx = [int(x) for x in args.idx.split(",") if x.strip()]
@@ -87,6 +91,11 @@ def main():
     sdk.ChannelFactory.Instance().Init(0, args.net)
 
     box = {}
+    # ⭐ 전 표본 기록. 콜백 안에서는 **append 만** 한다 -- 파일 I/O 나 포맷팅을 여기서
+    # 하면 500 Hz 콜백이 길어지고, 이 저장소는 그것 때문에 데드락을 겪었다
+    # (ibatch §8-62). 쓰기는 끝나고 한 번에 한다.
+    trace = [] if args.csv else None
+    t_start = time.monotonic()
 
     def on_low(m):
         # 콜백 안에서 값을 복사한다 -- 메시지 객체는 콜백 동안만 유효하다.
@@ -97,6 +106,10 @@ def main():
             return
         if ser:
             box["serial"], box["parallel"], box["n"] = ser, par, box.get("n", 0) + 1
+            if trace is not None:
+                trace.append((time.monotonic() - t_start,
+                              [ser[i] for i in idx if i < len(ser)],
+                              [par[i] for i in idx if i < len(par)]))
 
     sub = sdk.B1LowStateSubscriber(on_low)      # ⛔ 구독만. 발행 없음.
     sub.InitChannel()
@@ -152,6 +165,29 @@ def main():
             worst = max(abs(lo[i]), abs(hi[i]))
             s += "  -> |최대| %.4f = URDF 의 %.2f 배" % (worst, worst / max(abs(lim[1]), 1e-9))
         print(s)
+    if trace:
+        cols = ["t_s"]
+        for i in idx:
+            cols += ["%s_ser" % NAMES.get(i, "idx%d" % i),
+                     "%s_par" % NAMES.get(i, "idx%d" % i)]
+        with open(args.csv, "w", encoding="utf-8") as fh:
+            fh.write(",".join(cols) + "\n")
+            for tv, s, p in trace:
+                row = [tv]
+                for a, b in zip(s, p):
+                    row += [a, b]
+                fh.write(",".join("%.6g" % v for v in row) + "\n")
+        dtv = [b[0] - a[0] for a, b in zip(trace, trace[1:])]
+        dtv.sort()
+        med = dtv[len(dtv) // 2] if dtv else 0.0
+        print("\n[csv] %s -- %d 행, 실측 표본율 %.1f Hz (dt median %.4f s)"
+              % (args.csv, len(trace), (1.0 / med) if med else 0.0, med))
+        # 표본율이 낮으면 이 기록으로 고주파를 논할 수 없다. 그것을 여기서 못 박는다.
+        if med and 1.0 / med < 300:
+            print("[csv] ⚠️ 표본율이 %.0f Hz 다. 나이퀴스트 %.0f Hz -- 그 위 성분은"
+                  " 접힌다. 주파수 주장을 이 기록으로 하지 마라."
+                  % (1.0 / med, 0.5 / med))
+
     print("""
 읽는 법 (발목 roll, URDF 한계 ±0.345):
   |최대| 이 0.345 ± 0.02  -> (b) 확증. motor_state_serial 이 URDF 관절각과 다른 양이다.
