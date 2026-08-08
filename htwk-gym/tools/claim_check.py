@@ -53,6 +53,18 @@ CONDITIONS = [
     ("force_profile",     lambda r: r.get("force_profile") or "(none)"),
     ("seed",              lambda r: r.get("seed")),
     ("deterministic",     lambda r: r.get("deterministic")),
+    # ⛔⛔ 2026-08-09 추가. **이 도구가 채점 물리를 못 보고 있었다.**
+    # `effective_eval_protocol` 에 `asset` 과 `control` 이 아예 없어서, 같은 체크포인트를
+    # **armature 만 바꿔** 잰 두 리포트(낙상 **28,955 대 0**)에 "✅ 조건이 전부 같다" 를
+    # 출력했다. armature 가 지금 조사의 1차 변수인데(§8-52·§8-56 의 2x2 가 전부 그 축이다)
+    # 가드가 원리적으로 못 따라온 것이다. 분석 세션이 RETRACTIONS **C38** 로 잡았다.
+    #
+    # 지문(`protocol_sha`)에도 넣었지만(eval_goal_pose), 지문은 **갈렸다는 사실만** 말한다.
+    # 무엇이 갈렸는지 눈으로 봐야 하므로 armature 를 **따로 한 줄로** 찍는다.
+    # ⚠️ 옛 리포트에는 이 정보가 실제로 없다 -> `(기록없음)` 으로 찍히고, 그 경우
+    # **물리가 같은지 이 도구로는 알 수 없다**(아래 경고문이 그렇게 말한다).
+    ("armature",          lambda r: _armature_label(r)),
+    ("leg kp",            lambda r: _control_label(r, "stiffness")),
     ("protocol_sha",      lambda r: (r.get("effective_eval_protocol_sha") or "?")[:8]),
     ("env_code_sha",      lambda r: (r.get("env_code_sha") or "?")[:8]),
 ]
@@ -123,6 +135,40 @@ def _ckpt_iter(r):
         run = (r.get("checkpoint") or "/?/").split("/nn/")[0].split("/")[-1]
         return "?{}@{}".format(base, run[:18])
     return name or "?"
+
+
+def _protocol_block(r, name):
+    """`effective_eval_protocol` 안의 한 블록. 옛 리포트에는 없다."""
+    p = r.get("effective_eval_protocol") or {}
+    return p.get(name) if isinstance(p, dict) else None
+
+
+def _armature_label(r):
+    """채점 물리의 반사관성을 **한 줄로**. 옛 리포트는 `(기록없음)`.
+
+    스칼라와 관절별을 한 문자열로 합친다 -- 둘이 서로 다른 물리인데 한쪽만 보면
+    "armature 0.0 으로 같다" 라고 잘못 읽는다(관절별이 켜져 있으면 스칼라는 무의미하다).
+    """
+    a = _protocol_block(r, "asset")
+    if not isinstance(a, dict):
+        return "(기록없음)"
+    scalar = a.get("armature")
+    by_joint = a.get("armature_by_joint")
+    if by_joint:
+        items = ",".join("{}={}".format(k, v) for k, v in sorted(by_joint.items()))
+        return "by_joint[{}]".format(items)
+    return "{}".format(scalar)
+
+
+def _control_label(r, key):
+    """PD 게인 등 구동 파라미터. 벤더는 kp 를 armature 에서 유도하므로 **한 쌍**이다."""
+    c = _protocol_block(r, "control")
+    if not isinstance(c, dict):
+        return "(기록없음)"
+    v = c.get(key)
+    if isinstance(v, dict):
+        return ",".join("{}={}".format(k, v[k]) for k in sorted(v))
+    return "{}".format(v)
 
 
 def _g(r, *keys, mult=1.0):
@@ -294,8 +340,11 @@ def main():
     print("=" * 78)
     print("{:<18}".format("") + "".join("{:<{}}".format(l, w0) for l in labels))
     mismatched = []
+    armature_cells = []
     for cname, fn in CONDITIONS:
         vals = [fmt(fn(r)) for _, r in cols]
+        if cname == "armature":
+            armature_cells = list(vals)
         same = len(set(vals)) <= 1
         mark = "   " if same else "⛔ "
         if not same:
@@ -340,6 +389,19 @@ def main():
         print("   단 `env_code_sha` 가 갈렸다면 그 커밋이 eval 경로를 바꿨는지 직접 봐라.")
     else:
         print("✅ 조건이 전부 같다. 이 리포트들은 나란히 비교해도 된다.")
+
+    # ⛔⛔ 물리 지문이 없는 옛 리포트에 대해서는 **위의 ✅ 를 믿으면 안 된다.**
+    # 2026-08-09 이전 리포트에는 `effective_eval_protocol.asset` 이 없어서 armature 가
+    # 무엇이었는지 아티팩트만으로 알 수 없다. 실제로 이 도구는 같은 체크포인트를
+    # armature 만 바꿔 잰 두 리포트(낙상 28,955 대 0)에 ✅ 를 찍었다(RETRACTIONS C38).
+    # 침묵하면 그 ✅ 가 "물리도 같다" 로 읽힌다. 그래서 소리 내어 말한다.
+    if any(str(v) == "(기록없음)" for v in armature_cells):
+        print()
+        print("⛔ **이 리포트에는 채점 물리 지문이 없다**(2026-08-09 이전).")
+        print("   `armature` 열이 `(기록없음)` 인 쪽은 armature 가 무엇이었는지")
+        print("   아티팩트만으로 알 수 없다. 위의 판정은 **물리를 뺀 판정**이다 --")
+        print("   `asset.armature*` 를 채점 config(`<라운드>/<run>.cfg.yaml`)에서")
+        print("   **손으로 대조해라.** 같은 정책이 물리만 달라도 낙상이 0 과 28,955 로 갈린다.")
 
     hits = retractions_for(labels, repo_root)
     if hits:

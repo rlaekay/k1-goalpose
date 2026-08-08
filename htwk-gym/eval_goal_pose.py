@@ -775,6 +775,21 @@ def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
     # common-profile override.  Cross-arm aggregation rejects a single missing
     # or unequal hash, preventing another comparison of unequal force/noise/DR
     # protocols while still calling them "the same evaluation".
+    # ⛔⛔ 2026-08-09. 이 dict 에 **`asset` 과 `control` 이 없었다.** 그래서 지문이
+    # **채점 물리를 보지 못했다** -- 같은 체크포인트를 armature 만 바꿔 잰 두 리포트
+    # (낙상 28,955 대 0)에 `claim_check` 가 "✅ 조건이 전부 같다" 를 찍었다.
+    # armature 가 지금 조사의 1차 변수인데(§8-52·§8-56) 가드가 그것을 원리적으로
+    # 못 봤다는 뜻이다. 분석 세션이 RETRACTIONS **C38** 로 잡아냈다.
+    #
+    # 그래서 물리와 구동을 지문에 넣는다. 전부 넣으면 자산 경로 문자열 같은 무해한
+    # 차이로 매번 갈리므로, **동역학을 바꾸는 키만** 고른다.
+    #   asset   : armature(+관절별) · file · density · 감쇠 · 속도상한 · thickness
+    #   control : PD 게인 · decimation · action_scale · 액션 필터
+    # ⚠️ 이 변경으로 **앞으로의 protocol_sha 는 이전 리포트와 전부 갈린다.** 그건
+    # 정상이다 -- 옛 리포트에는 이 정보가 실제로 없다. claim_check 가 그 경우를
+    # "옛 리포트라 물리 지문이 없다" 로 구분해서 찍는다.
+    _asset = cfg.get("asset", {}) or {}
+    _control = cfg.get("control", {}) or {}
     effective_protocol = {
         "task": task,
         "sim_dt": cfg.get("sim", {}).get("dt"),
@@ -789,6 +804,13 @@ def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
         "joint_dr_probe": copy.deepcopy(joint_dr_probe),
         "joint_zero_probe": copy.deepcopy(
             cfg.get("evaluation", {}).get("joint_zero_probe")),
+        "asset": {k: copy.deepcopy(_asset.get(k)) for k in (
+            "file", "armature", "armature_by_joint", "density",
+            "angular_damping", "linear_damping", "max_angular_velocity",
+            "max_linear_velocity", "thickness", "default_dof_drive_mode")},
+        "control": {k: copy.deepcopy(_control.get(k)) for k in (
+            "stiffness", "damping", "action_scale", "decimation",
+            "action_filter_tau")},
     }
     evaluation = cfg.setdefault("evaluation", {})
     evaluation["effective_eval_protocol_sha"] = _stable_protocol_sha(
