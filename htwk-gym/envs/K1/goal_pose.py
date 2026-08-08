@@ -57,6 +57,53 @@ class GoalPose(BaseTask):
         self.num_bodies = self.gym.get_asset_rigid_body_count(robot_asset)
         self.dof_names = self.gym.get_asset_dof_names(robot_asset)
 
+        # ---- 관절별 armature (반사관성) ------------------------------------
+        #
+        # 위 `asset_options.armature` 는 **전 관절 하나의 값**이다. 그런데 이 로봇의
+        # 자산들은 서로 다른 값을, 그것도 관절별로 말한다(2026-08-08 직접 확인, §8-52):
+        #
+        #   Isaac  Goal_Pose_V7 / Goal_Pose_V8 / Base_Walk / Kick ...   0.0   (8개)
+        #   Isaac  Get_Up("official Booster USD value") / Safe_Fall / V3 0.02  (3개)
+        #   MuJoCo resources/K1/K1_serial.xml  발목·어깨·팔꿈치 0.05 / 머리 0.002
+        #                                      **힙 P·R·Y, 무릎은 속성 없음 = 0**
+        #
+        # 어느 자산도 "전 관절 0.02" 를 말하지 않는다. 그리고 이 선택은 사소하지 않다 --
+        # §8-52 의 2x2 에서 0.0 정책과 0.02 정책은 **서로의 물리에서 각각 붕괴한다**
+        # (낙상간격 1.5 s / 62 s). 스칼라 한 개로는 자산이 말하는 것을 표현할 수 없다.
+        #
+        # ⚠️ 기본값은 없음이다. `asset.armature_by_joint` 키가 없으면 이 블록은
+        # **완전한 no-op** 이고 기존 arm 은 한 글자도 영향받지 않는다
+        # (`randomization.ankle_gain` 이 쓴 패턴 그대로).
+        #
+        # 규칙: {부분문자열: 값} 이고 `default` 가 나머지를 받는다. 한 관절에 서로 다른
+        # 값을 주는 규칙 둘이 걸리면 **바로 죽는다** -- 조용히 하나를 이기게 두면
+        # "무엇을 학습했는지 모르는 arm" 이 또 하나 생긴다.
+        self._armature_per_dof = None
+        armature_by_joint = asset_cfg.get("armature_by_joint")
+        if armature_by_joint:
+            rules = {k: float(v) for k, v in armature_by_joint.items() if k != "default"}
+            default_arm = float(armature_by_joint.get("default", asset_cfg["armature"]))
+            per_dof, unmatched = [], []
+            for name in self.dof_names:
+                hits = {k: v for k, v in rules.items() if k in name}
+                if len({round(v, 9) for v in hits.values()}) > 1:
+                    raise ValueError(
+                        f"asset.armature_by_joint 규칙이 관절 '{name}' 에 서로 다른 값을 "
+                        f"준다: {hits}. 규칙을 겹치지 않게 써라.")
+                if hits:
+                    per_dof.append(next(iter(hits.values())))
+                else:
+                    per_dof.append(default_arm)
+                    unmatched.append(name)
+            # 어느 규칙에도 안 걸린 관절을 이름으로 찍는다. 규칙 오타(자산이 바뀌어
+            # 이름이 달라진 경우 포함)가 조용히 "전부 default" 로 떨어지는 것을 막는다.
+            self._armature_per_dof = per_dof
+            print(f"[armature] 관절별 반사관성 적용 (default={default_arm}): "
+                  + ", ".join(f"{n}={v}" for n, v in zip(self.dof_names, per_dof)))
+            if unmatched:
+                print(f"[armature] 규칙에 안 걸려 default 를 쓴 관절 {len(unmatched)}개: "
+                      + ", ".join(unmatched))
+
         dof_props_asset = self.gym.get_asset_dof_properties(robot_asset)
         self.dof_pos_limits = torch.zeros(self.num_dofs, 2, dtype=torch.float, device=self.device)
         self.dof_vel_limits = torch.zeros(self.num_dofs, dtype=torch.float, device=self.device)
@@ -167,6 +214,25 @@ class GoalPose(BaseTask):
             shape_props = self.gym.get_actor_rigid_shape_properties(env_handle, actor_handle)
             shape_props = self._process_rigid_shape_props(shape_props)
             self.gym.set_actor_rigid_shape_properties(env_handle, actor_handle, shape_props)
+            # 관절별 armature. **액터가 지금 들고 있는 props 에서 출발**하므로 우리가
+            # 건드리는 필드 말고는 전부 그대로다(드라이브 모드·강성·감쇠·한계 포함).
+            # 키가 없으면 이 블록 자체가 안 돈다.
+            if self._armature_per_dof is not None:
+                dof_props = self.gym.get_actor_dof_properties(env_handle, actor_handle)
+                for j in range(self.num_dofs):
+                    dof_props["armature"][j] = self._armature_per_dof[j]
+                self.gym.set_actor_dof_properties(env_handle, actor_handle, dof_props)
+                if i == 0:
+                    # 되읽어서 실제로 들어갔는지 확인한다. 설정이 조용히 무시되면
+                    # "레버를 켰다고 믿고 안 켠 채 학습한" arm 이 또 하나 생긴다
+                    # (NC_actfilter·NZ_zeroiid 가 정확히 그렇게 됐다).
+                    back = self.gym.get_actor_dof_properties(env_handle, actor_handle)
+                    bad = [(self.dof_names[j], float(back["armature"][j]), self._armature_per_dof[j])
+                           for j in range(self.num_dofs)
+                           if abs(float(back["armature"][j]) - self._armature_per_dof[j]) > 1e-9]
+                    if bad:
+                        raise RuntimeError(f"armature 설정이 반영되지 않았다: {bad[:4]}")
+                    print("[armature] env0 되읽기 확인 통과")
             self.gym.enable_actor_dof_force_sensors(env_handle, actor_handle)
             self.envs.append(env_handle)
             self.actor_handles.append(actor_handle)
