@@ -1240,6 +1240,67 @@ NP_ARMS = {
 N_ARMS.update(NP_ARMS)
 
 
+# ---- NQ: armature 를 **벤더 공식값**으로 (2026-08-09) ------------------------
+#
+# ⛔ `_ARM_ASSET`(NJ/NP 가 쓰는 것)은 **MuJoCo 자산에서 읽은 추측**이다 --
+# 발목 0.05 / 어깨·팔꿈치 0.05 / 머리 0.002 / **힙·무릎 0**.
+# 2026-08-09 에 벤더 공식 저장소를 찾아 진짜 값을 확보했다
+# ([`BoosterRobotics/booster_train`](https://github.com/BoosterRobotics/booster_train),
+# `assets/robots/actuator.py` + `booster.py` `BOOSTER_K1_CFG`).
+# 전문은 저장소 루트 `VENDOR_ACTUATOR_SPEC_K1.md`.
+#
+#   관절        모터              armature   (우리가 쓰던 추측)
+#   Hip_Pitch   E6408             0.047813   0.0      ← **힙·무릎이 0 이었다**
+#   Hip_Roll    E4315             0.033955   0.0
+#   Hip_Yaw     E4310             0.028253   0.0
+#   Knee_Pitch  E6416             0.095625   0.0      ← 가장 큰 값인데 0 이었다
+#   Ankle_P/R   E4310 ×평행2.0    0.056506   0.05     ← 우연히 가깝다
+#   팔          R14               0.001      0.05     ← 50배 과다
+#   머리        HT4438            0.001      0.002
+#
+# ⭐ 왜 이게 사소하지 않은가: 벤더는 PD 게인을 armature 에서 **유도**한다
+# (`actuator.py:161-163`):
+#       kp = armature·(2π·f_n)²,  kd = 2·ζ·armature·(2π·f_n),  f_n = 4 Hz
+# 즉 **게인과 armature 는 한 쌍이다.** 무릎 armature 0.0956 이 벤더 kp 60.4 를 낳는다.
+# 우리는 무릎 kp 100 을 쓰면서 armature 를 0 으로 뒀다 -- 그 게인이 가정하는 관성이
+# 시뮬에 없다.
+#
+# ⚠️ **단일 레버다.** `NP_clockarm` 과 `armature_by_joint` 값 하나만 다르다.
+# 계보·warm start·나머지 레버(영점 + 보행시계 정지)가 전부 같다. 대조군은 NP.
+#
+# 판정(숫자 보기 전에 고정):
+#   * 자기 물리에서 NP 보다 정확도·안정성이 좋으면 -> **추측값이 손해였다.**
+#     그 경우 NJ·NP 의 결과는 "armature 를 켰다" 가 아니라 "발목에만 켰다" 로 다시 읽어야 한다.
+#   * 비슷하면 -> 이득의 출처가 **발목 하나**이고 힙·무릎 관성은 이 증상에 무관하다.
+#   * 나빠지면 -> 힙·무릎 관성이 학습을 방해한다. 그때는 게인을 벤더 규칙으로
+#     같이 옮기는 것(kp = armature·(2π·4)²)을 시도한다 -- 벤더는 둘을 같이 쓴다.
+#
+# ⛔ 채점은 **두 물리에서** 해야 한다(§8-52·§8-56 함정): 공통 프로토콜(armature 없음)
+# 과 자기 분포. 한쪽만 재면 §8-52 의 NG@0.0 과 같은 오독이 난다.
+_ARM_VENDOR = {
+    "asset.armature_by_joint": {
+        "default": 0.0,
+        "Hip_Pitch": 0.047813,
+        "Hip_Roll": 0.033955,
+        "Hip_Yaw": 0.028253,
+        "Knee_Pitch": 0.095625,
+        "Ankle_Pitch": 0.056506,
+        "Ankle_Roll": 0.056506,
+        # 아래 셋은 이 URDF 에서 고정관절이라 보통 안 걸린다. 자산이 바뀌어
+        # 팔·머리가 살아나도 벤더 값을 쓰도록 미리 적어 둔다(안 걸리면 로그에 찍힌다).
+        "Shoulder": 0.001,
+        "Elbow": 0.001,
+        "Head": 0.001,
+    },
+}
+NQ_ARMS = {
+    "NQ_armvendor": merge(_N_BASE, _PATH_ON, _ZERO_ON,
+                          {"commands.path.pause_gait_during_dwell": True},
+                          _ARM_VENDOR),
+}
+N_ARMS.update(NQ_ARMS)
+
+
 # ---- NA: 이력 + 영점 오차를 함께 (2026-08-07, 사용자 요청) --------------------
 #
 # 이 조합은 편의가 아니라 **둘이 서로를 필요로 하기 때문에** 존재한다.
