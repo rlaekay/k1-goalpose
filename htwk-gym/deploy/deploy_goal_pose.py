@@ -612,6 +612,9 @@ class Controller:
     # 고정하므로(커스텀 불가), run_e0.sh는 **이 파일이 비어 있지 않은지**로
     # 데드락을 판별하고 재시도한다.
     INIT_DEADLOCK_LOG = "/tmp/e0_init_deadlock.log"
+    # LowState 가 흐르는 것을 확인할 때까지 명령 채널을 열지 않는다. 정상이면
+    # 500 Hz 라 즉시 통과한다. 3초면 "안 온다" 를 오검출하지 않는다.
+    LOWSTATE_GATE_S = 3.0
 
     def _init_communication(self) -> None:
         """SDK 채널을 연다. InitChannel의 GIL 데드락에 하드 타임아웃을 건다.
@@ -644,8 +647,6 @@ class Controller:
         try:
             self.low_cmd = LowCmd()
             self.low_state_subscriber = B1LowStateSubscriber(self._low_state_handler)
-            self.low_cmd_publisher = B1LowCmdPublisher()
-            self.client = B1LocoClient()
 
             # 데드락은 여기서만 난다. 창을 정확히 이 호출로 좁힌다.
             # 파일은 열어둔 채로 둔다 -- _exit()는 버퍼를 안 비우므로 워치독이
@@ -659,6 +660,39 @@ class Controller:
             wd.close()
             os.remove(self.INIT_DEADLOCK_LOG)   # 통과 -- 흔적을 남기지 않는다
 
+            # ⛔⛔ 2026-08-09. **LowState 가 실제로 흐르는 것을 확인하기 전에는
+            # 명령 채널을 열지 않는다.**
+            #
+            # 무엇이 있었나: LowState 가 한 번도 안 들어오는 상태에서 이 함수가
+            # `low_cmd_publisher.InitChannel()` 과 `client.Init()` 까지 끝까지
+            # 갔다. 3초 뒤 `_require_fresh_low_state` 가 그것을 잡아 죽었고
+            # `cleanup()` 이 `CloseChannel()` 을 불렀다. 즉 **명령 채널에 발행자가
+            # 나타났다가 아무것도 안 싣고 사라졌다.** 그 실행에서 로봇이 힘이
+            # 풀리고 관절 보호(빨간불)에 들어갔다. 인과는 확정 못 했지만
+            # (유령 프로세스 없음 확인, 모션 스택은 떠 있었다) **상태가 안 오는
+            # 로봇의 명령 채널을 건드릴 이유가 애초에 없다.**
+            #
+            # `probe_ankle_mapping.py` 가 이미 배운 것과 같은 원칙이다(85621f8):
+            # **명령 경로를 검증한 뒤에만 다음 단계로 간다.** 그 교훈이 여기에는
+            # 들어와 있지 않았다.
+            #
+            # 순서: 구독자 열기 -> **LowState 도착 확인** -> 그 다음에만 발행자.
+            # 확인에 실패하면 `low_cmd_publisher`/`client` 를 **만들지도 않는다** --
+            # `cleanup()` 의 `hasattr` 가드가 그대로 통과하도록.
+            deadline = time.monotonic() + self.LOWSTATE_GATE_S
+            while self._last_low_state_monotonic <= 0.0 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            if self._last_low_state_monotonic <= 0.0:
+                raise RuntimeError(
+                    "LowState 가 %.1f 초 안에 한 번도 오지 않았다. 명령 채널을 열지 "
+                    "않고 중단한다. 로봇 전원과 모션 스택(booster_agent_manager)을 "
+                    "확인해라 -- `python3 tools/read_joint_live.py` 로 상태만 먼저 "
+                    "확인하는 것이 가장 싸다." % self.LOWSTATE_GATE_S)
+            self.logger.info("[init] LowState 확인됨 (%.2f s) -- 명령 채널을 연다",
+                             self.LOWSTATE_GATE_S - (deadline - time.monotonic()))
+
+            self.low_cmd_publisher = B1LowCmdPublisher()
+            self.client = B1LocoClient()
             self.low_cmd_publisher.InitChannel()
             self.client.Init()
         except Exception as e:
