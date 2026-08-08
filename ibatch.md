@@ -4913,3 +4913,87 @@ overlay_states)` 로 위치를 맞추는데 overlay 는 매 스텝 쌓인다. �
 
 **다음**: 위 세 판정 셀을 120 s 로 렌더해서 `logs/eval_rounds/VIDEO_INDEX.md` 에
 적는다(MuJoCo 쪽 인덱스는 분석 세션이 이미 만들었다 -- Isaac 쪽은 비어 있다).
+
+---
+
+## 8-59. ⛔ 배포의 시계는 벽시계가 아니다 — 궤적 전체가 1.26배 시간 팽창해 있었다 (2026-08-09, 배포 세션)
+
+분석 세션이 `real_walk.csv` 의 보행시계 1.51 Hz 를 지적했다. **독립 검증했고 맞다.
+그리고 원인까지 내려갔다.**
+
+### 실측 (91행, 2.379 s, walking=1, `gait_freq` 명령 2.0)
+
+| 양 | 실측 | 설계 |
+|---|---:|---:|
+| `tick_dt_s` median | **0.0252 s** | 0.020 |
+| `gait_process` 스텝당 증가 | 0.0400 | 0.0400 |
+| 누적 위상 / 시간 | 3.596 주기 / 2.379 s = **1.512 Hz** | 2.0 |
+| `low_state_age` median / p99 | **0.0010 / 0.0089 s** | — |
+
+⭐ **`low_state_age` 가 1 ms 다.** 받는 데이터는 신선하다 — **느린 것은 루프다.**
+데이터 부족이 아니라 루프가 굶는 것이라는 뜻이라, 원인 후보가 크게 좁아진다.
+
+### 원인 — `Timer.get_time()` 이 벽시계가 아니다
+
+`deploy/utils/timer.py` 전문:
+
+```python
+def tick_timer_if_sim(self):   self.counter += 1        # ← LowState 콜백에서만
+def get_time(self):            return self.counter * 0.002
+```
+
+호출 지점은 `_low_state_handler` **한 곳뿐**이다. 즉 `time_now` 는
+**LowState 개수 × 0.002** 이고, "LowState 가 정확히 500 Hz 로 온다" 는 **가정**이다.
+
+⛔ **그런데 `advance_gait_clock` 의 docstring 은 이렇게 적고 있다**:
+
+> *"Elapsed time is **measured** rather than assumed, so 2 Hz is 2 Hz in wall clock
+> under loop jitter"*
+
+**거짓이다.** 재는 대상이 그 자체로 가정이다. 문서가 코드를 잘못 설명한 채 오래 살았다.
+
+### 사슬이 수치로 닫힌다
+
+```
+LowState 실측 396 Hz (설계 500, 비율 0.792)
+  → Timer.counter 가 그만큼만 오른다
+    → 정책 tick = 10 메시지 = 가상 0.020 s = 실제 10/396 = 0.0253 s
+                                              (실측 0.0252, 오차 0.4 %)
+      → 보행시계가 가상시간으로 적분 → 벽시계 2.0 × 0.792 = 1.584 Hz
+                                        (실측 1.512, 잔차는 4×interval 클램프와 지터)
+```
+
+### ⭐ 이것이 배포의 **모든** 시간량을 같은 배율로 틀어 놓는다
+
+`timer.get_time()` 을 읽는 곳은 셋이고 **전부** 걸린다:
+
+1. **`next_inference_time`** — 정책이 50 Hz 가 아니라 **39.6 Hz** 로 돈다.
+   ⇒ 행동 사이에 로봇이 학습보다 **26 % 더 멀리 넘어진다.** 물리는 안 느려지므로
+   이것이 가장 무겁다.
+2. **`advance_gait_clock`** — 보행 1.51 Hz (명령 2.0).
+3. **`next_publish_time`** (`+= common.dt`) — 발행률이 LowState 율과 1:1 이므로
+   **396 Hz**. EMA 0.8/0.2 의 tau 가 0.0113 s(설계 0.00896), fc **14.1 Hz**(설계 17.8).
+   ⇒ `--rate-fixed-filter` 가 겨냥한 그 열화가 **실재하고 크기도 계산된다.**
+
+### ⛔ 아직 안 갈린 것 — 고치는 방향이 여기에 달렸다
+
+**로봇이 LowState 를 396 Hz 로 내보내는가, 아니면 500 Hz 인데 우리가 20 % 를 흘리는가?**
+
+`low_state_age` 는 이것을 못 가른다(흘려도 우리가 보는 것은 늘 최신이라 age 는 작다).
+
+- **로봇이 396 이면** → `Timer` 가 구조적으로 틀렸다. 벽시계(`time.monotonic()`)로
+  바꾸는 것이 맞다. 그러면 보행은 2 Hz 로 복구되지만 **정책 tick 은 여전히 39.6 Hz** 다
+  (LowState 가 게이트라서). 즉 시계만 고쳐서는 ①이 안 낫는다.
+- **500 인데 우리가 흘리면** → 흘리는 원인을 고치는 것이 낫다. 유력 후보는 우리
+  자신의 rclpy executor 스레드다 — `--goal-source fixed` 에서도 `FallMonitor` 와
+  `ModeMonitor` 가 각각 `SingleThreadedExecutor` 를 스레드로 띄운다.
+  `base_walk` 는 `rclpy` 를 **import 조차 안 한다.**
+
+**판별 측정**: `--log-timing` 30초 (R6). `pub_hz` 열이 이미 있다.
+그리고 **모니터 둘을 끄고 같은 측정을 반복**하면 그 스레드가 원인인지 한 번에 갈린다.
+
+### 방법론
+
+이 91행 CSV 는 **2026-08-05 부터 저장소에 있었다.** `tick_dt_s` 열도 처음부터 있었다.
+넉 달치 가설을 세우는 동안 **아무도 그 열을 읽지 않았다.** 새 측정을 요청하기 전에
+이미 있는 로그의 열을 전부 훑는 것이 먼저다.
