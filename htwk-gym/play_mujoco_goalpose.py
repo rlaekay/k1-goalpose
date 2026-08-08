@@ -239,6 +239,13 @@ def main():
                     help="Hip_Roll 두 관절의 kp/kd 배수.")
     ap.add_argument("--lat-friction", type=float, default=None,
                     help="지면 마찰계수(기본 MuJoCo 1.0). 횡방향 미끄러짐 가설용.")
+    ap.add_argument("--leg-armature", type=float, default=None,
+                    help="다리 12관절의 armature 를 이 값으로 덮는다. MJCF 는 발목에만 "
+                         "0.05 를 주고 힙·무릎은 0 인데, Isaac(Goal_Pose_V7.yaml) 은 "
+                         "asset.armature=0.0 으로 **전 관절 0** 이다. 그래서 두 "
+                         "시뮬레이터가 발목만 다른 로봇을 돌렸다. 0 으로 맞추면 Isaac 의 "
+                         "발목 roll 분포(평균 7.5-12.8 rad/s, 한계 초과 27-55 %%)가 "
+                         "재현되는지가 이 플래그로 갈린다.")
     ap.add_argument("--dump-csv", default=None,
                     help="실기 deploy --log-timing과 **동일한 컬럼**으로 매 정책 tick을 "
                          "남긴다. 가설 없이 두 로그를 같은 축에 겹쳐 보기 위한 것이다.")
@@ -301,6 +308,15 @@ def main():
         print("발 관성: 벤더 MJCF 값 (학습 URDF와 다르다 -- 2.7-9.4배 작고 물리적으로 유효)")
 
     model = mujoco.MjModel.from_xml_path(mjcf_path)
+    if args.leg_armature is not None:
+        n_changed = 0
+        for j in range(model.njnt):
+            jn = mujoco.mj_name2id and mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j)
+            if not jn or not any(k in jn for k in ("Hip", "Knee", "Ankle")):
+                continue
+            model.dof_armature[model.jnt_dofadr[j]] = args.leg_armature
+            n_changed += 1
+        print("다리 armature -> %.4f (관절 %d개)" % (args.leg_armature, n_changed))
     model.opt.timestep = dt
     if args.contact_stiff is not None:
         model.geom_solref[:, 0] = args.contact_stiff
