@@ -31,6 +31,17 @@
 >   **게인과 armature 는 한 쌍이다.** → `NQ_armvendor`(= NP + 벤더값, 레버 하나) 큐에 있다.
 > - **도는 것**: `N3_pathcross`(gpu0) · `NI_conw`(gpu1) → 큐 `NJ_armasset`(gpu0) ·
 >   `NK_clockconw`(gpu1, = NH + `constellation_weight` 하나).
+> - 🔔 **배포 우선순위 2번(`dof_target` URDF 클램프)이 판단 대기 중이다** — 배포 세션이
+>   안 넣고 물어봤다. 답할 자리는
+>   [DEPLOY_REQUESTS_FROM_TRAINING.md](DEPLOY_REQUESTS_FROM_TRAINING.md) 맨 아래
+>   "배포 → 분석 세션" 절이다. ⛔ **근거 숫자가 바뀌었다**: §0 표의 *"정격 20"* 은
+>   우리 URDF 값이고 **벤더 Ankle_R 은 38.3 N·m** 이다(`VENDOR_ACTUATOR_SPEC_K1.md` §1).
+>   62.5 N·m 요구는 3배 초과가 아니라 **1.6배**다. 그리고 목표를 한계로 자르면 그
+>   지점에서 오차가 0 이 되어 **sim 이 학습시킨 "스톱에 밀어붙이는 토크" 가 사라진다**
+>   — 기하는 맞고 토크는 멀어진다. 어느 쪽도 완전한 재현이 아니라 **하드웨어 보호**로
+>   넣는 것이 정직하다는 것이 배포 쪽 의견.
+> - ⛔ **`b`~`r` 자세 수정이 로봇에서 아직 검증 안 됐다** — `--hold-diag 15` 의 tilt
+>   한 값이면 판정된다(§0 의 3번). 2° 안쪽이면 맞은 것, 4.9~13.8° 그대로면 영점(R7).
 >
 > - ~~N 배치 **1라운드** 결과 보고~~ — 2026-08-07 09:5x 보고 완료(ibatch §8-47).
 > - ~~`N2_pathgrid` + `NA_histzero` 두 축 보고~~ — 2026-08-07 16:0x 보고 완료
