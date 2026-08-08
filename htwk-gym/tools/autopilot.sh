@@ -30,6 +30,23 @@ mkdir -p "$PLAN/gpu0" "$PLAN/gpu1"
 
 say() { printf '[%s] %s\n' "$(TZ=Asia/Seoul date +'%F %T')" "$*" | tee -a "$LOG"; }
 
+# 카드 $1 에 **큰 레인** 워커가 살아 있는가.
+#
+# ⛔ 2026-08-08. 예전에는 `$3 == "tools/gpu_queue.sh" && $4 == g` 로만 봤다. 지금
+# 작은 레인은 같은 카드 번호로 `gpu_worker.sh <g>` (LANE=small) 로 돌고, 큰 레인도
+# gpu_worker.sh 로 갈아탈 예정이다. 그러면 **작은 레인 워커가 큰 레인 워커로 오인돼서
+# 큰 레인이 죽어도 복구가 발동하지 않는다** -- 감시자가 있는데 아무 신호가 안 나가는,
+# 이 파일이 막으라고 있는 바로 그 실패 모드다. 레인은 이름이 아니라 환경변수에 있다.
+big_worker_alive() {
+    local g="$1" p lane
+    for p in $(ps -eo pid=,args= | awk -v g="$g" '$3 ~ /tools\/gpu_(queue|worker)\.sh$/ && $4 == g {print $1}'); do
+        lane=$(tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | sed -n 's/^LANE=//p' | head -1)
+        [ -z "$lane" ] && lane=big
+        [ "$lane" = "big" ] && return 0
+    done
+    return 1
+}
+
 say "autopilot 시작 (유휴 ${PROMOTE_AFTER}초 후 승격, ${INTERVAL}초마다 확인)"
 
 while true; do
@@ -67,24 +84,31 @@ while true; do
     fi
     if [ "$stall" -ge 300 ]; then
         say "⚠️ 정체 $((stall / 60))분 -- 할 일이 있는데 아무것도 안 돈다. 복구 시도."
-        nw=$(ps -eo comm=,args= | awk '$1 ~ /^bash/ && $3 == "tools/gpu_queue.sh" {n++} END{print n+0}')
-        if [ "$nw" -lt 2 ]; then
-            say "  워커가 ${nw}개뿐이다. 두 장 모두 다시 띄운다."
-            for g in 0 1; do
-                ps -eo comm=,args= | awk -v g="$g" '$1 ~ /^bash/ && $3 == "tools/gpu_queue.sh" && $4 == g' \
-                    | grep -q . && continue
-                ( cd "$ROOT" && setsid nohup bash tools/gpu_queue.sh "$g" \
-                    < /dev/null >> "queue/worker$g.log" 2>&1 & )
-                say "  워커 $g 재기동"
-            done
-        fi
+        # 카드마다 큰 레인 워커가 살아 있는지 **레인 기준**으로 본다(위 함수 주석).
+        for g in 0 1; do
+            big_worker_alive "$g" && continue
+            say "  큰 레인 워커 $g 가 없다. 재기동."
+            ( cd "$ROOT" && setsid nohup bash tools/gpu_queue.sh "$g" \
+                < /dev/null >> "queue/worker$g.log" 2>&1 & )
+        done
         for f in "$ROOT/queue/done"/*.running; do
             [ -e "$f" ] || continue
             n=$(basename "$f" .running)
-            # 이름 앞의 우선순위 숫자로 어느 카드였는지는 알 수 없으므로 gpu0 로
-            # 되돌린다. 작업 스크립트는 cuda:$GPU_INDEX 라 카드에 무관하다.
-            mv "$f" "$ROOT/queue/gpu0/$n.sh" 2>/dev/null \
-                && say "  고아 표식 복구: $n -> queue/gpu0/"
+            # 되돌릴 곳은 `.owner`(pid gpu lane)에서 읽는다. gpu_worker.sh 가 작업을
+            # 집을 때 쓴다. 없으면(구 gpu_queue.sh 가 집은 것) gpu0 큰 레인으로 간다.
+            # ⛔ 예전에는 무조건 gpu0 큰 레인이었다. 그러면 2시간짜리 채점 작업이
+            # 큰 레인에 얹혀서 그 카드의 다음 학습을 그만큼 미룬다.
+            own="$ROOT/queue/done/$n.owner"
+            dest="$ROOT/queue/gpu0"
+            if [ -f "$own" ]; then
+                read -r _opid ogpu olane < "$own"
+                [ -z "$ogpu" ] && ogpu=0
+                if [ "$olane" = "small" ]; then dest="$ROOT/queue/small/gpu$ogpu"
+                else                            dest="$ROOT/queue/gpu$ogpu"; fi
+                mkdir -p "$dest"
+            fi
+            mv "$f" "$dest/$n.sh" 2>/dev/null \
+                && { rm -f "$own"; say "  고아 표식 복구: $n -> ${dest#$ROOT/}/"; }
         done
         sleep "$INTERVAL"
         continue

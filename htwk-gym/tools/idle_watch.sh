@@ -79,7 +79,12 @@ while true; do
     q1=$(find "$ROOT/queue/gpu1" "$ROOT/queue/small/gpu1" -maxdepth 1 -name '*.sh' 2>/dev/null | wc -l | tr -d ' ')
     running=$(find "$ROOT/queue/done" -maxdepth 1 -name '*.running' 2>/dev/null | wc -l | tr -d ' ')
     # 워커도 같은 이유로 실행 파일 기준으로 센다.
-    workers=$(ps -eo comm=,args= | awk '$1 ~ /^bash/ && $3 == "tools/gpu_queue.sh" {n++} END{print n+0}')
+    # ⛔ 2026-08-08: `gpu_queue.sh` 만 세고 있었다. 실제로는 작은 레인이
+    # `gpu_worker.sh LANE=small` 로 돌고 있어서 **백필 워커 둘이 이 숫자에 없었다** --
+    # 그것이 죽어도 `queue_workers_alive` 는 그대로 2 라 아무 신호가 안 난다.
+    # 그리고 큰 레인을 gpu_worker.sh 로 갈아타면 이 값이 0 이 돼서 정체 복구가
+    # 매 주기 워커를 덧띄우게 된다. 두 스크립트를 모두 센다.
+    workers=$(ps -eo comm=,args= | awk '$1 ~ /^bash/ && $3 ~ /^tools\/gpu_(queue|worker)\.sh$/ {n++} END{print n+0}')
     [ -z "$workers" ] && workers=0
 
     # --- 판정 -----------------------------------------------------------
