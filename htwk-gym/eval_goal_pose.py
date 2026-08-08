@@ -4007,7 +4007,13 @@ def write_outputs(out_dir, results, roll, report_md, env=None, cfg=None):
         last_path_segment = None
         camera_poses = getattr(env, "camera_poses", [])
         fov = float(getattr(env, "camera_horizontal_fov", 75.0))
-        with imageio.get_writer(video_path, fps=int(1.0 / env.dt)) as writer:
+        # ⛔ fps 는 **간격(stride)으로 나눈다.** 안 나누면 stride 2 로 담은 120 초가
+        # 60 초짜리 2배속 영상이 된다 -- 시뮬 시간은 2분이 맞지만 보행이 두 배로 빨라
+        # 보이고, 발이 교차하는 순간처럼 **눈으로 잡아야 하는 것**이 안 잡힌다.
+        # 영상은 눈으로 판정하라고 만드는 것이므로 재생은 실시간이어야 한다.
+        _stride = max(1, int((cfg.get("viewer") or {}).get("record_stride", 1) or 1))
+        _fps = max(1, int(round(1.0 / env.dt / _stride)))
+        with imageio.get_writer(video_path, fps=_fps) as writer:
             for i, (frame, st) in enumerate(zip(env.camera_frames, roll["overlay_states"])):
                 if len(st) >= 16 and int(st[15]) == CATEGORY_PATH:
                     segment = int(st[16]) if len(st) >= 17 else None
