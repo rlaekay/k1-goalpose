@@ -255,9 +255,17 @@ def main():
         r = arms[name].get("walk") or arms[name].get("accuracy")
         if r is None:
             continue
+        # ⛔ `feet_width` 는 **마지막 한 프레임**이고 절댓값이라 교차의 부호가 지워진다
+        # (RETRACTIONS C11). 롤아웃 전체를 누산한 `feet_sep_*` 가 있으면 그쪽을 쓰고,
+        # 없는 옛 리포트만 옛 값으로 떨어진다 -- 그 경우 열 이름에 `~` 를 붙여 구분한다.
+        sep_roll = g(r, "v7_extras", "feet_sep_abs_mean_m")
+        gap_cell = (fmt(sep_roll, 100) if sep_roll is not None
+                    else "~" + str(fmt(g(r, "v7_extras", "feet_width"), 100)))
         ex_rows.append([
             name,
-            fmt(g(r, "v7_extras", "feet_width"), 100),        # cm
+            gap_cell,                                        # cm
+            fmt(g(r, "v7_extras", "feet_touch_share"), 100, 2),
+            fmt(g(r, "v7_extras", "feet_sep_min_m"), 100),    # cm, 가장 깊게 모인 순간
             fmt(g(r, "v7_extras", "torque_occupancy"), 100, 1),
             fmt(g(r, "v7_extras", "torque_saturated"), 100, 2),
             fmt(g(r, "v7_extras", "dof_pos_occupancy"), 100, 1),
@@ -265,11 +273,15 @@ def main():
             fmt(g(r, "high_speed_stability", "cruise_pitch_abs_p90_deg"), 1, 1),
         ])
     print("== 자세/포화 (실기 증상 대조축: 실기는 다리가 모이며 발끼리 부딪혔다) ==")
-    print(table(["arm", "발간격(cm)", "토크점유(%)", "토크포화(%)",
-                 "관절점유(%)", "roll p90(도)", "pitch p90(도)"], ex_rows))
+    print(table(["arm", "발간격(cm)", "접촉체류(%)", "최소간격(cm)", "토크점유(%)",
+                 "토크포화(%)", "관절점유(%)", "roll p90(도)", "pitch p90(도)"], ex_rows))
     print()
-    print("주: 발간격은 좌우 발 중심거리다. 배포 정책이 7.0 cm 였고 발 폭이 7.0 cm 라")
-    print("    실기에서 발끼리 부딪혔다. 10 cm 이상이 목표다.")
+    print("주: 발간격은 좌우 발 중심거리(롤아웃 평균)다. 배포 정책이 7.0 cm 였고 발 폭이")
+    print("    7.0 cm 라 실기에서 발끼리 부딪혔다. 10 cm 이상이 목표다.")
+    print("    `접촉체류(%)` = 중심거리가 발 폭(7 cm)보다 좁았던 시간 비율,")
+    print("    `최소간격` = 롤아웃 중 가장 좁았던 순간. **이 둘이 실기 증상과 대조되는 양**이고")
+    print("    평균은 정상이면서 꼬리만 교차하는 경우를 평균만으로는 못 본다(실기 p1 -16.35 cm).")
+    print("⛔ 값 앞의 `~` 는 옛 리포트라 **마지막 한 프레임** 값이라는 뜻이다 -- 인용하지 마라(C11).")
     return 0
 
 

@@ -855,7 +855,25 @@ class GoalPoseV7(GoalPoseV3):
             # yaw sat pulled toward the centre -- is invisible to the fore-aft
             # term above and only shows up here.
             e["feet_lat_offset"] = float((fy[:, 0] + fy[:, 1]).mean().item() / 2.0)
+            # ⛔ 이 값은 **마지막 한 프레임**이고 절댓값이라 교차의 부호가 지워진다.
+            # 인용하지 마라(RETRACTIONS C11). 아래 `feet_sep_*` 가 롤아웃 전체이고
+            # 부호를 살린 쪽이다. 이 줄은 옛 리포트와의 호환을 위해 남긴다.
             e["feet_width"] = float((fy[:, 0] - fy[:, 1]).abs().mean().item())
+
+        # ⭐ 롤아웃 전체 발 간격. 부호 규약을 정하지 않고 음수/양수 체류 비율을 둘 다
+        # 찍는다 -- 지배적인 쪽이 정상 자세이고 반대쪽이 교차다. 실기 증언("다리가
+        # 모이면서 발끼리 부딪혀")과 대조되는 양은 `feet_touch_share`(중심거리가 발 폭
+        # 7 cm 보다 좁은 시간 비율)와 `feet_sep_min_m`(가장 깊게 모인 순간)이다.
+        _n = max(1, int(getattr(self, "_ft_steps", 0)))
+        if hasattr(self, "_ft_sep_sum"):
+            e["feet_sep_mean_m"] = round(float(self._ft_sep_sum) / _n, 4)
+            e["feet_sep_abs_mean_m"] = round(float(self._ft_abs_sum) / _n, 4)
+            e["feet_sep_min_m"] = round(float(self._ft_sep_min), 4)
+            e["feet_sep_max_m"] = round(float(self._ft_sep_max), 4)
+            e["feet_sep_neg_share"] = round(float(self._ft_neg_share) / _n, 5)
+            e["feet_sep_pos_share"] = round(float(self._ft_pos_share) / _n, 5)
+            e["feet_touch_share"] = round(float(self._ft_touch_share) / _n, 5)
+            e["feet_sep_steps"] = _n
             # per-joint left/right bias: the direct readout for hip yaw
             for i, nm in enumerate(self.dof_names):
                 if not nm.startswith("Left_"):

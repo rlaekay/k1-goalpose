@@ -1021,6 +1021,48 @@ class GoalPose(BaseTask):
         )
 
         self._refresh_feet_state()
+
+        # ⛔ 좌우 발 간격을 **롤아웃 전체**에 누산한다. 토크·관절속도와 같은 이유이고,
+        # 이 축은 그중에서도 가장 오래 눈이 없던 곳이다.
+        #
+        # 왜 지금까지 못 봤나. 라운드 표의 `발간격(cm)` 은 `_v7_extras` 의
+        # `feet_width` 인데 결함이 **둘**이다:
+        #   1. `_v7_extras` 는 롤아웃 끝에 **한 번** 호출된다 = 마지막 한 프레임
+        #      스냅샷이다(RETRACTIONS C11 이 이것 때문에 나왔다).
+        #   2. `(fy[:,0] - fy[:,1]).abs()` -- **절댓값이라 교차의 부호가 지워진다.**
+        #      깊게 교차한 자세(-16 cm)와 정상적으로 벌어진 자세(+16 cm)가 **같은 값**
+        #      으로 찍힌다. 즉 지금까지 이 열은 교차를 원리적으로 못 보는 열이었다.
+        #
+        # 실기 증언이 "다리가 모이면서 발끼리 부딪혀서 넘어져"이고, 실기 로그를 MuJoCo
+        # 운동학에 재생하니 **9.9 % 구간에서 겹치고 p1 이 -16.35 cm** 였다(§8-06).
+        # `feet_cross` 보상(N3_pathcross)이 겨냥한 것이 정확히 그 양인데, 그 arm 을
+        # 채점하고도 **레버가 겨냥한 양을 볼 수 없었다.**
+        #
+        # 부호 규약을 내가 정하지 않는다. 어느 인덱스가 왼발인지 가정하면 그 가정이
+        # 틀렸을 때 결론이 통째로 뒤집힌다. 그래서 **음수/양수 체류 비율을 둘 다** 찍고,
+        # 지배적인 쪽이 정상 자세이고 반대쪽이 교차다 -- 읽는 사람이 판단할 수 있다.
+        with torch.no_grad():
+            _, _, _fyaw = get_euler_xyz(self.base_quat)
+            _dxw = self.feet_pos[:, 0, 0] - self.feet_pos[:, 1, 0]
+            _dyw = self.feet_pos[:, 0, 1] - self.feet_pos[:, 1, 1]
+            _sep = -torch.sin(_fyaw) * _dxw + torch.cos(_fyaw) * _dyw   # 부호 있는 횡방향 간격 [m]
+            if not hasattr(self, "_ft_steps"):
+                _z = lambda: torch.zeros((), dtype=torch.float, device=self.device)
+                self._ft_sep_sum, self._ft_abs_sum = _z(), _z()
+                self._ft_neg_share, self._ft_pos_share, self._ft_touch_share = _z(), _z(), _z()
+                self._ft_sep_min = torch.full((), float("inf"), dtype=torch.float, device=self.device)
+                self._ft_sep_max = torch.full((), float("-inf"), dtype=torch.float, device=self.device)
+                self._ft_steps = 0
+            self._ft_sep_sum += _sep.mean()
+            self._ft_abs_sum += _sep.abs().mean()
+            self._ft_sep_min = torch.minimum(self._ft_sep_min, _sep.min())
+            self._ft_sep_max = torch.maximum(self._ft_sep_max, _sep.max())
+            self._ft_neg_share += (_sep < 0).float().mean()
+            self._ft_pos_share += (_sep > 0).float().mean()
+            # 발 폭이 7.0 cm 다. 중심거리가 그보다 좁으면 **발끼리 닿는 자세**다.
+            self._ft_touch_share += (_sep.abs() < 0.07).float().mean()
+            self._ft_steps += 1
+
         self._update_goal_state()
 
         self.episode_length_buf += 1
