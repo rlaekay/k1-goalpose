@@ -19,6 +19,14 @@
 >   팔꿈치 0.05 / 머리 0.002 / **힙·무릎 0** 이다. 배포 계보 `I3b_stance10` 도 0.0 이다.
 >   → 관절별 armature 지원을 넣었고(`asset.armature_by_joint`, 키 없으면 no-op,
 >   양성/음성 스모크 확인) `NJ_armasset` 이 큐에 있다.
+> - ⭐ **armature 실험 전체가 "켰다"가 아니라 "발목에만 켰다" 였다** (2026-08-09).
+>   `NJ_armasset`/`NP_clockarm` 이 쓴 `_ARM_ASSET`(발목 0.05 / **힙·무릎 0** / 팔 0.05)은
+>   MuJoCo 자산에서 읽은 **추측**이다. 벤더 공식값을 확보했다 —
+>   **[VENDOR_ACTUATOR_SPEC_K1.md](VENDOR_ACTUATOR_SPEC_K1.md)**:
+>   힙 0.0283~0.0478 / **무릎 0.0956** / 발목 0.0565 / 팔 0.001.
+>   ⛔ `Get_Up.yaml` 의 *"official Booster USD value 0.02"* 는 **틀렸다**(C33).
+>   ⭐ 그리고 벤더는 **게인을 armature 에서 유도**한다 — `kp = armature·(2π·4Hz)²`.
+>   **게인과 armature 는 한 쌍이다.** → `NQ_armvendor`(= NP + 벤더값, 레버 하나) 큐에 있다.
 > - **도는 것**: `N3_pathcross`(gpu0) · `NI_conw`(gpu1) → 큐 `NJ_armasset`(gpu0) ·
 >   `NK_clockconw`(gpu1, = NH + `constellation_weight` 하나).
 >
