@@ -903,6 +903,38 @@ class GoalPose(BaseTask):
             self._tq_occ_max = torch.maximum(self._tq_occ_max, occ.max(dim=0)[0])
             self._tq_sat_sum += (occ > 0.95).float().mean(dim=0)
             self._tq_abs_sum += self.torques.abs().mean(dim=0)
+
+            # ⛔ 관절 **속도** 점유. 토크와 달리 이 축에는 아무 제약이 없다:
+            #   토크        하드 클램프 있음(:866)   벌칙 스케일 -0.
+            #   관절 속도   **클램프 없음**          **벌칙 스케일 -0.**
+            # `dof_vel_limits` 는 `_reward_dof_vel_limits` 한 곳에서만 쓰이는데
+            # 그 보상의 스케일이 0 이다. 즉 학습에 관절 속도 제약이 전혀 없다.
+            #
+            # 그런데 실물 자산은 상한이 훨씬 낮다:
+            #   K1_robot_boxfoot(N 배치)        7.1 / 12.5 / 12.9 / 18.1 rad/s 혼재
+            #   K1_locomotion_armsdown(배포 계보) **22 관절 전부 18**
+            # 정책은 위치를 명령하고 속도는 PD 에서 나오므로, 학습된 보행이 실기
+            # 상한을 넘는 관절 속도를 요구하면 **실기는 물리적으로 못 낸다** --
+            # 스윙 다리가 제때 안 나가고 착지점이 어긋난다. "몇 걸음 가다 무너진다"
+            # 와 모양이 맞고, gait 2.0 Hz 는 스윙이 빠른 조건이다.
+            #
+            # ⛔ 그리고 이 축은 평가에서 한 번도 측정된 적이 없다. 라운드 표의
+            # `관절점유(%)` 는 `dof_pos_occupancy` = **위치** 점유다.
+            # **제약이 없는 축이 측정도 안 되는 축이었다.**
+            vocc = self.dof_vel.abs() / self.dof_vel_limits.clamp(min=1e-6)
+            if not hasattr(self, "_dv_occ_sum"):
+                self._dv_occ_sum = torch.zeros(self.num_dofs, dtype=torch.float, device=self.device)
+                self._dv_occ_max = torch.zeros(self.num_dofs, dtype=torch.float, device=self.device)
+                self._dv_over_sum = torch.zeros(self.num_dofs, dtype=torch.float, device=self.device)
+                self._dv_abs_sum = torch.zeros(self.num_dofs, dtype=torch.float, device=self.device)
+                self._dv_abs_max = torch.zeros(self.num_dofs, dtype=torch.float, device=self.device)
+            self._dv_occ_sum += vocc.mean(dim=0)
+            self._dv_occ_max = torch.maximum(self._dv_occ_max, vocc.max(dim=0)[0])
+            # 상한 **초과** 비율. 클램프가 없으므로 1.0 을 넘을 수 있고, 넘는다면
+            # 그 자체가 "실기가 못 내는 보행"의 직접 증거다.
+            self._dv_over_sum += (vocc > 1.0).float().mean(dim=0)
+            self._dv_abs_sum += self.dof_vel.abs().mean(dim=0)
+            self._dv_abs_max = torch.maximum(self._dv_abs_max, self.dof_vel.abs().max(dim=0)[0])
             self._tq_steps += 1
         self.render()
 

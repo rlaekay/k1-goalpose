@@ -799,6 +799,43 @@ class GoalPoseV7(GoalPoseV3):
             }
             e["torque_steps_accumulated"] = n
 
+        # ⛔ 관절 **속도** 점유. 이 축에는 학습에 아무 제약이 없다:
+        #   토크      하드 클램프 있음(goal_pose.py:866)  벌칙 스케일 -0.
+        #   관절 속도 **클램프 없음**                      **벌칙 스케일 -0.**
+        # `dof_vel_limits` 는 `_reward_dof_vel_limits` 한 곳에서만 읽히는데 그
+        # 보상의 스케일이 0 이다. 그리고 이 축은 평가에서도 한 번도 안 쟀다 --
+        # 라운드 표의 `관절점유(%)` 는 `dof_pos_occupancy` = **위치** 점유다.
+        # **제약이 없는 축이 측정도 안 되는 축이었다.**
+        #
+        # 왜 중요한가: 정책은 위치를 명령하고 속도는 PD 에서 나온다. 학습된 보행이
+        # 실기 상한을 넘는 관절 속도를 요구하면 실기는 물리적으로 못 낸다 --
+        # 스윙 다리가 제때 안 나가고 착지점이 어긋난다. 자산이 갈린다:
+        #   K1_robot_boxfoot(N 배치)          7.1 / 12.5 / 12.9 / 18.1 혼재
+        #   K1_locomotion_armsdown(배포 계보)  22 관절 **전부 18**
+        # ⚠️ 7.1 이 벤더 사양인지 누군가의 추정인지는 아직 확인 못 했다.
+        #    실물 계열 자산 두 개가 일치할 뿐이다. 그게 틀리면 이 축 전체가 틀린다.
+        if hasattr(self, "_dv_occ_sum"):
+            names = [d.replace("_Pitch", "P").replace("_Roll", "R").replace("_Yaw", "Y")
+                     for d in self.dof_names]
+            n = max(1, int(getattr(self, "_tq_steps", 0)))
+            e["dof_vel_by_joint"] = {
+                names[i]: {
+                    "limit": round(float(self.dof_vel_limits[i]), 2),
+                    "mean_rad_s": round(float(self._dv_abs_sum[i]) / n, 3),
+                    "peak_rad_s": round(float(self._dv_abs_max[i]), 3),
+                    "mean_occ": round(float(self._dv_occ_sum[i]) / n, 4),
+                    "peak_occ": round(float(self._dv_occ_max[i]), 4),
+                    # 상한 초과 체류 비율. 클램프가 없으므로 1.0 을 넘을 수 있고,
+                    # 넘는다면 그 자체가 "실기가 못 내는 보행"의 직접 증거다.
+                    "over_share": round(float(self._dv_over_sum[i]) / n, 5),
+                }
+                for i in range(self.num_dofs)
+            }
+            # 판정용 한 줄 요약. 다리 관절 중 최대 초과 체류 비율.
+            over = [float(self._dv_over_sum[i]) / n for i in range(self.num_dofs)]
+            e["dof_vel_over_limit_share_max"] = round(max(over), 5)
+            e["dof_vel_peak_occ_max"] = round(float(self._dv_occ_max.max()), 4)
+
         # Symmetry: we finally switched the loss on, but had no way to check
         # whether left/right actually became symmetric. This is the direct
         # readout of armA's "left foot always slightly ahead" observation.
