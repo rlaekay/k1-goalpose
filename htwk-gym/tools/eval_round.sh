@@ -126,16 +126,28 @@ for RUN in "$@"; do
         --sim_device "$DEV" --rl_device "$DEV" \
         --out "$OUTROOT/$NAME.walk" 2>&1 | tail -25
 
-    # --- 4단계: 마지막 체크포인트도 보행으로 재본다 -----------------------
-    # 왜: 위 선택기는 **정확도**(waypoint) 로 승자를 뽑는다. path arm 에서는 그
-    # 승자가 "잘 서는 체크포인트" 이고 정작 잘 걷는 체크포인트가 따로일 수 있다.
-    # 한 축으로 뽑아 다른 축으로 채점하는 것이 이 저장소가 반복한 오류라, 두 번째
-    # 후보를 싸게(60 s) 같이 재서 그 가능성을 열어둔다.
+    # --- 4단계: 마지막 체크포인트를 **두 축 모두** 재본다 -------------------
+    # 왜 마지막 체크포인트도 재는가: 위 선택기는 **정확도**(waypoint) 로 승자를 뽑는다.
+    # path arm 에서는 그 승자가 "잘 서는 체크포인트" 이고 정작 잘 걷는 체크포인트가
+    # 따로일 수 있다. 한 축으로 뽑아 다른 축으로 채점하는 것이 이 저장소가 반복한 오류다.
+    #
+    # ⛔ 2026-08-08 수정. 예전 4단계는 **보행만, 그것도 60 s** 로 쟀다. 둘 다 틀렸다.
+    #   (1) 정확도가 없어서, 마지막 체크포인트끼리 arm 을 비교하려면 매번 별도 작업을
+    #       한 번 더 걸어야 했다 -- N0_ctrl · N1_path · NF_dwellclock 에서 **세 번**
+    #       그랬다. 그 세 번의 비용이 이 단계를 처음부터 두 축으로 재는 비용보다 크다.
+    #   (2) 60 s 는 2·3단계(120 s)와 **프로토콜 길이가 다르다.** 길이가 다른 두 수를
+    #       나란히 놓은 것이 "118배" 오류였다(RETRACTIONS). claim_check 도 duration_s
+    #       불일치를 ⛔ 로 막는다. 즉 예전 4단계 결과는 3단계와 비교 불가였다.
+    # 그래서 **120 s, 두 축**으로 맞춘다. arm 당 채점 시간은 늘지만 비교가 성립한다.
     FINAL=$(ls -1v "$RUN"/nn/model_*.pth 2>/dev/null | tail -1)
     if [ -n "$FINAL" ] && [ -e "$FINAL" ] && [ "$(readlink -f "$FINAL")" != "$(readlink -f "$BEST")" ]; then
-        echo "-- 4/4 지속 보행: 마지막 체크포인트 $(basename "$FINAL") (60 s)"
+        echo "-- 4/4 마지막 체크포인트 $(basename "$FINAL") -- 정확도 + 보행 (각 120 s)"
         python -u eval_goal_pose.py --task K1/Goal_Pose_V7 --config "$CFG" \
-            --checkpoint "$FINAL" --terrain plane --duration_s 60 \
+            --checkpoint "$FINAL" --terrain plane --duration_s 120 \
+            --sim_device "$DEV" --rl_device "$DEV" \
+            --out "$OUTROOT/${NAME}_final.accuracy" 2>&1 | tail -20
+        python -u eval_goal_pose.py --task K1/Goal_Pose_V7 --config "$CFG" \
+            --checkpoint "$FINAL" --terrain plane --duration_s 120 \
             --goal_pattern forward_hold \
             --sim_device "$DEV" --rl_device "$DEV" \
             --out "$OUTROOT/${NAME}_final.walk" 2>&1 | tail -20
