@@ -120,15 +120,35 @@ class BaseTask:
             else:
                 self.gym.poll_viewer_events(self.viewer)
 
+        # ⛔ 프레임을 **매 스텝** 1280x720 RGBA 로 파이썬 리스트에 쌓는다. 한 장이
+        # 3.69 MB 이므로 50 Hz 로 120 초를 담으면 **22 GB** 다 -- 사용자 규칙("모든 eval 은
+        # 2분짜리 영상을 남긴다")을 이 구현으로는 만족시킬 수 없다. 기본값 8 초도 1.5 GB 다.
+        # 그래서 **간격(stride)과 해상도**를 config 로 연다. 기본값은 예전 그대로(1 / 1280x720)라
+        # 기존 실행은 한 글자도 안 바뀐다.
+        #   viewer.record_stride: 2  -> 25 fps, 프레임 수 절반
+        #   viewer.record_width/height: 640/360 -> 장당 0.92 MB
+        #   둘을 합치면 120 초가 2.8 GB 로 들어온다.
+        #
+        # ⚠️ `eval_goal_pose` 는 `zip(camera_frames, overlay_states)` 로 **위치**를 맞춰
+        # 마커를 그린다. 프레임만 솎으면 오버레이가 어긋난 시점에 그려진다 -- 조용히
+        # 틀린 영상이 나오는 쪽이라 숫자가 틀리는 것보다 나쁘다. 그래서 이 스텝에
+        # 실제로 담았는지를 `self.recorded_this_step` 으로 알려 주고, 호출자가 같은
+        # 조건으로 오버레이를 담는다.
+        self.recorded_this_step = False
         if self.cfg["viewer"]["record_video"]:
+            stride = max(1, int(self.cfg["viewer"].get("record_stride", 1) or 1))
+            self._record_step = getattr(self, "_record_step", -1) + 1
+            if self._record_step % stride != 0:
+                return
+            self.recorded_this_step = True
             if self.viewer is None:
                 if self.device != "cpu":
                     self.gym.fetch_results(self.sim, True)
                 self.gym.step_graphics(self.sim)
             if self.camera is None:
                 camera_props = gymapi.CameraProperties()
-                camera_props.width = 1280
-                camera_props.height = 720
+                camera_props.width = int(self.cfg["viewer"].get("record_width", 1280) or 1280)
+                camera_props.height = int(self.cfg["viewer"].get("record_height", 720) or 720)
                 camera_props.use_collision_geometry = False
                 self.camera = self.gym.create_camera_sensor(self.envs[self.cfg["viewer"]["record_env_idx"]], camera_props)
                 self.camera_frames = []

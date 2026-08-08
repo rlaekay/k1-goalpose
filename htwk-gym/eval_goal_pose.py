@@ -624,7 +624,7 @@ def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
                 joint_zero_probe_deg=None, joint_zero_probe_modes="iid",
                 force_profile=None, terrain=None,
                 joint_encoder_bias_rad=None, joint_target_offset_rad=None,
-                init_dof_std_rad=None):
+                init_dof_std_rad=None, record_video_stride=1, record_video_size=None):
     """Apply the standard evaluation conditions to a task config, in place."""
     cfg["basic"]["task"] = task
     cfg["basic"]["headless"] = True
@@ -635,6 +635,15 @@ def prepare_cfg(cfg, task, num_envs, sim_device=None, rl_device=None,
         cfg["basic"]["rl_device"] = rl_device
     cfg["viewer"]["record_video"] = bool(record_video)
     cfg["viewer"]["record_env_idx"] = 0
+    # 간격·해상도. 기본값은 예전과 같아서(1 / 1280x720) 안 주면 아무것도 안 바뀐다.
+    cfg["viewer"]["record_stride"] = max(1, int(record_video_stride or 1))
+    if record_video_size:
+        try:
+            w, h = (int(v) for v in str(record_video_size).lower().split("x"))
+        except ValueError:
+            raise SystemExit(f"--record_video_size 형식은 WxH 다: {record_video_size!r}")
+        cfg["viewer"]["record_width"] = w
+        cfg["viewer"]["record_height"] = h
     _apply_hbatch_common_eval(cfg, task)
     if joint_zero_probe_deg is not None:
         # 학습 때 이 축이 꺼져 있던 arm 에도 **똑같이** 건다. 커리큘럼은 끄고
@@ -1916,6 +1925,14 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
                 video_goal_category,
                 video_goal_segment,
             ))
+            # ⛔ 오버레이는 `zip(camera_frames, overlay_states)` 로 **위치**를 맞춰 그린다.
+            # `viewer.record_stride > 1` 이면 프레임은 솎이는데 이 리스트는 매 스텝
+            # 쌓이므로 짝이 어긋난다 -- 마커가 엉뚱한 시점에 그려진 영상이 조용히
+            # 나오는 쪽이고, 그건 숫자가 틀리는 것보다 나쁘다(눈으로 판정하라고 만든
+            # 영상이므로). 프레임을 안 담은 스텝이면 방금 넣은 것을 도로 뺀다.
+            # `recorded_this_step` 이 없는 옛 env 에서는 True 로 떨어져 예전과 같다.
+            if not getattr(env, "recorded_this_step", True):
+                overlay_states.pop()
             if (step_i + 1) * env.dt >= record_video_s:
                 env.cfg["viewer"]["record_video"] = False  # stop accumulating frames (memory)
                 video_done = True
@@ -4131,6 +4148,16 @@ def main():
              "after the HBatch common eval override; >=0")
     parser.add_argument("--record_video", action="store_true", help="also record an mp4 of env 0 (first --record_video_s seconds)")
     parser.add_argument("--record_video_s", type=float, default=8.0)
+    # ⛔ 프레임은 1280x720 RGBA 로 **메모리에** 쌓인다(장당 3.69 MB). 50 Hz 기준
+    # 기본 8 초가 이미 1.5 GB 이고, 사용자 규칙이 요구하는 **120 초는 22 GB** 라
+    # 그대로는 못 만든다. 아래 둘로 간격과 해상도를 낮추면 120 초가 들어온다:
+    #     --record_video_s 120 --record_video_stride 2 --record_video_size 640x360
+    #     -> 25 fps · 장당 0.92 MB · 3,000 장 ≈ 2.8 GB
+    # 기본값은 예전 그대로라(stride 1 / 1280x720) 기존 명령은 한 글자도 안 바뀐다.
+    parser.add_argument("--record_video_stride", type=int, default=1,
+                        help="영상 프레임을 N 스텝마다 한 장만 담는다(메모리·렌더시간 1/N)")
+    parser.add_argument("--record_video_size", default=None,
+                        help="영상 해상도 WxH (기본 1280x720)")
     parser.add_argument(
         "--force_visualization_probe", action="store_true",
         help="video-only HBatch protocol: path-only goals plus a guaranteed early support force")
@@ -4184,7 +4211,9 @@ def main():
                 joint_zero_probe_modes=args.joint_zero_probe_modes,
                 joint_encoder_bias_rad=args.joint_encoder_bias_rad,
                 joint_target_offset_rad=args.joint_target_offset_rad,
-                init_dof_std_rad=args.init_dof_std_rad)
+                init_dof_std_rad=args.init_dof_std_rad,
+                record_video_stride=args.record_video_stride,
+                record_video_size=args.record_video_size)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
