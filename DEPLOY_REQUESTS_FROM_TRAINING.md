@@ -356,7 +356,7 @@ python3 tools/estimate_joint_zero.py --observability   # 자세 집합 점수
 정책도 같은 IMU 를 `obs[0:3]` 으로 먹으므로 그게 오히려 맞는 프레임이다.
 
 
-## R8. 실기 모터의 **정격 토크와 최대 속도** — ⚠️ **절반 닫힘 (2026-08-08 웹 조사)**
+## R8. 실기 모터의 **정격 토크와 최대 속도** — ✅ **닫힘 (2026-08-08). 벤더 공식 저장소에서 확보**
 
 **왜 막혔나**: 저장소 안에 근거가 없다. 같은 물리 관절에 값이 세 군데에서 다르고
 (Hip_Roll 35 / 20 / 30), 어느 것이 실기인지 아무도 모른다. 나는 한때 "정격 20 N·m"
@@ -482,3 +482,26 @@ python3 tools/estimate_joint_zero.py --observability   # 자세 집합 점수
 `motor_state` 속도의 포화값을 읽으면 (2)가 갈린다. Hip_Pitch 하나면 충분하다:
 **7.1 근처에서 포화하면 확증, 12~18 까지 가면 학습 자산이 맞다.**
 ⛔ 매단 채로 하지 마라(tilt>45°에서 `kDamping` 후 공중 GetUp).
+
+
+### R8 종결 (2026-08-08) — **벤더 공식 액추에이터 DB 를 찾았다**
+
+[`BoosterRobotics/booster_train`](https://github.com/BoosterRobotics/booster_train) 의
+`assets/robots/actuator.py` + `booster.py` `BOOSTER_K1_CFG` 가 K1 의 관절별
+**effort / velocity / armature** 를 전부 준다. 전문은
+**[VENDOR_ACTUATOR_SPEC_K1.md](VENDOR_ACTUATOR_SPEC_K1.md)**.
+
+| 관절 | effort | velocity | armature |
+|---|---:|---:|---:|
+| Hip_Pitch | 68.0 | 14.66 | 0.047813 |
+| Hip_Roll | 76.0 | 12.57 | 0.033955 |
+| Hip_Yaw | 38.3 | 17.59 | 0.028253 |
+| Knee | 112.0 | 12.57 | 0.095625 |
+| Ankle P/R | 38.3 | 17.59 | 0.056506 |
+
+⇒ **로봇에서 잴 필요가 없어졌다.** 무부하 스텝 요청은 **취소**한다.
+
+⛔ **남은 것 하나만 사람이 닫을 수 있다**: 공개 페이지의 `Max Peak Torque 60 N·m` 와
+액추에이터 DB 의 무릎 **112 N·m** 가 어긋난다. 60 이 연속 정격이고 112 가 피크인가?
+벤더에 문의하거나 모터 데이터시트(E6416)를 구하면 닫힌다.
+**그 전에는 URDF effort 를 112 로 올리지 마라.**
