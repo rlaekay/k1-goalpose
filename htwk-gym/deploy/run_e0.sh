@@ -46,7 +46,9 @@ for attempt in 1 2 3 4 5; do
     if [ $rc -eq 0 ] || [ ! -s "$DEADLOCK_LOG" ]; then
         break
     fi
-    echo "[run_e0] InitChannel 데드락 (시도 $attempt/5). 스택: $DEADLOCK_LOG -- 재시도한다."
+    echo "[run_e0] 초기화 GIL 데드락 (시도 $attempt/5). 스택: $DEADLOCK_LOG -- 재시도한다."
+    echo "[run_e0]   창은 InitChannel 하나가 아니다 -- LowState 콜백이 500 Hz 로 도는"
+    echo "[run_e0]   동안 rclpy 노드(ModeMonitor/FallMonitor)를 세우는 구간도 포함이다."
     stty sane 2>/dev/null || true
     sleep 2
 done

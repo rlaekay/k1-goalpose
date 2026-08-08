@@ -575,6 +575,11 @@ class Controller:
         else:
             self.goal_source = GoalSource(self.cfg, initial=initial_goal)  # fixed/stdin
 
+        # rclpy 를 쓰는 것이 여기까지다(ModeMonitor / FallMonitor / RosGoalSource).
+        # 데드락 창을 지났으므로 워치독을 푼다. `RemoteControlService` 는 DDS 도
+        # rclpy 도 안 건드리므로 덮을 필요가 없다.
+        self._disarm_init_watchdog()
+
         self.remoteControlService = RemoteControlService()
 
     def _init_timer(self):
@@ -607,7 +612,9 @@ class Controller:
 
     # InitChannel 데드락을 잘라내는 시간(초). 정상 초기화는 1초 안에 끝나므로
     # 8초면 오검출이 없다.
-    INIT_WATCHDOG_S = 8.0
+    # 이제 구독자 InitChannel + LowState 게이트(최대 3 s) + rclpy 노드 셋을 전부
+    # 덮는다. 정상 초기화는 1-2초라 12초면 오검출이 없다.
+    INIT_WATCHDOG_S = 12.0
     # 워치독이 발동하면 이 파일에 스택이 남는다. faulthandler는 종료코드를 1로
     # 고정하므로(커스텀 불가), run_e0.sh는 **이 파일이 비어 있지 않은지**로
     # 데드락을 판별하고 재시도한다.
@@ -615,6 +622,51 @@ class Controller:
     # LowState 가 흐르는 것을 확인할 때까지 명령 채널을 열지 않는다. 정상이면
     # 500 Hz 라 즉시 통과한다. 3초면 "안 온다" 를 오검출하지 않는다.
     LOWSTATE_GATE_S = 3.0
+
+    def _arm_init_watchdog(self):
+        """GIL 데드락에 하드 타임아웃을 건다. 초기화 **전 구간**을 덮는다.
+
+        ⛔ 2026-08-09. 예전에는 이것이 `low_state_subscriber.InitChannel()` **한
+        호출만** 감쌌다. 그런데 데드락 창은 거기서 끝나지 않는다:
+
+          구독자 InitChannel 이 끝나면 **DDS 콜백 스레드가 500 Hz 로 GIL 을 요구
+          하기 시작한다.** 그 상태에서 `ModeMonitor`/`FallMonitor`/`RosGoalSource`
+          가 `rclpy.init()` 과 `Node()` 를 부르면 그쪽이 C 에서 GIL 을 쥔 채
+          블록한다 -- 같은 순환 대기가 **새 자리에서** 성립한다.
+
+        2026-08-09 실기에서 정확히 이것이 났다: `[init] LowState 확인됨` 다음 줄부터
+        아무것도 안 찍히고 **Ctrl-C 도 안 먹었다**(시그널 핸들러는 바이트코드
+        사이에서만 도는데 인터프리터가 멈춰 있다). `SIGKILL` 로만 죽었다.
+
+        ⚠️ 왜 그동안 안 터졌나: 직전 실행들은 **LowState 가 아예 안 와서** 콜백
+        스레드가 놀고 있었다. 로봇이 고장 나 있던 것이 데드락을 우연히 피하게 해
+        줬다. 로봇이 정상으로 돌아오자마자 드러났다 -- 경합이라 "대개는 통과" 한다.
+
+        `faulthandler` 의 워치독은 **C 스레드**라 GIL 없이 발동해 `_exit()` 한다.
+        `signal.alarm` 도 `threading.Timer` 도 둘 다 GIL 이 필요해서 안 된다.
+        """
+        import faulthandler
+        # 파일은 열어둔 채로 둔다 -- _exit()는 버퍼를 안 비우므로 워치독이 직접
+        # 쓸 수 있게 살아 있어야 한다. 통과하면 _disarm 이 지운다.
+        self._init_wd_file = open(self.INIT_DEADLOCK_LOG, "w")
+        faulthandler.dump_traceback_later(
+            self.INIT_WATCHDOG_S, file=self._init_wd_file, exit=True)
+
+    def _disarm_init_watchdog(self):
+        """초기화가 rclpy 까지 다 지나갔다. 흔적을 지운다."""
+        import faulthandler
+        faulthandler.cancel_dump_traceback_later()
+        wd = getattr(self, "_init_wd_file", None)
+        if wd is not None:
+            try:
+                wd.close()
+            except Exception:
+                pass
+            self._init_wd_file = None
+        try:
+            os.remove(self.INIT_DEADLOCK_LOG)   # run_e0.sh 는 이 파일로 판별한다
+        except OSError:
+            pass
 
     def _init_communication(self) -> None:
         """SDK 채널을 연다. InitChannel의 GIL 데드락에 하드 타임아웃을 건다.
@@ -651,14 +703,10 @@ class Controller:
             # 데드락은 여기서만 난다. 창을 정확히 이 호출로 좁힌다.
             # 파일은 열어둔 채로 둔다 -- _exit()는 버퍼를 안 비우므로 워치독이
             # 직접 쓸 수 있게 살아 있어야 한다. 통과하면 아래에서 지운다.
-            wd = open(self.INIT_DEADLOCK_LOG, "w")
-            faulthandler.dump_traceback_later(self.INIT_WATCHDOG_S, file=wd, exit=True)
-            try:
-                self.low_state_subscriber.InitChannel()
-            finally:
-                faulthandler.cancel_dump_traceback_later()
-            wd.close()
-            os.remove(self.INIT_DEADLOCK_LOG)   # 통과 -- 흔적을 남기지 않는다
+            # ⛔ 워치독은 여기서 **풀지 않는다.** `__init__` 이 rclpy 노드를 다
+            # 세운 뒤에 `_disarm_init_watchdog()` 이 푼다. 이유는 그 함수 참조.
+            self._arm_init_watchdog()
+            self.low_state_subscriber.InitChannel()
 
             # ⛔⛔ 2026-08-09. **LowState 가 실제로 흐르는 것을 확인하기 전에는
             # 명령 채널을 열지 않는다.**
@@ -696,6 +744,12 @@ class Controller:
             self.low_cmd_publisher.InitChannel()
             self.client.Init()
         except Exception as e:
+            # ⛔ 워치독을 반드시 푼다. 안 풀면 12초 뒤 `_exit()` 하면서 데드락
+            # 로그를 남기고, `run_e0.sh` 가 그것을 데드락으로 읽어 **5번 재시도**
+            # 한다 -- "LowState 가 안 온다" 같은 정상적이고 명확한 실패가 재시도
+            # 루프에 묻힌다. 데드락은 여기까지 못 오므로(예외가 안 난다) 이 경로
+            # 에서 푸는 것이 안전하다.
+            self._disarm_init_watchdog()
             self.logger.error(f"Failed to initialize communication: {e}")
             raise
 
