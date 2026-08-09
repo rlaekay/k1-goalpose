@@ -229,16 +229,77 @@ def holm(pvals):
     return out
 
 
+def noise_table(roots):
+    """**축별 노이즈 바닥 표.** arm 을 가로질러 한 번에 낸다. GPU 0.
+
+    C53 이 난 이유는 위치오차 축의 노이즈(4.38 %)를 **속도 축에 옮겨 쓴** 것이다.
+    축마다 재현성이 9배까지 다르므로 한 숫자를 공유하면 조밀한 축의 진짜 차이가
+    지워진다. 5시드가 이미 있으니 계산은 공짜다 -- **같은 값을 두 경로로 계산하지
+    않으려고** 여기 한 벌만 둔다(MJC 와 합의, 2026-08-09).
+    """
+    import glob as _g
+    print("=" * 104)
+    print("축별 노이즈 바닥 (시드 산포)   -- 판정선은 **이 표에서** 가져와라")
+    print("=" * 104)
+    print("{:<34}{:<22}{:>9}{:>9}{:>10}{:>10}".format(
+        "라벨 / 축", "지표", "n", "평균", "시드SD%", "판별선%"))
+    print("-" * 104)
+    for root in roots:
+        for d in sorted(_g.glob(os.path.join(root, "*"))):
+            if not os.path.isdir(d):
+                continue
+            for axis in ("accuracy", "walk"):
+                reps = load_reports([os.path.join(d, "seed*." + axis)])
+                if len(reps) < 2:
+                    continue
+                for name, fn, kind in METRICS:
+                    if kind != "cont":
+                        continue
+                    vals = [fn(r) for r in reps]
+                    vals = [v for v in vals if v is not None and v == v]
+                    if len(vals) < 2:
+                        continue
+                    arr = np.asarray(vals, float)
+                    mean, sd = float(arr.mean()), float(arr.std(ddof=1))
+                    if not mean:
+                        continue
+                    rel = 100.0 * sd / abs(mean)
+                    line = 100.0 * (2.0 * sd * np.sqrt(2.0 / len(arr))) / abs(mean)
+                    q = ""
+                    for step in (0.01, 0.1, 1.0):
+                        if np.allclose(arr / step, np.round(arr / step), atol=1e-9):
+                            qsd = 100.0 * (step / (12 ** 0.5)) / abs(mean)
+                            q = " ⚠️눈금{:g}({:.2f}%p)".format(step, qsd)
+                            break
+                    print("{:<34}{:<22}{:>9}{:>9.4g}{:>10.2f}{:>10.2f}{}".format(
+                        (os.path.basename(d) + "/" + axis)[:33], name[:21],
+                        len(arr), mean, rel, line, q))
+    print()
+    print("읽는 법:")
+    print("  * `판별선%` = 5시드 평균끼리 비교할 때의 2SE. **관측차가 이보다 작으면 말하지 마라.**")
+    print("  * ⚠️눈금 = 값이 전부 그 배수다. 괄호 안이 양자화만으로 생기는 SD 기여분이고,")
+    print("    그것이 시드SD 에 육박하면 **그 지표로는 노이즈 바닥을 못 잰다.**")
+    print("  * ⛔ 한 축의 바닥을 다른 축에 옮겨 쓰지 마라 -- 그것이 C53 이다.")
+    return 0
+
+
 # ---------------------------------------------------------------- 출력
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--a", nargs="+", required=True, help="A 쪽 리포트 디렉터리 glob")
-    ap.add_argument("--b", nargs="+", required=True, help="B 쪽 리포트 디렉터리 glob")
+    ap.add_argument("--noise-table", nargs="*", default=None,
+                    help="축별 노이즈 바닥 표만 낸다(기본 root: logs/eval_rounds/v2). --a/--b 불필요")
+    ap.add_argument("--a", nargs="+", help="A 쪽 리포트 디렉터리 glob")
+    ap.add_argument("--b", nargs="+", help="B 쪽 리포트 디렉터리 glob")
     ap.add_argument("--label-a", default="A")
     ap.add_argument("--label-b", default="B")
     ap.add_argument("--primary", default=None,
                     help="사전등록한 1차 엔드포인트 이름. 이것만 보정 없이 읽는다")
     args = ap.parse_args()
+
+    if args.noise_table is not None:
+        return noise_table(args.noise_table or ["logs/eval_rounds/v2"])
+    if not args.a or not args.b:
+        sys.exit("--a 와 --b 가 필요하다 (또는 --noise-table).")
 
     A, B = load_reports(args.a), load_reports(args.b)
     if not A or not B:
