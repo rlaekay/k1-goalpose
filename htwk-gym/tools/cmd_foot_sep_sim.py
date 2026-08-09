@@ -139,7 +139,20 @@ def process(path, model, data, guard_steps):
     z = np.load(path, allow_pickle=True)
     idx = leg_index_map(z["dof_names"])
     scale = float(z["action_scale"])
+    # ⛔ `env.default_dof_pos` 는 Isaac 에서 **(1, num_dofs)** 다(env 축으로 브로드캐스트
+    # 하려고). 그대로 `[None, None, :]` 하면 (1,1,1,D) 가 되어 (T,K,D) 와 4차원으로
+    # 조용히 브로드캐스트되고, 그 뒤 인덱싱이 **엉뚱한 축**을 집는다. 모양 검사가
+    # 없었으면 숫자가 나왔을 것이고 그 숫자는 전부 쓰레기였을 것이다.
     default = np.asarray(z["default_dof_pos"], dtype=np.float64)
+    if default.ndim == 2:
+        if default.shape[0] != 1 and not np.allclose(default, default[0:1]):
+            raise SystemExit("default_dof_pos 의 env 행이 서로 다르다 {} -- "
+                             "명령 재구성이 env 마다 달라야 한다.".format(default.shape))
+        default = default[0]
+    default = default.reshape(-1)
+    if default.size != np.asarray(z["actions"]).shape[-1]:
+        raise SystemExit("default_dof_pos {} 와 actions 마지막 축 {} 가 안 맞는다".format(
+            default.size, np.asarray(z["actions"]).shape[-1]))
     actions = np.asarray(z["actions"], dtype=np.float64)      # [T, k, nA] 클립 적용됨
     dof_pos = np.asarray(z["dof_pos"], dtype=np.float64)      # [T, k, nJ]
     done = np.asarray(z["done"])

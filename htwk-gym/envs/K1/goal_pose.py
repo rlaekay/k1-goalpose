@@ -1734,15 +1734,38 @@ class GoalPose(BaseTask):
         56.9도(MuJoCo -0.4도 / 22.6도)다. 한쪽만 벌하면 반대쪽으로 밀려난다.
 
         `get_feet_offset`의 y는 이미 `feet_distance_ref`를 뺀 상대 오프셋이므로,
-        절대 간격은 `|y + ref|`다. 좁아지는 쪽은 발 너비(`feet_min_gap`)를, 넓어지는
+        간격은 `y + ref`다. 좁아지는 쪽은 발 너비(`feet_min_gap`)를, 넓어지는
         쪽은 `feet_max_gap`을 넘은 만큼만 벌한다. 그 사이에서는 정확히 0이라 기존
         보상과 충돌하지 않는다 -- 자세 목표가 아니라 **안전 구간 제약**이다.
+
+        ⛔⛔ **2026-08-09 수정 -- 이 보상은 만들어진 이래 교차를 벌한 적이 없다.**
+        원래 식이 `gap = torch.abs(feet_y_offset + feet_distance_ref)` 였는데,
+        그 `abs()` 가 **교차와 정상 자세를 구별하는 유일한 정보인 부호를 지운다.**
+        결과가 정확히 반대였다 -- 벌칙이 발간격 0 에서 최대이고 **교차가 깊어질수록
+        0 으로 사라진다**:
+
+            부호 있는 간격  +0.19 -> 0.000   (정상)
+                             0.00 -> 0.070   (발 접촉, 최대)
+                            -0.15 -> **0.000**  <- 15 cm 교차인데 무벌칙
+                            -0.20 -> **0.000**  <- 위 docstring 이 인용한 실기 p1 이 여기다
+                            -0.30 -> 0.040   ("너무 벌어짐" 으로 오분류
+
+        즉 **깊게 교차할수록 덜 벌받는다.** sim 물리도 깊은 교차를 통과시키므로
+        (위 -20.6 cm 접촉 0건) 정책 입장에서 깊은 교차는 **물리적으로도 보상적으로도
+        공짜**였다. `N3_pathcross`(가중치 -20)가 대조군 `N1_path` 보다 오히려 **좁게
+        지령한다**(명령 p1 +0.049 대 +0.087, 5시드 전부)는 측정이 이 결함을 드러냈다.
+
+        부호를 살린다. `foot_names` 가 `[left, right]` 이므로
+        `feet_pos[:,0]-feet_pos[:,1]` 는 **left-right** 이고 정상 자세에서 **양수**다
+        (`get_feet_offset` docstring 의 "right - left" 는 틀렸다).
         """
         _, feet_y_offset = self.get_feet_offset()
-        gap = torch.abs(feet_y_offset + self.cfg["rewards"]["feet_distance_ref"])
+        # ⛔ `abs()` 를 쓰지 마라. 부호가 곧 교차 여부다.
+        sep = feet_y_offset + self.cfg["rewards"]["feet_distance_ref"]
         lo = self.cfg["rewards"].get("feet_min_gap", 0.07)   # 발 너비 = 0.07 m
         hi = self.cfg["rewards"].get("feet_max_gap", 0.26)   # 실기 median 0.14 + 여유
-        return torch.clip(lo - gap, min=0.0) + torch.clip(gap - hi, min=0.0)
+        # 좁아지는 쪽 벌칙이 이제 **교차 깊이에 비례해 커진다**(sep 이 음수면 lo-sep > lo).
+        return torch.clip(lo - sep, min=0.0) + torch.clip(sep - hi, min=0.0)
 
     def _reward_feet_air_time(self):
         """Reward the swing duration that actually occurred, at touchdown.
