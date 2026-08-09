@@ -36,8 +36,12 @@
 # goal_rel_y, heading_error) in the robot-local frame and outputs 12 leg joint
 # targets. See ROBOT_DEPLOY_E0_GUIDE.md and envs/K1/Goal_Pose_V7.yaml.
 #
-# 23-joint order: indices 0..10 = arms/head/waist (NOT policy-controlled),
-#                 indices 11..22 = legs (the 12 policy DOFs).
+# ⛔ 22-joint order (this K1 has NO waist -- joint_cnt: 22 below):
+#     indices 0..9  = head/arms (NOT policy-controlled)
+#     indices 10..21 = legs (the 12 policy DOFs; policy.leg_dof_start: 10)
+# 예전 주석은 "23관절, 다리 11..22" 라고 말했다 -- SDK 상수(B1JointCnt=23, 허리 있음)
+# 기준이라 이 로봇이 아니다. 그 오해가 첫 하드웨어 기동을 죽였다
+# (deploy/utils/command.py:5-14). 실측 지문: parallel 관측 [14,15,20,21].
 
 common:
   dt: 0.002
