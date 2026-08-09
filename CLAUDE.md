@@ -75,8 +75,17 @@ Agent/Task 를 띄울 때 **`model: sonnet`** 을 명시한다. 예외 없다. �
 >   **[VENDOR_ACTUATOR_SPEC_K1.md](VENDOR_ACTUATOR_SPEC_K1.md)**:
 >   힙 0.0283~0.0478 / **무릎 0.0956** / 발목 0.0565 / 팔 0.001.
 >   ⛔ `Get_Up.yaml` 의 *"official Booster USD value 0.02"* 는 **틀렸다**(C33).
->   ⭐ 그리고 벤더는 **게인을 armature 에서 유도**한다 — `kp = armature·(2π·4Hz)²`.
->   **게인과 armature 는 한 쌍이다.** → `NQ_armvendor`(= NP + 벤더값, 레버 하나) 큐에 있다.
+>   ⛔ ~~벤더가 게인을 armature 에서 유도하므로 **게인과 armature 는 한 쌍이다**~~ →
+>   **철회(2026-08-09, Teacher 지적 + 내 독립 확인).** `kp = armature·(2π·4Hz)²` 는
+>   **벤더 컨트롤러의 튜닝 레시피**이지 우리 로봇 게인의 서술이 아니다.
+>   **학습(`Goal_Pose_V7.yaml:148-149`)과 배포(`Goal_Pose_E0.yaml` 다리)가 이미 정확히
+>   같다** — Hip/Knee **100**, Ankle **50**, kd 2/2/1. ⇒ **게인에는 sim2real 격차가 없다.**
+>   학습에 벤더 유도식을 적용하면 Hip 30.2/Knee 60.4/Ankle 35.7 로 가는데 **로봇은 계속
+>   100/50 을 받으므로 없던 격차를 만든다.** ⛔ 격차는 **armature 하나**다.
+>   ⭐ 단 **게인이 같아도 그 게인이 작용하는 플랜트가 다르다** — 학습은 armature 0
+>   (로터 관성 없음), 실물은 0.0283~0.0956 ⇒ **같은 kp 가 다른 폐루프 응답**을 낸다.
+>   그것이 armature 가 1순위인 이유다. `NQ_armvendor`(= NP + `armature_by_joint` 만,
+>   레버 하나) **학습 6000 완주, 5시드 채점 중**(2026-08-09).
 > - **도는 것 (2026-08-09 11:2x)**: 학습은 **전부 끝났다**(`NQ_armvendor`·`NR_protect`
 >   6000/6000 완주). 지금 도는 것은 **채점 4건**이다 —
 >   `160-eval5_NQ`(gpu0) · `161-eval5_NR`(gpu1, 대기) ·
