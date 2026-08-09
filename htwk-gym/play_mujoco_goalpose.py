@@ -70,6 +70,26 @@ DEPLOY_CFG = "deploy/configs/Goal_Pose_E0.yaml"
 # 학습이 실제로 쓰는 상한(K1_locomotion_armsdown.urdf의 effort). 다리 12개, 좌우 동일.
 URDF_LEG_EFFORT = [30.0, 20.0, 20.0, 40.0, 20.0, 15.0] * 2
 
+# ---- armature (기어박스 뒤 로터 관성) ------------------------------------
+# ⛔ 세 자산이 서로 다르고, **어느 것도 벤더 값이 아니었다.**
+#   Isaac `Goal_Pose_V7.yaml`  : asset.armature 0.0  -> 전 관절 0
+#   MuJoCo `K1_serial.xml`     : 발목 0.05, **힙·무릎은 속성 없음 = 0**
+#   벤더 공식(booster_train)   : 무릎 0.0956 이 최대값이다
+# 즉 `--leg-armature 0.05` 같은 스칼라로는 벤더 분포를 만들 수 없고, MJCF 기본값은
+# "armature 를 켰다"가 아니라 **"발목에만 켰다"** 이다.
+# 출처: VENDOR_ACTUATOR_SPEC_K1.md §1 (booster_train actuator.py / booster.py).
+# 발목은 평행기구 래퍼가 armature_ratio 2.0 을 곱한 뒤의 값이다.
+VENDOR_ARMATURE = {
+    "Hip_Pitch": 0.047813, "Hip_Roll": 0.033955, "Hip_Yaw": 0.028253,
+    "Knee_Pitch": 0.095625, "Ankle_Pitch": 0.056506, "Ankle_Roll": 0.056506,
+}
+# ⚠️ 벤더는 게인을 armature 에서 **유도**한다: kp = armature*(2*pi*4Hz)^2,
+# kd = 2*zeta*armature*(2*pi*4Hz), zeta 1.5(무릎만 1.0). armature 만 옮기고 kp 를
+# 그대로 두면 벤더 관점에서 짝이 안 맞는 조합이다 -- `--vendor-gains` 로 같이 옮긴다.
+VENDOR_FN_HZ = 4.0
+VENDOR_ZETA = {"Knee_Pitch": 1.0}
+VENDOR_ZETA_DEFAULT = 1.5
+
 
 def quat_to_mat(q):
     """MuJoCo qpos[3:7]은 (w, x, y, z)다."""
@@ -271,6 +291,18 @@ def main():
                          "시뮬레이터가 발목만 다른 로봇을 돌렸다. 0 으로 맞추면 Isaac 의 "
                          "발목 roll 분포(평균 7.5-12.8 rad/s, 한계 초과 27-55 %%)가 "
                          "재현되는지가 이 플래그로 갈린다.")
+    ap.add_argument("--armature-preset", choices=["asset", "vendor", "zero"], default="asset",
+                    help="다리 armature 를 관절별로 정한다. asset=MJCF 그대로"
+                         "(발목 0.05, **힙·무릎 0**), vendor=벤더 공식값"
+                         "(무릎 0.0956 이 최대), zero=Isaac 과 같은 전 관절 0. "
+                         "⛔ --leg-armature 는 스칼라라 벤더 분포를 만들 수 없다. "
+                         "학습 세션 측정: 채점 물리만 armature 로 바꿔도 낙상간격이 "
+                         "1.5 s 와 3,740 s 로 갈린다 -- 이 축을 고정하지 않은 대조는 "
+                         "그 차이를 통째로 물려받는다.")
+    ap.add_argument("--vendor-gains", action="store_true",
+                    help="벤더 관계식으로 다리 kp/kd 를 armature 에서 유도한다"
+                         " (kp = J*(2*pi*4)^2, kd = 2*zeta*J*(2*pi*4), zeta 1.5/무릎 1.0)."
+                         " armature 만 옮기고 게인을 두면 벤더 관점에서 짝이 안 맞는다.")
     ap.add_argument("--dump-csv", default=None,
                     help="실기 deploy --log-timing과 **동일한 컬럼**으로 매 정책 tick을 "
                          "남긴다. 가설 없이 두 로그를 같은 축에 겹쳐 보기 위한 것이다.")
@@ -300,6 +332,20 @@ def main():
     kp = np.array(cfg["common"]["stiffness"], dtype=np.float64)
     kd = np.array(cfg["common"]["damping"], dtype=np.float64)
     # 관절 인덱스: 다리 10..21 = [HipP,HipR,HipY,Knee,AnkP,AnkR] x 2
+    LEG_ORDER = ["Hip_Pitch", "Hip_Roll", "Hip_Yaw",
+                 "Knee_Pitch", "Ankle_Pitch", "Ankle_Roll"] * 2
+    if args.vendor_gains:
+        # kp = J*(2*pi*f_n)^2, kd = 2*zeta*J*(2*pi*f_n). 다른 배수 플래그보다 **먼저**
+        # 적용해서, --ankle-gain 같은 레버가 이 위에 얹히게 한다(순서를 바꾸면
+        # 그 레버들이 조용히 무시된다).
+        w = 2.0 * math.pi * VENDOR_FN_HZ
+        for k, name in enumerate(LEG_ORDER):
+            J = VENDOR_ARMATURE[name]
+            z = VENDOR_ZETA.get(name, VENDOR_ZETA_DEFAULT)
+            kp[10 + k] = J * w * w
+            kd[10 + k] = 2.0 * z * J * w
+        print("벤더 유도 게인: kp %s / kd %s"
+              % (np.round(kp[10:16], 1), np.round(kd[10:16], 2)))
     if args.ankle_gain != 1.0:
         for i in (14, 15, 20, 21):
             kp[i] *= args.ankle_gain; kd[i] *= args.ankle_gain
@@ -333,6 +379,22 @@ def main():
         print("발 관성: 벤더 MJCF 값 (학습 URDF와 다르다 -- 2.7-9.4배 작고 물리적으로 유효)")
 
     model = mujoco.MjModel.from_xml_path(mjcf_path)
+    if args.armature_preset != "asset":
+        shown = []
+        for j in range(model.njnt):
+            jn = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j) or ""
+            key = next((k for k in VENDOR_ARMATURE if k in jn), None)
+            if key is None:
+                continue
+            v = 0.0 if args.armature_preset == "zero" else VENDOR_ARMATURE[key]
+            old = float(model.dof_armature[model.jnt_dofadr[j]])
+            model.dof_armature[model.jnt_dofadr[j]] = v
+            if jn.startswith("Left"):
+                shown.append("%s %.4f->%.4f" % (key, old, v))
+        if len(shown) != 6:
+            raise SystemExit("armature 프리셋: 왼다리 6관절을 못 찾았다 (%d개) -- "
+                             "자산의 관절 이름이 바뀌었다" % len(shown))
+        print("armature 프리셋 %s: %s" % (args.armature_preset, " | ".join(shown)))
     if args.leg_armature is not None:
         n_changed = 0
         for j in range(model.njnt):
@@ -475,6 +537,11 @@ def main():
     # 실기와 같은 지표를 낸다: 관절별 |tau| 분위수와 부호전환 횟수.
     tau_hist = [[] for _ in range(nj)]
     hiproll_hist = []
+    foot_sep = []
+    foot_bid = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "%s_foot_link" % s)
+                for s in ("left", "right")]
+    if any(b < 0 for b in foot_bid):
+        raise SystemExit("발 링크를 못 찾았다: left/right_foot_link")
     dump_fp = None
     if args.dump_csv:
         os.makedirs(os.path.dirname(args.dump_csv) or ".", exist_ok=True)
@@ -600,6 +667,15 @@ def main():
         data.ctrl[:] = applied
         applied_prev = applied.copy()
         hiproll_hist.append((float(q[11]), float(q[17])))
+        # ---- 부호 있는 좌우 발 간격 (학습 세션 요청) -----------------------
+        # ⛔ 절대값을 쓰면 다리 교차가 **원리적으로 안 보인다**, 그리고 평균으로도
+        # 안 보인다(교차는 스윙 한순간이라 평균 18~21 cm 에 묻힌다). 그래서 부호를
+        # 유지한 채 **롤아웃 전체**를 누산하고 최소값과 초과 체류율로 읽는다.
+        # 몸통 yaw 프레임의 y 성분: 양수=정상, 음수=교차.
+        if it % 5 == 0:
+            _d = data.xpos[foot_bid[0]][:2] - data.xpos[foot_bid[1]][:2]
+            _c, _s = math.cos(-yaw), math.sin(-yaw)
+            foot_sep.append(float(_s * _d[0] + _c * _d[1]))
         for k in range(nj):
             a = float(applied[k])
             tau_hist[k].append(abs(a))
@@ -712,6 +788,20 @@ def main():
             "flips_per_s": round(tau_flips[10+k]/max(args.duration,1e-9),1),
         }
     res["torque"] = tq
+    if foot_sep:
+        fs = np.array(foot_sep)
+        # 발 폭 7.0 cm = 충돌 box 의 폭(§8-45 부수 발견). 그 아래면 두 발이 겹친다.
+        res["foot_sep_m"] = {
+            "min": round(float(fs.min()), 4),
+            "p1": round(float(np.percentile(fs, 1)), 4),
+            "median": round(float(np.median(fs)), 4),
+            "mean": round(float(fs.mean()), 4),
+            "share_below_0p07": round(float((fs < 0.07).mean()), 6),
+            "share_negative": round(float((fs < 0.0).mean()), 6),
+            "n": int(fs.size),
+        }
+    res["armature_preset"] = args.armature_preset
+    res["vendor_gains"] = bool(args.vendor_gains)
     if hiproll_hist:
         hl = np.array([h[0] for h in hiproll_hist]); hr = np.array([h[1] for h in hiproll_hist])
         res["hip_roll_deg"] = {
