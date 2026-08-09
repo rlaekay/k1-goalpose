@@ -47,6 +47,19 @@ fi
 cp "$CFG" "$OUT/protocol.cfg.yaml"
 echo "체크포인트: $(readlink -f "$CKPT")"
 
+# ⛔ **라벨은 기록이 아니다.** 라벨은 사람이 짓고 사람이 오해한다 -- 2026-08-09 에
+# `N1_path_cross` 가 실제로는 대조군 `N1_path` 인데 MJC 가 `N3_pathcross` 로 읽을
+# 뻔했고, 그러면 레버 효과의 **부호가 뒤집힌다**(분석 세션이 잡았다). 리포트마다
+# `checkpoint` 가 들어 있지만 그건 열어 봐야 보이고, 디렉터리를 훑는 사람은 못 본다.
+# ⇒ 디렉터리가 **스스로를 설명하게** 한다. 라벨을 잘못 지어도 여기서 걸린다.
+cat > "$OUT/WHICH_ARM.txt" <<EOF
+라벨      : $LABEL      <- ⛔ 라벨을 arm 이름으로 읽지 마라
+run       : $RUN
+체크포인트: $(readlink -f "$CKPT")
+채점 config: ${EVAL_CFG:-공통 sweeps/N0_ctrl.yaml + 관측 인터페이스 이식}
+생성      : $(date '+%Y-%m-%d %H:%M:%S')
+EOF
+
 run_one () {          # $1 = seed, $2 = axis(accuracy|walk)
     local seed="$1" axis="$2" dest="$OUT/seed${1}.${2}" pattern="" dump=""
     [ "$axis" = "walk" ] && pattern="--goal_pattern forward_hold"
