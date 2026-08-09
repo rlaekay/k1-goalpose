@@ -309,6 +309,22 @@ def main():
                          "학습 세션 측정: 채점 물리만 armature 로 바꿔도 낙상간격이 "
                          "1.5 s 와 3,740 s 로 갈린다 -- 이 축을 고정하지 않은 대조는 "
                          "그 차이를 통째로 물려받는다.")
+    # ---- 발목 roll 관측 오염 주입 (배포 세션 §8-69 요청) -------------------
+    # 실기 `motor_state_serial` 의 발목 roll 2채널이 **표본이 교체된** 값을 섞어 보내고
+    # (직전 값과 무상관, 42~53 %가 다음 틱에 되돌아옴, 물리 스톱 밖에 착지),
+    # `deploy_goal_pose.py:895-897` 이 그것을 여과 없이 policy 관측으로 넘겼다.
+    # 보행 중 **왼발목 44 % / 오른발목 21 %** 가 오염된 관측이었다.
+    # ⛔ 물리에는 안 건다 -- 온보드 PD 는 모터 자기 인코더를 쓰므로 오염은 **정책이
+    # 보는 값**에만 걸리는 것이 맞다. 그 비대칭이 이 셀의 요점이다.
+    ap.add_argument("--corrupt-lankr", type=float, default=0.0,
+                    help="왼발목 roll 관측을 이 확률로 무상관 표본으로 교체 (실기 0.44)")
+    ap.add_argument("--corrupt-rankr", type=float, default=0.0,
+                    help="오른발목 roll 관측을 이 확률로 교체 (실기 0.21)")
+    ap.add_argument("--corrupt-q-range", type=float, default=0.47,
+                    help="교체 표본 q 의 균일분포 반폭(rad). 실기 관측 범위 ±0.47.")
+    ap.add_argument("--corrupt-dq-range", type=float, default=33.0,
+                    help="교체 표본 dq 의 균일분포 반폭(rad/s). 실기 |dq| max 32.8. "
+                         "0 이면 q 만 오염시킨다(보수적 하한).")
     ap.add_argument("--ankle-armature", type=float, default=None,
                     help="발목 4관절 armature 만 이 값으로 (프리셋 **뒤**에 적용). "
                          "발목 roll |dq| 는 이 값이 단독으로 지배한다 -- 실측: "
@@ -642,6 +658,7 @@ def main():
     ff_prev = False
     ff_depth_min = 0.0
     ff_recent = []
+    corrupt_n = 0
     stand_tilt, stand_drift = [], []
     px0 = py0 = 0.0          # stand 모드의 기준점: 첫 스텝의 위치
     t = 0.0
@@ -699,8 +716,20 @@ def main():
             # sim 모드면 물리 시간이 그대로 가고(팽창 없음), counter 모드면 틱당
             # nominal 만 가므로 벽시계 케이던스가 nominal/wall_dt 배로 줄어든다.
             clock_arg = clk if args.clock_mode == "counter" else t
+            # 발목 roll 관측 오염. 물리가 아니라 **정책이 읽는 값**에만 건다.
+            obs_q = q + joint_bias
+            if args.corrupt_lankr > 0.0 or args.corrupt_rankr > 0.0:
+                obs_q = obs_q.copy()
+                obs_dq = obs_dq.copy()
+                for _j, _p in ((15, args.corrupt_lankr), (21, args.corrupt_rankr)):
+                    if _p > 0.0 and rng.random() < _p:
+                        corrupt_n += 1
+                        obs_q[_j] = rng.uniform(-args.corrupt_q_range, args.corrupt_q_range)
+                        if args.corrupt_dq_range > 0.0:
+                            obs_dq[_j] = rng.uniform(-args.corrupt_dq_range,
+                                                     args.corrupt_dq_range)
             targets = policy.inference(
-                clock_arg, (q + joint_bias).astype(np.float32), obs_dq.astype(np.float32),
+                clock_arg, obs_q.astype(np.float32), obs_dq.astype(np.float32),
                 obs_w.astype(np.float32), obs_g.astype(np.float32),
                 grx, gry, herr)
             clk += cnt_dt
@@ -999,6 +1028,10 @@ def main():
             "final": round(float(lp[-1]), 4),
             "delta": round(float(np.median(lp[-k:]) - np.median(lp[:k])), 4),
         }
+    res["obs_corrupt"] = {
+        "l_share": args.corrupt_lankr, "r_share": args.corrupt_rankr,
+        "injected": corrupt_n,
+    }
     res["foot_foot"] = {
         "episodes": ff_episodes,
         "per_min": round(ff_episodes / max(args.duration / 60.0, 1e-9), 1),
