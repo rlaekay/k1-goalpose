@@ -81,7 +81,9 @@ class GoalPosePolicy:
 
         self.gait_frequency = float(c["gait_frequency"])
         # 시계 팽창 재현 레버. config `policy.gait_clock_scale`, 기본 1.0(no-op).
-        # 0.79 = 구 빌드 실측 팽창(§8-59). 위상 적분의 dt 에만 곱한다.
+        # 실기 실측(총위상/총시간, §8-70): 붕괴 실행 0.756 / "성공" 실행 0.791.
+        # ⛔ 0.79 를 양성 대조로 쓰지 마라 -- 그건 성공한 실행의 시계다.
+        # 위상 적분의 dt 에만 곱한다.
         self._clock_scale = float(c.get("gait_clock_scale", 1.0))
         self.gait_process = 0.0
         self._last_time = None

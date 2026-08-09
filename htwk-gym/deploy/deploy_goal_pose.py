@@ -2349,9 +2349,9 @@ if __name__ == "__main__":
                              "for this many seconds before the gait prompt. Tells drift "
                              "(no position servo) apart from oscillation (under-damped).")
     parser.add_argument("--gait-clock-scale", type=float, default=1.0,
-                        help="gait 위상 적분 dt 에 곱하는 배율. 0.79 = 구 빌드의 실측 "
-                             "시계 팽창(§8-59) 재현. 시계 가설 30초 시험의 B 실행 전용. "
-                             "기본 1.0 = no-op.")
+                        help="gait 위상 적분 dt 에 곱하는 배율. 실기 실측(총/총): "
+                             "붕괴 0.756 / 성공 0.791. 시계 검정 B1=0.756(결정적), "
+                             "B2=0.79(성공 재현, 검정력 낮음). 기본 1.0 = no-op.")
     parser.add_argument("--rate-fixed-filter", action="store_true",
                         help="관절 목표 필터를 루프 속도와 무관하게 만든다. 고정 계수 0.2는 "
                              "500 Hz 발행을 가정한 값이라 시정수 10 ms를 의도한 것인데, "
