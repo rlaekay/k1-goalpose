@@ -99,42 +99,48 @@ def replay(path, qcols):
 
 
 QC = ["q%d" % i for i in range(12)]
-STOP = 0.40
 
-print("T6 실기 서기 로그 재생: 오염 표본을 잡고, 조용한 구간은 안 건드린다")
-p = os.path.join(REAL, "2026-08-09_t_stand_i3b.csv")
-if os.path.exists(p):
+# ⛔⛔ 재생 테스트가 무엇을 **못** 하는지 먼저 못 박는다.
+#
+# 게이트는 LowState 콜백(≈380 Hz, dt 2.6 ms)에서 돈다. 거기서 예산은
+# 30 × 0.0026 = **0.078 rad** 이다. 그런데 `realdata/` CSV 는 **정책 주기
+# (25 ms)로 내려찍은 것**이라 재생하면 예산이 30 × 0.025 = **0.75 rad** 이 된다.
+# 즉 재생은 게이트를 **실제보다 10배 느슨한 조건**에서 돌린다 -- 관측된 도약
+# 0.2~0.8 rad 의 대부분이 통과해 버린다. 이것은 게이트의 결함이 아니라
+# **우리에게 LowState 율 관절 로그가 없다**는 사실이다(MJC 가 요청한 그 측정).
+#
+# 그래서 재생으로는 "얼마나 잡나"를 주장하지 않는다. 재생이 **정말로** 검사할
+# 수 있는 것은 불변식 둘뿐이고, 그 둘만 본다:
+#   T6 통과한 출력에는 예산을 넘는 표본이 남지 않는다 (연속거부 상한 탈출 제외)
+#   T7 거부가 발목 roll 두 채널에 **국소적**이다 -- 다른 10채널을 안 건드린다
+# 진짜 효과 검증은 LowState 율 로그가 생긴 뒤에 한다. 그 전까지 미완이다.
+print("⚠️ 재생은 정책주기(25 ms) 로그라 게이트를 실제(2.6 ms)보다 10배 느슨하게 건다.")
+print("   '얼마나 잡나'는 이 테스트로 주장하지 않는다. 불변식 둘만 본다.")
+
+for label, fn in (("서기 184 s", "2026-08-09_t_stand_i3b.csv"),
+                  ("보행 run2", "2026-08-09_t_walk_i3b_run2.csv")):
+    p = os.path.join(REAL, fn)
+    if not os.path.exists(p):
+        print("  ⚠️ %s 없음 -- 건너뜀" % fn)
+        continue
     rows, kept, s = replay(p, QC)
-    # 발목 roll = q5, q11
+    # T6 불변식: 출력의 함의속도가 예산을 넘는 표본은 연속거부 상한을 탈출한
+    # 것뿐이어야 한다. 그 수는 거부 수보다 많을 수 없다.
+    viol = 0
+    for i in range(1, len(kept)):
+        dt = float(rows[i]["tick_dt_s"] or 0.0) or 1e-4
+        for j in range(12):
+            if abs(kept[i][j] - kept[i - 1][j]) > 30.0 * dt + 1e-9:
+                viol += 1
     rej_roll = int(s._dof_gate_rejected[5] + s._dof_gate_rejected[11])
-    quiet = [i for i, r in enumerate(rows) if float(r["t_s"]) < 140.0]
-    # 조용한 구간(낙상 전)에서의 거부는 오검출로 본다
-    over_before = sum(1 for r in rows if abs(float(r["q5"])) > STOP
-                      or abs(float(r["q11"])) > STOP)
-    over_after = sum(1 for k in kept if abs(k[5]) > STOP or abs(k[11]) > STOP)
-    check("T6a 발목 roll 거부가 실제로 일어난다", rej_roll > 20,
-          "거부 %d" % rej_roll)
-    check("T6b 스톱(±0.40) 밖 표본이 줄어든다", over_after < over_before * 0.5,
-          "%d → %d" % (over_before, over_after))
-    check("T6c 다른 10채널은 거의 안 건드린다",
-          int(sum(s._dof_gate_rejected)) - rej_roll <= rej_roll * 0.5,
-          "다른채널 %d 대 발목 %d"
-          % (int(sum(s._dof_gate_rejected)) - rej_roll, rej_roll))
-    print("     (참고) 조용구간 %d 행" % len(quiet))
-else:
-    print("  ⚠️ %s 없음 -- 건너뜀" % p)
+    rej_other = int(sum(s._dof_gate_rejected)) - rej_roll
+    check("T6 [%s] 출력에 남은 예산초과는 연속거부 탈출뿐" % label,
+          viol <= int(sum(s._dof_gate_rejected)),
+          "잔여 %d ≤ 거부 %d" % (viol, int(sum(s._dof_gate_rejected))))
+    check("T7 [%s] 거부가 발목 roll 에 국소적" % label,
+          rej_other <= rej_roll,
+          "발목 %d / 다른10채널 %d" % (rej_roll, rej_other))
 
-print("T7 실기 보행 로그 재생")
-p = os.path.join(REAL, "2026-08-09_t_walk_i3b_run2.csv")
-if os.path.exists(p):
-    rows, kept, s = replay(p, QC)
-    rej_roll = int(s._dof_gate_rejected[5] + s._dof_gate_rejected[11])
-    check("T7 보행 중 발목 roll 거부", rej_roll > 10, "거부 %d / %d 행"
-          % (rej_roll, len(rows)))
-else:
-    print("  ⚠️ 없음 -- 건너뜀")
-
-print("\n%s  (%d 검사, 실패 %d)"
-      % ("전부 통과" if not FAILS else "실패: " + ", ".join(FAILS),
-         5 + 4, len(FAILS)))
+print("\n%s  (실패 %d)"
+      % ("전부 통과" if not FAILS else "실패: " + ", ".join(FAILS), len(FAILS)))
 sys.exit(1 if FAILS else 0)
