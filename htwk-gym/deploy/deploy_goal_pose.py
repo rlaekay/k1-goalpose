@@ -711,6 +711,25 @@ class Controller:
         self._dof_gate_dt_hist_rej = np.zeros_like(self._dof_gate_dt_hist)
         self._dof_gate_dt_max = 0.0
 
+        # 토크 박스(학습 클램프 재현). config `safety.torque_box_limits` 가 없으면
+        # **꺼짐** -- 포화 점유율을 모르는 채로 실기 행동을 바꾸지 않는다.
+        # 값은 학습 자산의 URDF effort 여야 한다(I3b/armsdown = 30·20·20·40·20·15).
+        tb = self.cfg.get("safety", {}).get("torque_box_limits")
+        self._torque_box = None
+        self._torque_box_hits = np.zeros(n, dtype=np.int64)
+        if tb:
+            ls = int(self.cfg["policy"].get("leg_dof_start", 10))
+            if len(tb) != 12:
+                raise ValueError(
+                    "safety.torque_box_limits 는 다리 12관절이어야 한다(받은 값 %d개). "
+                    "학습 자산의 URDF effort 를 그대로 적어라." % len(tb))
+            self._torque_box = {ls + k: float(v) for k, v in enumerate(tb)}
+            self._torque_box_kp = np.asarray(self.cfg["common"]["stiffness"],
+                                             dtype=np.float64)
+            self._torque_box_kd = np.asarray(self.cfg["common"]["damping"],
+                                             dtype=np.float64)
+            self.logger.warning("[torque-box] 학습 클램프 재현 ON: %s", self._torque_box)
+
     # InitChannel 데드락을 잘라내는 시간(초). 정상 초기화는 1초 안에 끝나므로
     # 8초면 오검출이 없다.
     # 이제 구독자 InitChannel + LowState 게이트(최대 3 s) + rclpy 노드 셋을 전부
@@ -1020,6 +1039,49 @@ class Controller:
                     self.dof_tau.copy(), self.base_ang_vel.copy(),
                     self.projected_gravity.copy(), int(self._low_state_seq),
                     float(self._low_state_sample_monotonic))
+
+    def _apply_torque_box(self, target):
+        """학습의 토크 클램프를 위치명령으로 재현한다. 기본 **꺼짐**.
+
+        왜 필요한가 (트래커 §1-B, Teacher·MJC 확인):
+          * 학습은 `goal_pose.py:944` 가 `dof_torques` 를 URDF `effort` 로 **전 DOF
+            하드 클립**한다. I3b(armsdown) = 30·20·20·40·20·15.
+          * 배포는 `common.torque_limit` 이 `--parallel-torque` 경로의 발목 4관절에만
+            걸린다(`:2282-2290`). **힙·무릎 8관절은 우리 상한이 없고** 실제 상한은
+            펌웨어(벤더 68~112)다.
+          * ⇒ **로봇은 이미 "클램프가 풀린" 조건에서 돈다.** MJC 가 같은 정책을
+            벤더 한계로 풀면 낙상 1.8 → 46.8 (26배, 5시드 일관)임을 쟀다.
+
+        위치제어라 토크를 직접 못 자르므로 **목표 이탈**을 자른다. 학습식과 같게
+        감쇠항까지 넣는다 -- `kp·Δ` 가 지배항이지만 `kd·dq` 도 예산의 ~20 % 다:
+
+            tau_pred = kp·(target − q) − kd·dq
+            |tau_pred| > lim  ->  target := q + (sign(tau_pred)·lim + kd·dq)/kp
+
+        ⚠️ **완전한 재현은 아니다**: 온보드 PD 는 자기 `q`/`dq` 를 더 빠른 율로 읽는다.
+        여기서 쓰는 값은 게이트를 통과한 정책주기 표본이다.
+        ⛔ `DEPLOY_REQUESTS` 우선순위 2번(`dof_target` **ROM** 클램프)과 **다른 양**이다.
+        그쪽은 관절 각도 한계, 이쪽은 토크 박스다. 섞지 마라.
+        ⛔ **포화 점유율을 모르는 채로 켜지 마라** -- 학습 리포트의
+        `occ = |torques|/torque_limits` 가 1 % 미만이면 이 클램프는 아무것도 안 바꾸고,
+        20 % 면 실기 행동을 크게 바꾼다. Teacher 가 `NQ` 채점과 같이 뽑는다.
+        """
+        lim = self._torque_box
+        if lim is None:
+            return target
+        kp = self._torque_box_kp
+        kd = self._torque_box_kd
+        out = np.array(target, dtype=np.float32)
+        q = self.dof_pos_latest
+        dq = self.dof_vel
+        for i, l in lim.items():
+            if i >= len(out) or kp[i] <= 0.0:
+                continue
+            tau = kp[i] * (out[i] - q[i]) - kd[i] * dq[i]
+            if abs(tau) > l:
+                out[i] = q[i] + (math.copysign(l, tau) + kd[i] * dq[i]) / kp[i]
+                self._torque_box_hits[i] += 1
+        return out
 
     def _gate_joint_sample(self, q_in):
         """물리적으로 불가능한 관절 표본을 버리고 직전 값을 유지한다.
@@ -2256,8 +2318,9 @@ class Controller:
         else:
             self.filtered_dof_target = self.filtered_dof_target * 0.8 + self.dof_target * 0.2
 
+        published = self._apply_torque_box(self.filtered_dof_target)
         for i in range(self.joint_cnt):
-            self.low_cmd.motor_cmd[i].q = self.filtered_dof_target[i]
+            self.low_cmd.motor_cmd[i].q = published[i]
 
         # 기본은 위치 제어다. 검증된 E1 wrapper가 22관절 전부를 위치로 명령했고,
         # codex의 토크 피드포워드 변형은 이 로봇에서 **하중에 천천히 접히는

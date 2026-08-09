@@ -205,6 +205,15 @@ safety:
   # 0 이면 상한 OFF.
   low_state_max_joint_step_rad: 0.20
 
+  # ⛔ 토크 박스 — **기본 꺼짐(주석 상태)**. 켜면 학습의 토크 클램프를 위치명령으로
+  # 재현한다(`_apply_torque_box`). 학습은 URDF effort 로 12관절 전부 하드 클립하는데
+  # 배포는 힙·무릎에 상한이 없어서, 로봇은 지금 **클램프가 풀린 조건**에서 돈다
+  # (MJC: 같은 정책을 벤더 한계로 풀면 낙상 26배). 값은 **학습 자산의 effort** 다:
+  #   I3b(K1_locomotion_armsdown) = 30, 20, 20, 40, 20, 15
+  #   N 배치(K1_robot_boxfoot)     = 30, 35, 20, 40, 20, 20
+  # ⛔ 포화 점유율(occ = |torques|/torque_limits)을 모르는 채로 켜지 마라.
+  # torque_box_limits: [30, 20, 20, 40, 20, 15, 30, 20, 20, 40, 20, 15]
+
   recovery:
     enable: true
     # Authoritative fall state + whether the SDK will run its get-up. Measured
