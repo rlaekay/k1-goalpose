@@ -1016,9 +1016,10 @@ class Controller:
         # 쓰면 발목(kd 1, dq 최대 ~7 rad/s)에서 예산 20 의 **35 %가 최대 20 ms 낡은
         # 값**이 된다 -- MJC 가 지적한 "실효 상한이 20 보다 높게 샌다"의 경로다.
         # 게이트가 q 를 버린 표본은 dq 도 버린다(§8-69: dq 는 같은 q 에서 유도된다).
-        for i, motor in enumerate(low_state_msg.motor_state_serial):
-            if i < len(self._dof_gate_consec) and self._dof_gate_consec[i] == 0:
-                self.dof_vel_latest[i] = motor.dq
+        if self.dof_vel_latest is not None:
+            for i, motor in enumerate(low_state_msg.motor_state_serial):
+                if i < len(self._dof_gate_consec) and self._dof_gate_consec[i] == 0:
+                    self.dof_vel_latest[i] = motor.dq
         gravity = rotate_vector_inverse_rpy(
             low_state_msg.imu_state.rpy[0],
             low_state_msg.imu_state.rpy[1],
