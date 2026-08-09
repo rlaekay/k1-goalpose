@@ -69,6 +69,13 @@ DEPLOY_CFG = "deploy/configs/Goal_Pose_E0.yaml"
 
 # 학습이 실제로 쓰는 상한(K1_locomotion_armsdown.urdf의 effort). 다리 12개, 좌우 동일.
 URDF_LEG_EFFORT = [30.0, 20.0, 20.0, 40.0, 20.0, 15.0] * 2
+# ⛔ 벤더 공식 effort(VENDOR_ACTUATOR_SPEC_K1.md §1). MJCF 도 URDF 도 이것이 아니다:
+#   벤더  68.0 / 76.0 / 38.3 / 112.0 / 38.3 / 38.3
+#   MJCF    45 /   30 /   30 /    45 /   20 /   20   <- 지금까지 전 실험이 여기
+#   URDF    30 /   20 /   20 /    40 /   20 /   15   <- 학습
+# 무릎 2.49배 · 발목 1.91배 차이다. 그리고 실측에서 **발목 pitch 가 MJCF 한계 20 에
+# 정확히 포화한다**(p99 = max = 20.00) ⇒ 이 한계는 실제로 물린다.
+VENDOR_LEG_EFFORT = [68.0, 76.0, 38.3, 112.0, 38.3, 38.3] * 2
 
 # ---- armature (기어박스 뒤 로터 관성) ------------------------------------
 # ⛔ 세 자산이 서로 다르고, **어느 것도 벤더 값이 아니었다.**
@@ -153,8 +160,10 @@ def main():
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--policy", default=None, help="TorchScript 경로 (기본: deploy config)")
-    ap.add_argument("--torque-limits", choices=["mjcf", "urdf"], default="mjcf",
-                    help="mjcf=벤더/배포 값(45/30/30/45/20/20), urdf=학습 값(30/20/20/40/20/15)")
+    ap.add_argument("--torque-limits", choices=["mjcf", "urdf", "vendor"], default="mjcf",
+                    help="mjcf=MJCF 값(45/30/30/45/20/20) — ⛔ 이름과 달리 **벤더가 아니다**. "
+                         "urdf=학습 값(30/20/20/40/20/15). "
+                         "vendor=벤더 공식(68/76/38.3/112/38.3/38.3) — 무릎 2.5배·발목 1.9배 크다.")
     ap.add_argument("--goal-hold", action="store_true",
                     help="목표를 로컬 2 m 앞에 고정한다(forward_hold). 도착하지 않으므로 계속 걷는다")
     ap.add_argument("--stand", action="store_true",
@@ -492,6 +501,13 @@ def main():
     if args.torque_limits == "urdf":
         lim[10:22] = URDF_LEG_EFFORT
         print("토크 상한: 학습(URDF effort) %s" % lim[10:16])
+    elif args.torque_limits == "vendor":
+        lim[10:22] = VENDOR_LEG_EFFORT
+        # ⛔ MuJoCo actuator_forcerange 도 같이 올려야 한다. 안 그러면 모델 쪽이
+        # 45/20 에서 잘라서 레버가 조용히 무시된다.
+        model.actuator_forcerange[10:22, 0] = -np.array(VENDOR_LEG_EFFORT)
+        model.actuator_forcerange[10:22, 1] = np.array(VENDOR_LEG_EFFORT)
+        print("토크 상한: 벤더 공식 %s (forcerange 도 함께 상향)" % lim[10:16])
     else:
         print("토크 상한: 벤더 MJCF/배포 %s" % lim[10:16])
 
