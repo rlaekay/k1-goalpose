@@ -37,6 +37,11 @@ def make_gate(n=22, rate=30.0, consec=5, step=0.20):
     s._dof_gate_max_rate = rate
     s._dof_gate_max_consec = consec
     s._dof_gate_max_step = step
+    s._dof_gate_dt_edges = [0.002, 0.003, 0.004, 0.005, 0.0067,
+                            0.010, 0.015, 0.020, 0.025, 0.030, 0.040]
+    s._dof_gate_dt_hist = np.zeros(12, dtype=np.int64)
+    s._dof_gate_dt_hist_rej = np.zeros(12, dtype=np.int64)
+    s._dof_gate_dt_max = 0.0
     s._dof_gate_prev = None
     s._dof_gate_prev_t = None
     s._dof_gate_consec = np.zeros(n, dtype=np.int32)
@@ -103,6 +108,19 @@ s = make_gate(step=0.20)
 feed(s, [0.0] * 22, 0.0)
 out = feed(s, [0.072] + [0.0] * 21, 0.024)
 check("T5b-음성 대조(지연 틱의 진짜 운동 통과)", out[0] == 0.072)
+
+print("T5c dt 히스토그램이 거부를 그 틱의 dt 칸에 귀속시킨다 (같은 프로세스 계측)")
+# 짧은 틱(2.6 ms) 거부 1회 + 긴 틱(24 ms) 통과 1회 → 거부 히스토그램은 짧은 칸에만
+s = make_gate()
+feed(s, [0.0] * 22, 0.0)
+feed(s, [0.72] + [0.0] * 21, 0.0026)          # 짧은 틱, 거부
+feed(s, [0.05] + [0.0] * 21, 0.0026 + 0.024)  # 긴 틱, 통과
+# 0.0026 은 ≤0.003 칸(b=1), 0.024 는 ≤0.025 칸(b=8)
+check("T5c", s._dof_gate_dt_hist[1] == 1 and s._dof_gate_dt_hist[8] == 1
+      and s._dof_gate_dt_hist_rej[1] == 1 and s._dof_gate_dt_hist_rej[8] == 0
+      and abs(s._dof_gate_dt_max - 0.024) < 1e-9,
+      "hist=%s rej=%s" % (list(s._dof_gate_dt_hist[:9]),
+                          list(s._dof_gate_dt_hist_rej[:9])))
 
 
 def replay(path, qcols):

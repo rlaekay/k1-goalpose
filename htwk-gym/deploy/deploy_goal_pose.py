@@ -536,8 +536,10 @@ class Controller:
                     + ["tau%d" % i for i in range(12)]
                     + ["act%d" % i for i in range(12)]
                     # 게이트 오탐률 실측용(분석 세션 요청): 누적 거부(다리 12합/전체)
-                    # 와 누적 표본. 채널별 상세는 종료 시 로그로 찍는다.
-                    + ["gate_rej_legs", "gate_rej_total", "gate_samples"])
+                    # 와 누적 표본, 그리고 **같은 프로세스에서 잰** 콜백 dt 분포
+                    # (p99 는 히스토그램 상단 경계 근사). 채널별·dt별 상세는 종료 로그.
+                    + ["gate_rej_legs", "gate_rej_total", "gate_samples",
+                       "gate_dt_p99_ms", "gate_dt_max_ms"])
             self._timing_fp.write(",".join(cols) + "\n")
             self._timing_t0 = time.monotonic()
             self.logger.info("[timing] logging to %s", log_timing)
@@ -691,6 +693,17 @@ class Controller:
         self._dof_gate_consec = np.zeros(n, dtype=np.int32)
         self._dof_gate_rejected = np.zeros(n, dtype=np.int64)
         self._dof_gate_samples = 0
+        # ⛔ 콜백 dt 분포를 **이 프로세스에서** 잰다(분석 세션 지적). read_joint_live
+        # 는 구독 전용이라 rclpy 스레드 3개가 없고, §8-41 의 pub_hz 499 Hz 가 그렇게
+        # 다른 프로세스를 재서 2.7배 틀렸다(RETRACTIONS C16). 같은 표본 위에 있어야
+        # "거부가 짧은 틱(오염)에 몰리나 긴 틱(오탐)에 몰리나"를 직접 가른다.
+        # 경계: 2.6 ms 정상 / 6.7 ms 상한 활성점 / 24 ms 예산 구멍.
+        self._dof_gate_dt_edges = [0.002, 0.003, 0.004, 0.005, 0.0067,
+                                   0.010, 0.015, 0.020, 0.025, 0.030, 0.040]
+        self._dof_gate_dt_hist = np.zeros(len(self._dof_gate_dt_edges) + 1,
+                                          dtype=np.int64)
+        self._dof_gate_dt_hist_rej = np.zeros_like(self._dof_gate_dt_hist)
+        self._dof_gate_dt_max = 0.0
 
     # InitChannel 데드락을 잘라내는 시간(초). 정상 초기화는 1초 안에 끝나므로
     # 8초면 오검출이 없다.
@@ -1017,21 +1030,48 @@ class Controller:
         prev = self._dof_gate_prev
         out = list(q_in)
         if dt > 0.0:
+            # dt 히스토그램 (콜백 안 -- 정수 증가만, 할당 없음. §8-62 교훈)
+            b = 0
+            for e in self._dof_gate_dt_edges:
+                if dt <= e:
+                    break
+                b += 1
+            self._dof_gate_dt_hist[b] += 1
+            if dt > self._dof_gate_dt_max:
+                self._dof_gate_dt_max = dt
             budget = self._dof_gate_max_rate * dt
             if self._dof_gate_max_step > 0.0:
                 budget = min(budget, self._dof_gate_max_step)
+            tick_rejected = False
             for i in range(min(len(out), len(prev), len(self._dof_gate_consec))):
                 if (abs(out[i] - prev[i]) > budget
                         and self._dof_gate_consec[i] < self._dof_gate_max_consec):
                     out[i] = prev[i]                    # 직전 값 유지
                     self._dof_gate_consec[i] += 1
                     self._dof_gate_rejected[i] += 1
+                    tick_rejected = True
                 else:
                     self._dof_gate_consec[i] = 0
+            if tick_rejected:
+                self._dof_gate_dt_hist_rej[b] += 1
         self._dof_gate_prev = out
         self._dof_gate_prev_t = now
         self._dof_gate_samples += 1
         return out
+
+    def _gate_dt_p99_ms(self):
+        """콜백 dt p99 근사 -- 히스토그램의 해당 칸 **상단 경계**(보수적)."""
+        total = int(self._dof_gate_dt_hist.sum())
+        if total == 0:
+            return 0.0
+        cum, target = 0, 0.99 * total
+        for b, c in enumerate(self._dof_gate_dt_hist):
+            cum += int(c)
+            if cum >= target:
+                edges = self._dof_gate_dt_edges
+                return (edges[b] if b < len(edges)
+                        else self._dof_gate_dt_max) * 1e3
+        return self._dof_gate_dt_max * 1e3
 
     def _send_cmd(self, cmd: LowCmd):
         self.low_cmd_publisher.Write(cmd)
@@ -1052,6 +1092,15 @@ class Controller:
                     "[dof-gate] 표본 %d, 거부 %d, 채널별 %s",
                     int(self._dof_gate_samples),
                     int(self._dof_gate_rejected.sum()), nz if nz else "없음")
+                # dt 히스토그램 -- 전체 대 거부 틱. 거부가 짧은 틱에 몰리면 오염을
+                # 잡은 것, 긴 틱에 몰리면 상한이 정당한 운동을 자른 것이다.
+                labels = ["≤%.1fms" % (e * 1e3) for e in self._dof_gate_dt_edges]
+                labels.append(">%.0fms" % (self._dof_gate_dt_edges[-1] * 1e3))
+                self.logger.info(
+                    "[dof-gate] dt 분포 전체 %s | 거부틱 %s | max %.1f ms",
+                    {l: int(c) for l, c in zip(labels, self._dof_gate_dt_hist) if c},
+                    {l: int(c) for l, c in zip(labels, self._dof_gate_dt_hist_rej)
+                     if c} or "없음", self._dof_gate_dt_max * 1e3)
             except Exception:
                 pass
 
@@ -2038,7 +2087,8 @@ class Controller:
                     + list(self.policy.actions[:12])
                     + [int(self._dof_gate_rejected[ls:ls + 12].sum()),
                        int(self._dof_gate_rejected.sum()),
-                       int(self._dof_gate_samples)])
+                       int(self._dof_gate_samples),
+                       self._gate_dt_p99_ms(), self._dof_gate_dt_max * 1e3])
             self._timing_fp.write(
                 ",".join("%.5g" % float(v) for v in head + body) + "\n")
         except Exception:
