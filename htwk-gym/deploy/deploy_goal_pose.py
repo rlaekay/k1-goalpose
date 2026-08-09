@@ -662,6 +662,8 @@ class Controller:
         self.dof_target = np.zeros(n, dtype=np.float32)
         self.filtered_dof_target = np.zeros(n, dtype=np.float32)
         self.dof_pos_latest = np.zeros(n, dtype=np.float32)
+        # 콜백 율 dq (토크 박스용). `dof_vel` 은 정책 주기라 최대 20 ms 낡는다.
+        self.dof_vel_latest = np.zeros(n, dtype=np.float32)
         # tau_est는 원래 안 받았다. 덜덜 떠는 것이 토크 포화인지 진동인지
         # 가르려면 이게 있어야 한다.
         self.dof_tau = np.zeros(n, dtype=np.float32)
@@ -1010,6 +1012,13 @@ class Controller:
         time_now = time.monotonic()
         q_raw = self._gate_joint_sample(
             [motor.q for motor in low_state_msg.motor_state_serial])
+        # ⭐ 콜백 율 `dq`. 토크 박스가 `kd·dq` 항을 쓰는데, 정책 주기(20 ms) 표본을
+        # 쓰면 발목(kd 1, dq 최대 ~7 rad/s)에서 예산 20 의 **35 %가 최대 20 ms 낡은
+        # 값**이 된다 -- MJC 가 지적한 "실효 상한이 20 보다 높게 샌다"의 경로다.
+        # 게이트가 q 를 버린 표본은 dq 도 버린다(§8-69: dq 는 같은 q 에서 유도된다).
+        for i, motor in enumerate(low_state_msg.motor_state_serial):
+            if i < len(self._dof_gate_consec) and self._dof_gate_consec[i] == 0:
+                self.dof_vel_latest[i] = motor.dq
         gravity = rotate_vector_inverse_rpy(
             low_state_msg.imu_state.rpy[0],
             low_state_msg.imu_state.rpy[1],
@@ -1085,7 +1094,7 @@ class Controller:
         kd = self._torque_box_kd
         out = np.array(target, dtype=np.float32)
         q = self.dof_pos_latest
-        dq = self.dof_vel
+        dq = self.dof_vel_latest
         for i, l in lim.items():
             if i >= len(out) or kp[i] <= 0.0:
                 continue
