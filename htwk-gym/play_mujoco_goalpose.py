@@ -778,6 +778,14 @@ def main():
                 # 배포의 도착 상태. _update_arrival_gait가 stop_radius 안에서
                 # gait_frequency를 0으로 내리고, 정책은 그 조건을 학습에서 봤다.
                 grx, gry, herr = 0.0, 0.0, 0.0
+            elif args.goal_straight:
+                # 월드 기준 초기 방향으로 2 m 앞. heading_err 이 실제 값이라 yaw 가 닫힌다.
+                gx_w = px + 2.0 * math.cos(yaw0)
+                gy_w = py + 2.0 * math.sin(yaw0)
+                dx, dy = gx_w - px, gy_w - py
+                c, s = math.cos(-yaw), math.sin(-yaw)
+                grx, gry = c * dx - s * dy, s * dx + c * dy
+                herr = wrap_pi(yaw0 - yaw)
             elif args.goal_hold:
                 grx, gry, herr = 2.0, 0.0, 0.0    # 로컬 2 m 앞 고정 -> 도달하지 않는다
             else:
