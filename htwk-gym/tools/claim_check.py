@@ -69,6 +69,8 @@ CONDITIONS = [
     ("leg kp",            lambda r: _control_label(r, "stiffness")),
     ("protocol_sha",      lambda r: (r.get("effective_eval_protocol_sha") or "?")[:8]),
     ("env_code_sha",      lambda r: (r.get("env_code_sha") or "?")[:8]),
+    # ⛔ 채점 시점이 아니라 **학습 시점**. 둘은 다른 양이다(위 docstring).
+    ("train_env_sha",     lambda r: _train_env_sha(r)),
 ]
 
 # 조건이 같아야만 의미가 있는 지표들. 어느 조건에 의존하는지 같이 적는다.
@@ -138,6 +140,55 @@ def _ckpt_iter(r):
         run = (r.get("checkpoint") or "/?/").split("/nn/")[0].split("/")[-1]
         return "?{}@{}".format(base, run[:18])
     return name or "?"
+
+
+def _train_env_sha(r):
+    """**학습 시점** env 코드 sha. 채점 시점(`env_code_sha`) 과 다른 양이다.
+
+    ⛔ 이 저장소의 arm 은 며칠에 걸쳐 학습됐고 그 사이 `envs/` 가 계속 바뀌었다.
+    그런데 이 도구는 **채점 시점** sha 만 봤다 -- 두 arm 을 같은 커밋에서 채점하면
+    ✅ 가 뜨는데, 정작 **학습이 서로 다른 env 코드 위에서 돌았을 수 있다.**
+    실측(2026-08-09, 분석 세션 지적):
+
+        N1_path      a5f33a87   |   N3_pathcross  9e845026   <- 레버 하나 쌍이라고 불렀다
+        NF_dwellclock 8d763fb3  |   NH_zeroclock  9e845026   <- 5시드 풀스택의 대표 결과
+
+    `NF`->`NH` 사이에만 `envs/` 에 **4 커밋 141줄**이 들어갔고 그중 둘이
+    커리큘럼·랜덤화 기계를 건드린다. ⇒ **"레버 하나 차이" 가 아닐 수 있다.**
+
+    학습 run 디렉터리에 `ENV_CODE_SHA` 파일이 이미 있다(train 이 쓴다). 그걸 읽는다.
+    """
+    ck = r.get("checkpoint") or ""
+    run_dir = ck.split("/nn/")[0]
+    if not run_dir:
+        return "?"
+    for base in (run_dir, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", run_dir)):
+        try:
+            with open(os.path.join(base, "ENV_CODE_SHA")) as f:
+                return (f.read().strip() or "?")[:8]
+        except Exception:
+            continue
+    return "(기록없음)"
+
+
+def _env_diff_hint(sha_a, sha_b):
+    """두 학습 sha 사이 `envs/` 변경 규모. "다르다" 로 끝내지 않고 **얼마나** 다른지 찍는다."""
+    import subprocess
+    if "?" in (sha_a, sha_b) or "기록없음" in (sha_a + sha_b) or sha_a == sha_b:
+        return None
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        n = subprocess.run(["git", "-C", root, "rev-list", "--count",
+                            "{}..{}".format(sha_a, sha_b), "--", "envs"],
+                           capture_output=True, text=True, timeout=15).stdout.strip()
+        d = subprocess.run(["git", "-C", root, "diff", "--shortstat",
+                            "{}..{}".format(sha_a, sha_b), "--", "envs"],
+                           capture_output=True, text=True, timeout=15).stdout.strip()
+        if not n and not d:
+            return None
+        return "envs/ 커밋 {} · {}".format(n or "?", d or "변경 없음")
+    except Exception:
+        return None
 
 
 def _ckpt_sha(r):
@@ -411,6 +462,27 @@ def main():
         print("   단 `env_code_sha` 가 갈렸다면 그 커밋이 eval 경로를 바꿨는지 직접 봐라.")
     else:
         print("✅ 조건이 전부 같다. 이 리포트들은 나란히 비교해도 된다.")
+
+    # ⛔⛔ **학습 시점** env 코드가 갈렸으면 위의 ✅ 는 "채점이 공정했다" 까지만 말한다.
+    # 두 정책이 **서로 다른 env 코드 위에서 학습**됐으면 그것은 레버가 아니라 코드 차이일
+    # 수 있다. "얼마나 다른지" 를 같이 찍어야 사람이 판단할 수 있다(분석 세션 제안).
+    shas = [_train_env_sha(r) for _, r in cols]
+    if len(set(shas)) > 1:
+        print()
+        print("⛔⛔ **학습 시점 env 코드가 다르다** — {}".format(" 대 ".join(shas)))
+        hint = _env_diff_hint(*sorted(set(s for s in shas if len(s) == 8))[:2]) \
+            if len([s for s in shas if len(s) == 8]) >= 2 else None
+        if hint:
+            print("   그 사이 {}".format(hint))
+        print("   ⇒ **이 쌍을 '레버 하나 차이' 라고 부르지 마라.** 관측된 차이가 레버 때문인지")
+        print("      그 커밋들 때문인지 이 자료로는 구별할 수 없다. 빠져나가는 유일한 길은")
+        print("      **그 커밋들이 이 config 에서 no-op 임을 사람이 확인해서 적는 것**이다.")
+        print("   ⚠️ 그리고 no-op 확인은 **키 값만으로 부족하다** — 난수를 뽑는 코드가 늘면")
+        print("      값이 0 이어도 RNG 스트림이 밀려 궤적이 통째로 달라진다.")
+    elif "(기록없음)" in shas:
+        print()
+        print("⚠️ 학습 시점 env sha 를 못 읽었다(`<run>/ENV_CODE_SHA` 없음).")
+        print("   **학습 코드가 같았는지 이 도구로는 알 수 없다.**")
 
     # ⛔⛔ 물리 지문이 없는 옛 리포트에 대해서는 **위의 ✅ 를 믿으면 안 된다.**
     # 2026-08-09 이전 리포트에는 `effective_eval_protocol.asset` 이 없어서 armature 가
