@@ -723,7 +723,13 @@ class Controller:
                 raise ValueError(
                     "safety.torque_box_limits 는 다리 12관절이어야 한다(받은 값 %d개). "
                     "학습 자산의 URDF effort 를 그대로 적어라." % len(tb))
-            self._torque_box = {ls + k: float(v) for k, v in enumerate(tb)}
+            # 값이 0 이하면 그 관절은 **안 자른다.** MJC 5시드 측정이 두 관절군의
+            # 방향이 반대임을 보였다(2026-08-09):
+            #   힙·무릎 = 열수록 좋다 (URDF 30~40 최악 57~62회 → 벤더 68~112 최고 0~2회)
+            #   발목     = 조일수록 좋다 (38.3 파국 47.8회 → 20 최적 0회, Fisher p=0.004)
+            # ⇒ 발목만 20 으로 자르고 힙·무릎은 열어 두는 것이 네 칸 중 최선이었다.
+            self._torque_box = {ls + k: float(v)
+                                for k, v in enumerate(tb) if float(v) > 0.0}
             self._torque_box_kp = np.asarray(self.cfg["common"]["stiffness"],
                                              dtype=np.float64)
             self._torque_box_kd = np.asarray(self.cfg["common"]["damping"],
