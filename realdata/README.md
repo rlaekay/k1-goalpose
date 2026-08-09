@@ -20,8 +20,11 @@
 - **등간격이 아니다.** `tick_dt_s` CV **0.303**(11~48 ms). **FFT 를 그냥 걸지 마라** —
   나와 분석 세션이 둘 다 여기서 틀렸다(`ibatch` §8-64, `RETRACTIONS` C44~C46).
   주파수 주장을 하려면 Lomb-Scargle 이나 비균일 표본용 방법을 쓰고, **귀무분포를 같이 내라.**
-- **`t_s` 는 벽시계가 아니다** — `Timer.get_time()` 이 `LowState 개수 × 0.002` 다
-  (§8-59). 벽시계 간격은 `tick_dt_s` 열에 따로 있다.
+- ~~`t_s` 는 벽시계가 아니다~~ → **정정(2026-08-09, Codex 감사 §19-6 이 잡았다):
+  `t_s` 는 `time.monotonic()` 이다**(`00ed5b8` 의 `_log_timing`, `now - _timing_t0`).
+  카운터 시계(`Timer.get_time()` = LowState 개수 × 0.002, §8-59)는 **정책 스케줄링과
+  `gait_process`** 에 쓰인 것이지 이 열이 아니다. 그래서 이 파일의 t_s 로 계산한
+  율(38.4 Hz 등)은 유효하다.
 - 열 배치: `t_s, low_state_age_s, tick_dt_s, tilt_deg, roll, pitch, gx, gy, gz,
   walking, gait_freq, gait_process, pub_hz, goal_x, goal_y, heading_err,
   q0..q11, dq0..dq11, tau0..tau11, act0..act11`

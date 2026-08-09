@@ -1,0 +1,11 @@
+trial_id,file,model,goal,policy_limit_s,publish_setting,filter_setting,scheduler_or_state_variant,rows,sha256,performance_validity
+R1,np_stand.csv,NP,"0,0,0",1.0,uncapped_legacy,legacy_alpha_0.2,counter_clock,37,0c52c833e1287620c22d1fc4ee1d8293f7b2a632e2a81e0151549f1542be1834,limited_reference
+R2,np_walk_02.csv,NP,"0.2,0,0",1.5,uncapped_legacy,legacy_alpha_0.2,counter_clock_and_damping_cleanup,54,38f15605cd7f1383030508230fa3c0470e8a63fc71903b1a22384dabfebce134,policy_and_cleanup_confounded
+R3,np_wallclock_stand.csv,NP,"0,0,0",1.0,uncapped_legacy,legacy_alpha_0.2,wallclock_with_1ms_polling,39,692ffd83e353d1b217dc76210e234d1f29c7e2bff05ba2737058a0605dbb8852,valid_for_scheduler_ab
+R4,np_deadline_stand.csv,NP,"0,0,0",1.0,uncapped_legacy,legacy_alpha_0.2,wallclock_deadline_sleep,50,87fac9f25a8510ac84947ec1dac7ca4bd64bbff1f54869aafcf3b2adbe07597d,valid_short_stand
+R5,nh_deadline_stand.csv,NH,"0,0,0",1.0,uncapped_legacy,legacy_alpha_0.2,wallclock_deadline_sleep,46,61d1fff69707e9dbccb84a64dad9a1bb74bb44a9b130697785e0e71fc997a51b,valid_short_stand_with_rate_confound
+R6,i3b_deadline_stand.csv,I3b,"0,0,0",1.0,uncapped_legacy,legacy_alpha_0.2,wallclock_deadline_sleep,41,19db57a288b4837323a985727264520c051719cb2c1d455a11da81e11d9bf16a,valid_short_stand_with_rate_confound
+R7,i3b_pub100_stand.csv,I3b,"0,0,0",1.0,100Hz,tau_10ms,pre_freshness_fix,50,605f7d3b9bfcfe106e0fdcaf2c65570aa96f11273c8a74d92b95f9334e0239ef,invalid_for_policy_performance_valid_for_bug_detection
+R8,i3b_pub100_walk02.csv,I3b,"0.2,0,0",1.0,100Hz,tau_10ms,pre_freshness_fix,50,ba9bea8f593d709666b28badea5dc51c8943cdfd98b8378d977712181d7ed986,invalid_for_policy_performance_valid_for_bug_detection
+R10,i3b_freshstate_stand.csv,I3b,"0,0,0",1.0,100Hz,tau_10ms,atomic_fresh_snapshot_fix,50,034ab557fc13b1d7c6fc0826300baf4f0dd8c8d232c6d146e52b0ae4623fee5e,valid_short_stand
+

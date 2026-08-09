@@ -1,0 +1,4 @@
+run_id,samples,imu_roll_deg,imu_pitch_deg,L_Hip_Pitch_deg,R_Hip_Pitch_deg,L_Hip_Roll_deg,R_Hip_Roll_deg,L_Hip_Yaw_deg,R_Hip_Yaw_deg,L_Knee_deg,R_Knee_deg,L_Ankle_Pitch_deg,R_Ankle_Pitch_deg,L_Ankle_Roll_deg,R_Ankle_Roll_deg,robot_mode,source
+P1,155,-0.28,-2.39,0.12,0.23,-0.97,1.19,-0.05,-0.38,5.89,6.57,-5.63,-4.41,0.16,0.47,vendor_PREPARE,console_transcription
+P2,172,-0.21,-0.46,-0.30,0.19,-1.04,1.13,-0.05,-0.30,5.78,6.52,-5.95,-4.72,0.06,0.71,vendor_PREPARE,console_transcription
+P3,155,-0.21,-0.46,-0.30,0.19,-1.04,1.13,-0.05,-0.30,5.78,6.52,-5.94,-4.72,0.08,0.71,vendor_PREPARE,console_transcription
