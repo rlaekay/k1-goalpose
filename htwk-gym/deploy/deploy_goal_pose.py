@@ -534,7 +534,10 @@ class Controller:
                     + ["q%d" % i for i in range(12)]
                     + ["dq%d" % i for i in range(12)]
                     + ["tau%d" % i for i in range(12)]
-                    + ["act%d" % i for i in range(12)])
+                    + ["act%d" % i for i in range(12)]
+                    # 게이트 오탐률 실측용(분석 세션 요청): 누적 거부(다리 12합/전체)
+                    # 와 누적 표본. 채널별 상세는 종료 시 로그로 찍는다.
+                    + ["gate_rej_legs", "gate_rej_total", "gate_samples"])
             self._timing_fp.write(",".join(cols) + "\n")
             self._timing_t0 = time.monotonic()
             self.logger.info("[timing] logging to %s", log_timing)
@@ -1039,6 +1042,18 @@ class Controller:
                 return
             self._cleaned_up = True
             self.running = False
+
+            # 게이트 오탐률 판정용 채널별 상세(분석 세션 사전등록). 발목 roll
+            # (오염 확정 채널) 밖에서 거부가 나오면 게이트가 과하거나 오염이
+            # 더 넓다는 신호다 -- 0 이어도 그 사실을 찍는다.
+            try:
+                nz = {i: int(c) for i, c in enumerate(self._dof_gate_rejected) if c}
+                self.logger.info(
+                    "[dof-gate] 표본 %d, 거부 %d, 채널별 %s",
+                    int(self._dof_gate_samples),
+                    int(self._dof_gate_rejected.sum()), nz if nz else "없음")
+            except Exception:
+                pass
 
             if self.publish_runner is not None and self.publish_runner.is_alive():
                 self.publish_runner.join(timeout=1.0)
@@ -2020,7 +2035,10 @@ class Controller:
             body = (list(policy_dof_pos[ls:ls + 12])
                     + list(policy_dof_vel[ls:ls + 12])
                     + list(policy_dof_tau[ls:ls + 12])
-                    + list(self.policy.actions[:12]))
+                    + list(self.policy.actions[:12])
+                    + [int(self._dof_gate_rejected[ls:ls + 12].sum()),
+                       int(self._dof_gate_rejected.sum()),
+                       int(self._dof_gate_samples)])
             self._timing_fp.write(
                 ",".join("%.5g" % float(v) for v in head + body) + "\n")
         except Exception:
