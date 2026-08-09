@@ -871,7 +871,7 @@ def load_policy(checkpoint, env, device, model=None, verbose=True,
 
 def rollout(env, model, total_steps, device, stochastic=False, record_video=False,
             record_video_s=8.0, progress_every=500, progress_prefix="  ", stress=None,
-            cfg_speed_window_s=0.2):
+            cfg_speed_window_s=0.2, dump_actions=None, dump_actions_envs=8):
     """Roll the policy and collect one record per completed goal segment.
 
     Per segment we keep not just the final error but the provenance needed to
@@ -879,6 +879,25 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     how long the policy had, the closest it ever got, and whether the residual
     error is along or across the approach direction.
     """
+    # ---- per-step action dump ---------------------------------------------
+    # The commanded joint target is default_dof_pos + action_scale * action, and
+    # the foot separation implied by THAT is a different quantity from the one
+    # the robot achieves: the 2026-08-09 command-FK test found the command is
+    # deeper than the measurement in every crossing case, i.e. physics masks the
+    # crossing rather than causing it.  Nothing here could see that, because the
+    # only foot-gap statistic in this file (`stance_hist`) is accumulated under
+    # `both` -- DOUBLE SUPPORT ONLY -- and crossing happens during swing.
+    #
+    # Rather than do forward kinematics on a virtual joint set inside Isaac
+    # (which has no articulation to query for a pose the robot is not in), dump
+    # the raw actions and let the MuJoCo-side tooling run the same FK it already
+    # runs on the real-robot CSVs.  Measured dof_pos goes out alongside so both
+    # axes are computed by one code path on one convention.
+    dump_act = None
+    if dump_actions:
+        k = max(1, min(int(dump_actions_envs), env.num_envs))
+        dump_act = {"k": k, "actions": [], "dof_pos": [], "done": []}
+
     instrumented = hasattr(env, "goal_start_pos") and hasattr(env, "goal_start_step")
     has_segment_id = hasattr(env, "goal_segment_id")
     has_path_speed = hasattr(env, "path_speed")
@@ -1365,8 +1384,18 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
                             0, len(mirror_error_hist) - 1),
                     1,
                 )
+        if dump_act is not None:
+            k = dump_act["k"]
+            dump_act["actions"].append(
+                act[:k].detach().cpu().numpy().astype(np.float32))
+            dump_act["dof_pos"].append(
+                env.dof_pos[:k].detach().cpu().numpy().astype(np.float32))
+
         obs, _, done, infos = env.step(act.to(env.device))
         obs = obs.to(device)
+
+        if dump_act is not None:
+            dump_act["done"].append(done[:dump_act["k"]].detach().cpu().numpy())
 
         timeouts = infos["time_outs"].to(done.device)
         physical_failures = infos.get("physical_failures")
@@ -2004,6 +2033,25 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     out["speed_hist_max"] = speed_hist_max
     out["angvel_hist"] = angvel_hist
     out["angvel_hist_max"] = angvel_hist_max
+    if dump_act is not None and dump_act["actions"]:
+        # Everything the command reconstruction needs travels with the data:
+        # a dump that requires the reader to guess action_scale or the joint
+        # order is a dump that will be read wrong exactly once, silently.
+        # goal_pose.py:926 -- default_dof_pos + control.action_scale * actions.
+        scale = (env.cfg.get("control", {}) or {})["action_scale"]
+        np.savez_compressed(
+            dump_actions,
+            actions=np.stack(dump_act["actions"]),        # [T, k, num_actions]
+            dof_pos=np.stack(dump_act["dof_pos"]),        # [T, k, num_dofs]
+            done=np.stack(dump_act["done"]),              # [T, k]
+            default_dof_pos=env.default_dof_pos.detach().cpu().numpy().astype(np.float32),
+            action_scale=np.asarray(scale, dtype=np.float32),
+            dof_names=np.asarray(list(getattr(env, "dof_names", [])), dtype=object),
+            dt=np.float32(env.dt),
+        )
+        print(f"{progress_prefix}actions dumped -> {dump_actions} "
+              f"({len(dump_act['actions'])} steps x {dump_act['k']} envs)")
+
     out["v7_extras"] = dict(getattr(env, "extras", {}).get("v7", {}) or {})
     out["upright_share"] = upright_steps / float(max(total_steps * env.num_envs, 1))
     out["env_minutes"] = total_steps * env.dt * env.num_envs / 60.0
@@ -4265,6 +4313,8 @@ def main():
         help="스트레스 프로브의 고장 모드. iid / single / leg_common / mirror / anti_mirror")
     parser.add_argument("--goal_pattern", choices=["lateral", "reverse", "forward_hold"],
                         help="force abrupt robot-local side or rear waypoint goals")
+    parser.add_argument("--dump_actions", help="write per-step actions + measured dof_pos to this .npz. The commanded joint target is default_dof_pos + control.action_scale * action, and the foot separation implied by the COMMAND is not the one the robot achieves -- physics masks crossing rather than causing it (2026-08-09 command-FK test). No statistic in this file can see that: stance_hist is double-support only, and crossing happens during swing.")
+    parser.add_argument("--dump_actions_envs", type=int, default=8, help="how many envs to dump actions for (default 8). One env is a single trajectory and falls out early; the point of several is that the command-side statistic has a distribution.")
     parser.add_argument("--exploratory", action="store_true", help="label this run as a non-authoritative preview rather than an official gate evaluation")
     parser.add_argument("--out", help="output dir (default: <run_dir>/eval/<timestamp>)")
     parser.add_argument(
@@ -4340,7 +4390,9 @@ def main():
     roll = rollout(env, model, int(duration_s / env.dt), device,
                    stochastic=args.stochastic, record_video=args.record_video,
                    record_video_s=args.record_video_s, stress=args.stress,
-                   cfg_speed_window_s=cfg.get("evaluation", {}).get("speed_window_s", 0.2))
+                   cfg_speed_window_s=cfg.get("evaluation", {}).get("speed_window_s", 0.2),
+                   dump_actions=args.dump_actions,
+                   dump_actions_envs=args.dump_actions_envs)
 
     if args.stress:
         results, report_md = summarize_stress(
