@@ -677,6 +677,12 @@ class Controller:
             self.cfg.get("safety", {}).get("low_state_max_joint_rate_rps", 30.0))
         self._dof_gate_max_consec = int(
             self.cfg.get("safety", {}).get("low_state_max_consecutive_reject", 5))
+        # ⛔ 예산 절대 상한 (분석 세션 지적, 2026-08-09). rate×dt 만 쓰면 콜백이
+        # 24 ms 밀렸을 때 예산이 0.72 rad 가 되어 관측된 최대 도약(0.72/0.75)이
+        # **그대로 통과**한다. 물리 스톱이 ±0.40 이므로 한 표본에 ROM 절반(0.20)을
+        # 건너뛰는 정당한 움직임은 없다. 0 이면 상한 OFF(음성 대조군).
+        self._dof_gate_max_step = float(
+            self.cfg.get("safety", {}).get("low_state_max_joint_step_rad", 0.20))
         self._dof_gate_prev = None          # 마지막으로 **채택한** q
         self._dof_gate_prev_t = None        # 그때의 monotonic 시각
         self._dof_gate_consec = np.zeros(n, dtype=np.int32)
@@ -1009,6 +1015,8 @@ class Controller:
         out = list(q_in)
         if dt > 0.0:
             budget = self._dof_gate_max_rate * dt
+            if self._dof_gate_max_step > 0.0:
+                budget = min(budget, self._dof_gate_max_step)
             for i in range(min(len(out), len(prev), len(self._dof_gate_consec))):
                 if (abs(out[i] - prev[i]) > budget
                         and self._dof_gate_consec[i] < self._dof_gate_max_consec):

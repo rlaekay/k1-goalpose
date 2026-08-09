@@ -200,6 +200,10 @@ safety:
   # 0 으로 두면 게이트가 꺼진다(음성 대조군).
   low_state_max_joint_rate_rps: 30.0
   low_state_max_consecutive_reject: 5
+  # 예산 절대 상한. rate×dt 만 쓰면 콜백이 24 ms 밀린 직후의 오염 표본
+  # (도약 0.72 rad)이 통과한다. 물리 스톱 ±0.40 → 한 표본 0.20 이 상한.
+  # 0 이면 상한 OFF.
+  low_state_max_joint_step_rad: 0.20
 
   recovery:
     enable: true

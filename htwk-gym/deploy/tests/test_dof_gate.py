@@ -32,10 +32,11 @@ def check(name, ok, detail=""):
         FAILS.append(name)
 
 
-def make_gate(n=22, rate=30.0, consec=5):
+def make_gate(n=22, rate=30.0, consec=5, step=0.20):
     s = type("S", (), {})()
     s._dof_gate_max_rate = rate
     s._dof_gate_max_consec = consec
+    s._dof_gate_max_step = step
     s._dof_gate_prev = None
     s._dof_gate_prev_t = None
     s._dof_gate_consec = np.zeros(n, dtype=np.int32)
@@ -86,6 +87,22 @@ s = make_gate(rate=0.0)
 feed(s, [0.0] * 22, 0.0)
 out = feed(s, [99.0] + [0.0] * 21, 0.0026)
 check("T5", out[0] == 99.0)
+
+print("T5b ⛔ 예산 구멍(분석 세션): 콜백 24 ms 지연 + 0.72 도약")
+# 상한 없으면 budget = 30×0.024 = 0.72 → 통과(구멍 실증). 상한 0.20 이면 거부.
+s = make_gate(step=0.0)
+feed(s, [0.0] * 22, 0.0)
+out = feed(s, [0.72] + [0.0] * 21, 0.024)
+check("T5b-구멍 실증(상한 OFF 면 통과해 버린다)", out[0] == 0.72)
+s = make_gate(step=0.20)
+feed(s, [0.0] * 22, 0.0)
+out = feed(s, [0.72] + [0.0] * 21, 0.024)
+check("T5b-상한이 막는다", out[0] == 0.0 and s._dof_gate_rejected[0] == 1)
+# 지연 콜백에서도 정당한 큰 움직임(3 rad/s × 24 ms = 0.072)은 통과
+s = make_gate(step=0.20)
+feed(s, [0.0] * 22, 0.0)
+out = feed(s, [0.072] + [0.0] * 21, 0.024)
+check("T5b-음성 대조(지연 틱의 진짜 운동 통과)", out[0] == 0.072)
 
 
 def replay(path, qcols):
