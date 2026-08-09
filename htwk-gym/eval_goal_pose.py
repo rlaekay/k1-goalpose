@@ -2287,6 +2287,27 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
     falls = int(roll["falls"])
     attempts = n + falls
 
+    # 게이트가 걸리는 카테고리(기본 waypoint)의 **시도 수**. 낙상을 실패로 세는
+    # 도착률(`success_per_attempt`)의 분모다 -- 왜 필요한지는 그 항목 주석에 있다.
+    # 낙상 분류는 아래 `fall_analysis` 에서 다시 쓰지만 그건 results 를 만든 뒤라
+    # 여기서 같은 것을 먼저 센다.
+    def _count(mask):
+        return int(np.sum(mask))
+
+    _fc_early = roll.get("fall_ctx") or {}
+    _fc_cat = _fc_early.get("category")
+    _classified = int(len(_fc_cat)) if _fc_cat is not None else 0
+    _gate_falls_exact = (_classified == falls)
+    if _gate_falls_exact and falls:
+        _cat_arr = np.asarray(_fc_cat).astype(int)
+        # 게이트 카테고리 = gate_mask 가 True 인 카테고리 집합. 기본은 path 를 뺀 것.
+        _gate_cats = set(np.asarray(cat_all)[gate_mask].tolist())
+        _gate_falls = int(np.sum([c in _gate_cats for c in _cat_arr.tolist()]))
+    else:
+        # 분류가 불완전하면 **전부 게이트 쪽에 청구한다**(보수적 = 성공률을 낮게).
+        _gate_falls = falls
+    _gate_attempts = int(gate_mask.sum()) + _gate_falls
+
     gate_pos, gate_head = pos_all[gate_mask], head_all[gate_mask]
     n_gate, n_path = int(gate_mask.sum()), int((~gate_mask).sum())
     pos_med, pos_p90 = _median(gate_pos), _pct(gate_pos, 90)
@@ -2366,6 +2387,31 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
         "final_speed_mps": {"median": _median(speed), "p90": _pct(speed, 90), "mean": float(np.mean(speed))},
         "success_rate_strict": _frac((pos[gate_mask] <= g_pos_med) & ok_head[gate_mask] & ok_stop[gate_mask]),
         "success_rate_loose": _frac(ok_pos_loose[gate_mask] & ok_head[gate_mask]),
+        # ⛔⛔ 2026-08-09. 위 두 값과 `pos_err_m` 은 **완주한 구간만** 분모로 쓴다
+        # (`completed = changed & ~done`, :1808 -- 넘어진 구간은 기록조차 안 된다).
+        # 그래서 **더 자주 넘어질수록 정확도가 좋아 보인다.** 가설이 아니라 실측이다:
+        # `NJ_armasset/model_6000` 하나를 채점 물리만 바꿔 재면
+        #     자기 물리   38.75 cm / 낙상    2
+        #     틀린 물리   27.26 cm / 낙상 6,145   <- 65 % 를 넘어뜨렸더니 30 % "좋아졌다"
+        # 체크포인트·프로토콜·seed 가 전부 같은 쌍이다. `NG_armature` 도 40.96 -> 35.91.
+        # ⇒ **지표가 인과적으로 반대**이고, 카테고리 재가중으로는 못 고친다(+0.11 cm).
+        #    분모를 **시도**로 바꿔야 한다. 낙상은 이제 성공률을 **깎는다.**
+        #
+        # 분모는 카테고리를 맞춘다: 게이트는 waypoint 구간에만 걸리므로 낙상도
+        # waypoint 로 분류된 것만 센다. 분류가 불완전하면 전체 낙상을 쓰고
+        # (보수적 = 성공률을 낮게) `denominator_exact: false` 로 표시한다.
+        "success_per_attempt": {
+            "strict": (_count((pos[gate_mask] <= g_pos_med) & ok_head[gate_mask] & ok_stop[gate_mask])
+                       / _gate_attempts if _gate_attempts else float("nan")),
+            "loose": (_count(ok_pos_loose[gate_mask] & ok_head[gate_mask])
+                      / _gate_attempts if _gate_attempts else float("nan")),
+            "attempts": _gate_attempts,
+            "completed": int(gate_mask.sum()),
+            "falls_charged": _gate_falls,
+            "denominator_exact": bool(_gate_falls_exact),
+            "note": "낙상을 실패로 세는 도착률. 완주 구간만 보는 success_rate_* 와 달리 "
+                    "더 넘어질수록 나빠진다. arm 선택은 이 값으로 해라.",
+        },
         "ci95": {
             "pos_median": bootstrap_ci(gate_pos, 50.0, seed=seed),
             "pos_p90": bootstrap_ci(gate_pos, 90.0, seed=seed),

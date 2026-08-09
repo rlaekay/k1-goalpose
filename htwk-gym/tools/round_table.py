@@ -200,16 +200,25 @@ def main():
             str(g(r, "falls", default="-")),
             fmt(drop, 1, 1),
             fmt(g(r, "success_rate_strict"), 100, 1),
+            # ⭐ 낙상을 실패로 세는 도착률. 위 strict(%) 와 달리 **더 넘어질수록 나빠진다.**
+            # arm 선택은 이 열로 한다(§6-c: 정확도 cm 는 인과적으로 반대다).
+            fmt(g(r, "success_per_attempt", "strict"), 100, 1),
             str(g(r, "segments_completed", default="-")),
             "PASS" if g(r, "all_gates_pass") else "fail",
         ])
     print("== 정확도: 공통 waypoint 프로토콜 (모든 arm 을 같은 config 로 채점) ==")
     print(table(["arm", "오차med(cm)", "오차p90(cm)", "heading(도)",
-                 "낙상", "표본탈락(%)", "strict(%)", "구간수", "게이트"], acc_rows))
+                 "낙상", "표본탈락(%)", "strict(%)", "**도착률/시도(%)**",
+                 "구간수", "게이트"], acc_rows))
     print()
-    print("⛔ 표본탈락(%) = 낙상으로 끝나 **오차 통계에서 빠진** 시도의 비율이다.")
-    print("   이 값이 큰 arm 의 오차 숫자는 '안 넘어졌을 때만'의 값이라 다른 arm 과")
-    print("   같은 자가 아니다. 오차만으로 순위를 매기지 마라.")
+    print("⛔⛔ `오차med` 와 `strict(%)` 는 **완주한 구간만** 분모로 쓴다 --")
+    print("    낙상으로 끝난 구간은 기록조차 안 된다(eval_goal_pose.py:1808).")
+    print("    그래서 **더 자주 넘어질수록 정확도가 좋아 보인다.** 실측이다:")
+    print("    같은 체크포인트(NJ_armasset/model_6000)를 채점 물리만 바꾸면")
+    print("      자기 물리  38.75 cm / 낙상     2")
+    print("      틀린 물리  27.26 cm / 낙상 6,145   <- 65 % 를 넘어뜨렸더니 30 % '좋아졌다'")
+    print("⭐ **`도착률/시도(%)` 로 순위를 매겨라.** 분모가 시도라 낙상이 점수를 깎는다.")
+    print("   (`-` 이면 2026-08-09 이전 리포트라 그 열이 없다. 그런 표로 순위를 매기지 마라.)")
     print()
 
     # ---- 표 2: 지속 보행 (forward_hold) ----------------------------------
