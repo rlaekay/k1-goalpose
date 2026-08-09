@@ -490,6 +490,18 @@ class Controller:
         self._timing_t0 = 0.0
         self._timing_last_tick = 0.0
         if log_timing:
+            # ⛔ 2026-08-09. 예전에는 `"w"` 로 그냥 열었다. 사용자가 같은 명령을 두 번
+            # 돌렸더니 **두 번째가 첫 번째를 덮어썼고 4발자국 성공 로그 하나를 잃었다.**
+            # 실기 기록은 되찾을 수 없다. 이미 있으면 이름 뒤에 번호를 붙인다.
+            if os.path.exists(log_timing):
+                base, ext = os.path.splitext(log_timing)
+                n = 2
+                while os.path.exists("%s_%d%s" % (base, n, ext)):
+                    n += 1
+                log_timing = "%s_%d%s" % (base, n, ext)
+                self.logger.warning(
+                    "[timing] 기존 파일이 있어 %s 로 쓴다 -- 실기 로그를 덮어쓰지 않는다",
+                    log_timing)
             self._timing_fp = open(log_timing, "w", buffering=1, encoding="utf-8")
             ls = int(self.cfg["policy"].get("leg_dof_start", 10))
             cols = (["t_s", "low_state_age_s", "tick_dt_s", "tilt_deg",
