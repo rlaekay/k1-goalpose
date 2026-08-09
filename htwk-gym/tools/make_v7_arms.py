@@ -1293,6 +1293,44 @@ _ARM_VENDOR = {
         "Head": 0.001,
     },
 }
+# ---- NR: `_OFF_PROTECT` 를 되켠다 (2026-08-09, 10회 감사 만장일치 권고) ----------
+#
+# ⛔ `_OFF_PROTECT`(:82)는 **E 배치부터 상속돼** F·I·M·N 전 배치와 **배포된 정책
+# `I3b_stance10` 까지** 보호 보상 6종을 0 으로 꺼 왔다. 10회 독립 감사가 **10/10 으로**
+# "6개 키, 전부 베이스에서 비-0 이므로 전부 실효" 를 확인했다.
+#
+# 그중 셋이 **한계 초과를 벌하는 유일한 항**이다:
+#     dof_pos_margin(-0.5) · dof_vel_margin(-0.02) · torque_margin
+# ⇒ 우리가 "속도 제약이 없다"(C30)·"발목 pitch 포화"(Q7)·"발목 roll 이 스톱 밖"이라고
+# 조사해 온 것들의 **처방이 이미 구현돼 있고 6일째 꺼져 있었다.**
+# 감사 04 의 표현: *"새 arm 을 돌린다면 레버는 `_OFF_PROTECT` 해제 하나."*
+#
+# ⚠️ 단일 레버가 아니다(키 6개). 그래도 **하나로 묶는 것이 옳다** — 여섯이 같은 목적
+# (물리 한계 존중)이고, 하나씩 켜면 6 arm × 6000 it 이 든다. 효과가 있으면 그때 쪼갠다.
+#
+# 판정(숫자 보기 전 고정) — ⛔ **정확도 cm 로 판정하지 마라**(C48: 정확도는 낙상과
+# 인과적으로 반대다). 1차 엔드포인트는 **시도 단위**다:
+#   * 확증: `1 - fall_rate_per_attempt` 가 대조군(NH_zeroclock) 대비 개선되고
+#     발목 pitch `sat_share` 가 절반 아래로 내려간다
+#   * 기각: 낙상률이 같거나 나빠진다 (보호 보상이 보행을 방해한 것)
+#   * ⚠️ 정확도가 나빠지는 것은 **기각 사유가 아니다** — 넘어지던 시도가 표본에
+#     들어오면 오차 median 은 원래 올라간다(C48).
+_PROTECT_ON = {
+    "rewards.scales.dof_pos_margin": -0.5,
+    "rewards.scales.dof_vel_margin": -0.02,
+    "rewards.scales.torque_margin": -0.002,
+    "rewards.scales.electrical_power": -2.0e-3,
+    "rewards.stop_ang_speed_threshold": 0.3,
+    "rewards.scales.stand_posture": -1.0,
+}
+NR_ARMS = {
+    "NR_protect": merge(_N_BASE, _PATH_ON, _ZERO_ON,
+                        {"commands.path.pause_gait_during_dwell": True},
+                        _PROTECT_ON),
+}
+N_ARMS.update(NR_ARMS)
+
+
 NQ_ARMS = {
     "NQ_armvendor": merge(_N_BASE, _PATH_ON, _ZERO_ON,
                           {"commands.path.pause_gait_during_dwell": True},
