@@ -169,8 +169,33 @@ def main():
                          "관측 쪽 지연은 전혀 없다")
     ap.add_argument("--period-ms", type=float, default=None,
                     help="정책 주기(ms). 기본은 config의 dt*decimation = 20 ms(50 Hz). "
-                         "실기 실측은 median 25.3 ms / p99 48 ms였다 -- 학습이 본 적 없는 값이다. "
-                         "액션 유지 시간이 길어지면 위상 지연이 생기고, 그것이 고주파 진동을 만든다.")
+                         "실기 실측은 median 25.24 / **mean 26.14** ms다. "
+                         "⛔ 케이던스를 맞추려면 mean 을 써라 -- 위상은 적분량이라 "
+                         "창 전체 케이던스 = 평균율 x 증분이고, median 은 오른쪽 꼬리를 "
+                         "버려서 케이던스를 과대평가한다(median 25.24 -> 1.585 Hz, "
+                         "실측 케이던스는 1.512 Hz).")
+    # ---- 시간 팽창 ---------------------------------------------------------
+    # `deploy/utils/timer.py` 의 Timer 는 벽시계가 아니라 **LowState 콜백에서만
+    # 증가하는 카운터**다(증가 지점은 deploy_goal_pose.py:871 하나뿐). 콜백이
+    # 설계 500 Hz 보다 느리게 실행되면 정책이 보는 시간축 전체가 같이 느려진다.
+    #
+    # 실기 로그(realdata/2026-08-0x_real_walk_i3b.csv, 91틱)가 이 기전의 지문을
+    # 그대로 담고 있다 -- gait_process 증분 90개가 **전부 0.004 의 정수배**이고
+    # (0.004 = time_step 0.002 x gait_freq 2.0 = 콜백 1회분 위상), 값이 7개뿐이며
+    # 잔차가 정확히 0 이다. 벽시계였다면 연속분포에 sd 0.0167 이 나와야 한다.
+    #
+    # ⛔ MuJoCo 는 물리 스텝(dt=0.002)이 콜백과 1:1 이라 두 시계가 자동으로 같다.
+    # 팽창을 재현하려면 **명시적으로 갈라야** 한다: 물리는 --period-ms 마다 정책을
+    # 부르고, 정책에 넘기는 시계는 nominal(dt*decimation) 만큼만 전진시킨다.
+    ap.add_argument("--clock-mode", choices=["sim", "counter"], default="sim",
+                    help="정책에 넘기는 시간축. sim=물리 시간(=완전한 벽시계, 팽창 없음). "
+                         "counter=틱당 nominal dt*decimation 만 전진하는 카운터"
+                         "(=실기 Timer 재현). --period-ms 가 nominal 과 같으면 둘은 "
+                         "동일해야 한다 -- 그 널 셀이 이 플래그의 자체 검증이다.")
+    ap.add_argument("--tick-replay", default=None,
+                    help="틱 주기를 CSV 에서 재생한다. 헤더 wall_dt_s,counter_dt_s. "
+                         "실기 로그에서 뽑은 (벽시계 주기, 카운터 증분) 쌍을 순환 재생해 "
+                         "지터까지 포함한 조건을 만든다. tools/make_tick_replay.py 가 만든다.")
     ap.add_argument("--no-torque-clamp", action="store_true",
                     help="토크 클램프를 푼다. sim은 URDF effort로 하드 클램프하는데 실기는 "
                          "deploy가 tau=0으로 온보드 PD에 맡겨 막지 않는다. 실기 2.4초에서 "
@@ -421,7 +446,31 @@ def main():
         print("관절 영점 오차(도): %s" % np.round(np.degrees(joint_bias[10:22]), 2))
 
     period_s = (args.period_ms / 1000.0) if args.period_ms else (dt * decim)
+    nominal_period_s = dt * decim         # 카운터 시계가 틱마다 전진하는 양(=0.020)
+    tick_replay = None
+    if args.tick_replay:
+        import csv as _csv
+        with open(args.tick_replay, newline="", encoding="utf-8") as f:
+            rd = _csv.DictReader(f)
+            tick_replay = [(float(r["wall_dt_s"]), float(r["counter_dt_s"])) for r in rd]
+        if not tick_replay:
+            raise SystemExit("--tick-replay 파일이 비었다: %s" % args.tick_replay)
+        print("틱 재생: %d 쌍, 벽시계 mean %.5f s / 카운터 mean %.5f s (비 %.4f)"
+              % (len(tick_replay),
+                 sum(w for w, _ in tick_replay) / len(tick_replay),
+                 sum(c for _, c in tick_replay) / len(tick_replay),
+                 sum(c for _, c in tick_replay) / max(sum(w for w, _ in tick_replay), 1e-9)))
+    if args.clock_mode == "counter":
+        print("시계: 카운터 (틱당 %.4f s 전진) -- 실기 Timer 재현" % nominal_period_s)
     next_infer = 0.0
+    clk = 0.0                             # 정책에 넘기는 카운터 시계
+    clk_elapsed = 0.0                     # 카운터가 실제로 전진한 총량
+    last_tick_t = 0.0
+    tick_dt_s = period_s
+    replay_i = 0
+    gp_prev = 0.0
+    phase_total = 0.0                     # 보행 위상 누적(랩 복원) -- 실기와 같은 통계
+    phase_incr = []
     next_filt = 0.0
     # 실기와 같은 지표를 낸다: 관절별 |tau| 분위수와 부호전환 횟수.
     tau_hist = [[] for _ in range(nj)]
@@ -477,7 +526,18 @@ def main():
         obs_dq = dq + (rng.normal(0.0, args.dofvel_noise, nj) if args.dofvel_noise > 0 else 0.0)
 
         if t >= next_infer - 1e-9:
-            next_infer = t + period_s
+            # 게이트는 **누산**이다(deploy_goal_pose.py:1753 `+= policy_interval`).
+            # `= t + period` 로 리셋하면 period 가 dt 의 배수가 아닐 때 매 틱 올림이
+            # 누적돼 실효 주기가 최대 dt 만큼 길어진다(26.14 ms -> 27 ms, -3 %).
+            # 실기 데이터가 이 규칙을 확증한다: 틱당 콜백수 mean 9.989 ~= decimation 10.
+            if tick_replay is not None:
+                wall_dt, cnt_dt = tick_replay[replay_i % len(tick_replay)]
+                replay_i += 1
+            else:
+                wall_dt, cnt_dt = period_s, nominal_period_s
+            next_infer += wall_dt
+            tick_dt_s = t - last_tick_t
+            last_tick_t = t
             if args.stand:
                 # 배포의 도착 상태. _update_arrival_gait가 stop_radius 안에서
                 # gait_frequency를 0으로 내리고, 정책은 그 조건을 학습에서 봤다.
@@ -489,13 +549,27 @@ def main():
                 c, s = math.cos(-yaw), math.sin(-yaw)
                 grx, gry = c * dx - s * dy, s * dx + c * dy
                 herr = wrap_pi(goal[2] - yaw)
+            # 정책은 `advance_gait_clock` 안에서 이 값의 **차분**으로 위상을 적분한다.
+            # sim 모드면 물리 시간이 그대로 가고(팽창 없음), counter 모드면 틱당
+            # nominal 만 가므로 벽시계 케이던스가 nominal/wall_dt 배로 줄어든다.
+            clock_arg = clk if args.clock_mode == "counter" else t
             targets = policy.inference(
-                t, (q + joint_bias).astype(np.float32), obs_dq.astype(np.float32),
+                clock_arg, (q + joint_bias).astype(np.float32), obs_dq.astype(np.float32),
                 obs_w.astype(np.float32), obs_g.astype(np.float32),
                 grx, gry, herr)
+            clk += cnt_dt
+            clk_elapsed += cnt_dt
+            # 실기 로그와 **같은 통계**로 잰다: 랩을 복원한 위상 증분.
+            _x = policy.gait_process - gp_prev
+            if _x < -0.5:
+                _x += 1.0
+            if abs(_x) > 1e-12:
+                phase_incr.append(_x)
+            phase_total += _x
+            gp_prev = policy.gait_process
             if dump_fp is not None:
                 rr = math.atan2(R[2, 1], R[2, 2]); pp = math.asin(-max(-1.0, min(1.0, R[2, 0])))
-                head = [t, 0.001, period_s, math.degrees(tilt_rad_prev), rr, pp,
+                head = [t, 0.001, tick_dt_s, math.degrees(tilt_rad_prev), rr, pp,
                         ang_vel[0], ang_vel[1], ang_vel[2],
                         1.0, policy.gait_frequency, policy.gait_process, grx, gry, herr]
                 body = (list(q[10:22]) + list(dq[10:22])
@@ -606,6 +680,22 @@ def main():
         "period_ms": round(period_s * 1000.0, 2),
         "torque_clamped": not args.no_torque_clamp,
     }
+    # ---- 시계 팽창 지표 ----------------------------------------------------
+    # 실기 로그와 **같은 통계**다: 랩 복원한 위상 증분의 분포와, 총위상/총시간.
+    # 실기 실측(91틱): cadence 1.5116 Hz, 증분 median 0.040 / sd 0.00424 / 고유 7값.
+    if phase_incr:
+        _pi = np.array(phase_incr)
+        res["gait"] = {
+            "cadence_hz": round(float(phase_total / max(args.duration, 1e-9)), 4),
+            "commanded_hz": round(float(policy.gait_frequency), 3),
+            "ticks": len(_pi),
+            "incr_median": round(float(np.median(_pi)), 6),
+            "incr_sd": round(float(np.std(_pi)), 6),
+            "incr_unique": int(len(set(np.round(_pi, 9)))),
+            "clock_ratio": round(float(clk_elapsed / max(args.duration, 1e-9)), 4),
+            "clock_mode": args.clock_mode,
+            "tick_replay": os.path.basename(args.tick_replay) if args.tick_replay else None,
+        }
     LEGN = ["L_HipP","L_HipR","L_HipY","L_Knee","L_AnkP","L_AnkR",
             "R_HipP","R_HipR","R_HipY","R_Knee","R_AnkP","R_AnkR"]
     URDF_LIM = [30,20,20,40,20,15]*2
