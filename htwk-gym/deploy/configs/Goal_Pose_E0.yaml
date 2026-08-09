@@ -191,6 +191,16 @@ safety:
   fall_tilt_limit_rad: 0.785      # 45 deg
   roll_pitch_limit_rad: 1.0       # legacy name, used only if the above is absent
 
+  # ⭐ motor_state_serial 표본 게이트 (ibatch §8-69).
+  # 발목 roll 두 채널이 물리적으로 불가능한 표본을 섞어 보낸다 -- 손 실측 물리
+  # 스톱(±0.40) 밖에 착지하고, 절반 가까이가 다음 틱에 되돌아오며, 직전 값과
+  # 상관이 없다. 그 값이 여과 없이 policy 관측으로 들어갔다(보행 중 왼발목 44 %).
+  # 30 rad/s: 관측된 진짜 관절 운동은 최대 3 rad/s 이고 오염은 LowState dt 환산
+  # 190~1,000 rad/s 다. 두 자릿수 사이라 어느 쪽에도 안 걸친다.
+  # 0 으로 두면 게이트가 꺼진다(음성 대조군).
+  low_state_max_joint_rate_rps: 30.0
+  low_state_max_consecutive_reject: 5
+
   recovery:
     enable: true
     # Authoritative fall state + whether the SDK will run its get-up. Measured

@@ -622,6 +622,32 @@ class Controller:
         # 가르려면 이게 있어야 한다.
         self.dof_tau = np.zeros(n, dtype=np.float32)
 
+        # ⭐ motor_state_serial 발목 roll 이 **물리적으로 불가능한 표본**을 섞어 보낸다
+        # (ibatch §8-69). 서기 로그 6,330행에서 다리가 멈춰 있을 때 도약률 0.02 %
+        # 인데 |Δ발목pitch| > 0.1 rad/tick 이면 26~36 % 다. 도약 표본은
+        #   * 손 실측 물리 스톱(±0.40) **밖**에 착지하고 (같은 채널 단위로)
+        #   * 42~53 % 가 다음 틱에 그대로 되돌아오며
+        #   * 직전 값과 **상관이 없다**(q_after 기울기 -0.11 ~ -0.38)
+        # 즉 관절이 움직인 것이 아니라 **표본이 바뀐 것**이다. 그런데 이 값은
+        # 여과 없이 policy 관측(dof_pos/dof_vel)과 명령 경로(dof_pos_latest)로
+        # 그대로 들어간다. 보행 중 왼발목은 **틱의 44 %** 가 오염돼 있었다.
+        #
+        # 그래서 물리적으로 불가능한 속도를 만드는 표본을 버리고 직전 값을 유지한다.
+        # LowState 는 ~380 Hz(dt 2.6 ms)라 진짜 운동(관측 최대 3 rad/s)과
+        # 오염(같은 dt 환산 190~1,000 rad/s) 사이가 두 자릿수 벌어져 있다 --
+        # 기본 30 rad/s 는 그 사이 어디에도 안 걸치는 값이다.
+        # 연속 거부에 상한을 두는 이유: 진짜로 값이 튀는 정당한 경우(재영점 등)에
+        # 옛 값을 영원히 붙들면 그게 더 위험하다.
+        self._dof_gate_max_rate = float(
+            self.cfg.get("safety", {}).get("low_state_max_joint_rate_rps", 30.0))
+        self._dof_gate_max_consec = int(
+            self.cfg.get("safety", {}).get("low_state_max_consecutive_reject", 5))
+        self._dof_gate_prev = None          # 마지막으로 **채택한** q
+        self._dof_gate_prev_t = None        # 그때의 monotonic 시각
+        self._dof_gate_consec = np.zeros(n, dtype=np.int32)
+        self._dof_gate_rejected = np.zeros(n, dtype=np.int64)
+        self._dof_gate_samples = 0
+
     # InitChannel 데드락을 잘라내는 시간(초). 정상 초기화는 1초 안에 끝나므로
     # 8초면 오검출이 없다.
     # 이제 구독자 InitChannel + LowState 게이트(최대 3 s) + rclpy 노드 셋을 전부
@@ -882,8 +908,10 @@ class Controller:
                    np.degrees(roll), np.degrees(pitch)))
         self.timer.tick_timer_if_sim()
         time_now = self.timer.get_time()
-        for i, motor in enumerate(low_state_msg.motor_state_serial):
-            self.dof_pos_latest[i] = motor.q
+        q_raw = self._gate_joint_sample(
+            [motor.q for motor in low_state_msg.motor_state_serial])
+        for i, q in enumerate(q_raw):
+            self.dof_pos_latest[i] = q
         if time_now >= self.next_inference_time:
             self.projected_gravity[:] = rotate_vector_inverse_rpy(
                 low_state_msg.imu_state.rpy[0],
@@ -893,9 +921,42 @@ class Controller:
             )
             self.base_ang_vel[:] = low_state_msg.imu_state.gyro
             for i, motor in enumerate(low_state_msg.motor_state_serial):
-                self.dof_pos[i] = motor.q
-                self.dof_vel[i] = motor.dq
+                # q 는 위에서 이미 통과시킨 값을 쓴다. dq 는 SDK 가 **같은
+                # 오염된 q 에서 유도**한 것이라(MJC 확인: dq p90 22.2 ≈ Δq/Δt 21.9)
+                # q 를 버린 표본은 dq 도 같이 버린다.
+                self.dof_pos[i] = q_raw[i]
+                if self._dof_gate_consec[i] == 0:
+                    self.dof_vel[i] = motor.dq
                 self.dof_tau[i] = motor.tau_est
+
+    def _gate_joint_sample(self, q_in):
+        """물리적으로 불가능한 관절 표본을 버리고 직전 값을 유지한다.
+
+        근거와 판별은 `__init__` 의 `_dof_gate_*` 주석에 있다(ibatch §8-69).
+        `max_rate <= 0` 이면 게이트를 통째로 끈다 -- 음성 대조군용이다.
+        """
+        now = time.monotonic()
+        if self._dof_gate_prev is None or self._dof_gate_max_rate <= 0.0:
+            self._dof_gate_prev = list(q_in)
+            self._dof_gate_prev_t = now
+            return list(q_in)
+        dt = now - self._dof_gate_prev_t
+        prev = self._dof_gate_prev
+        out = list(q_in)
+        if dt > 0.0:
+            budget = self._dof_gate_max_rate * dt
+            for i in range(min(len(out), len(prev), len(self._dof_gate_consec))):
+                if (abs(out[i] - prev[i]) > budget
+                        and self._dof_gate_consec[i] < self._dof_gate_max_consec):
+                    out[i] = prev[i]                    # 직전 값 유지
+                    self._dof_gate_consec[i] += 1
+                    self._dof_gate_rejected[i] += 1
+                else:
+                    self._dof_gate_consec[i] = 0
+        self._dof_gate_prev = out
+        self._dof_gate_prev_t = now
+        self._dof_gate_samples += 1
+        return out
 
     def _send_cmd(self, cmd: LowCmd):
         self.low_cmd_publisher.Write(cmd)
