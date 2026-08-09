@@ -1060,6 +1060,8 @@ class Controller:
     _torque_box = None
     _torque_box_kp = None
     _torque_box_kd = None
+    # 부분 생성 경로(테스트 스텁)에서도 안전하도록 클래스 기본값을 둔다.
+    dof_vel_latest = None
 
     def _apply_torque_box(self, target):
         """학습의 토크 클램프를 위치명령으로 재현한다. 기본 **꺼짐**.
@@ -1094,7 +1096,7 @@ class Controller:
         kd = self._torque_box_kd
         out = np.array(target, dtype=np.float32)
         q = self.dof_pos_latest
-        dq = self.dof_vel_latest
+        dq = self.dof_vel_latest if self.dof_vel_latest is not None else self.dof_vel
         for i, l in lim.items():
             if i >= len(out) or kp[i] <= 0.0:
                 continue
