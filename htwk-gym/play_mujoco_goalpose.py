@@ -987,6 +987,22 @@ def main():
             "flips_per_s": round(tau_flips[10+k]/max(args.duration,1e-9),1),
         }
     res["torque"] = tq
+    if foot_sep and cap_rows and len(cap_rows) == len(foot_sep):
+        # ⛔ 낙상 과도구간이 p1 을 오염시킨다. 낙상 36회 x 0.4 s = 120 s 의 12 % 이고
+        # p1 은 **1 퍼센타일**이라 그 1 % 가 통째로 넘어지는 중일 수 있다.
+        # C48 과 같은 모양이다 -- 지표가 결과에 오염된다.
+        # `cap_rows` 와 `foot_sep` 은 같은 블록에서 같은 주기로 쌓여 인덱스가 정렬돼 있다.
+        _up = np.array([r[2] for r in cap_rows]) < UPRIGHT_DEG
+        _fu = np.array(foot_sep)[_up]
+        if _fu.size:
+            res["foot_sep_upright_m"] = {
+                "p1": round(float(np.percentile(_fu, 1)), 4),
+                "p01": round(float(np.percentile(_fu, 0.1)), 4),
+                "median": round(float(np.median(_fu)), 4),
+                "share_negative": round(float((_fu < 0).mean()), 6),
+                "share_below_0p07": round(float((_fu < 0.07).mean()), 6),
+                "n": int(_fu.size), "share_kept": round(float(_up.mean()), 4),
+            }
     if foot_sep:
         fs = np.array(foot_sep)
         # 발 폭 7.0 cm = 충돌 box 의 폭(§8-45 부수 발견). 그 아래면 두 발이 겹친다.
