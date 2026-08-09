@@ -1533,9 +1533,6 @@ def main():
                   mi=args.max_iterations, dev=dev))
 
 
-if __name__ == "__main__":
-    main()
-
 # ---- NS: 토크 한계를 **벤더값**으로 (2026-08-09, 분석 세션 + MJC 제안) -----------
 #
 # `NQ_armvendor` 가 벤더 물리 보행 축에서 낙상 1.6/30,720 s 로 1위였다(§8-72).
@@ -1587,3 +1584,7 @@ NS_ARMS = {
                        _ARM_VENDOR, _EFFORT_VENDOR),
 }
 N_ARMS.update(NS_ARMS)
+
+
+if __name__ == "__main__":
+    main()
