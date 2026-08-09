@@ -36,13 +36,21 @@
 #   bash tools/run_timedilation_2x2.sh
 set -u
 
-OUT=logs/mujoco/timedilation
+# ⛔ armature 는 이 실험의 **교락 변수**다. 학습 세션 측정: 채점 물리만 armature 로
+# 바꿔도 낙상간격이 1.5 s 와 3,740 s 로 갈린다. 셀 사이에서는 고정되므로 B 대 D 의
+# **대조**는 어느 값에서도 유효하지만, "평균 낙상간격 3.1 s" 같은 **크기**는 그렇지
+# 않다. 그리고 MJCF 기본(asset)은 벤더 기준 가장 큰 값인 무릎이 0 이다.
+# 실기를 재현하려면 vendor 다 -- 로봇에는 벤더 로터 관성이 들어 있다.
+# ⚠️ 게인은 **우리 것을 그대로 둔다.** 로봇이 우리 게인으로 돈다. --vendor-gains 는
+# 다른 로봇을 재는 것이므로 이 스크립트에서는 켜지 않는다.
+ARM=${ARM:-asset}
+OUT=logs/mujoco/timedilation_$ARM
 mkdir -p "$OUT"
 DUR=${DUR:-120}
 # 배포 계보 그대로. 필터 실험(§8-45/§8-47)과 **같은 체크포인트**라 나란히 놓을 수 있다.
 # `deploy/models/goal_pose_i3b.pt` 는 이것을 export 한 것이고 서버에는 없다.
 POLICY=${POLICY:-logs/K1/K1/Goal_Pose_V7/2026-08-04-09-48-36_I3b_stance10/nn/model_200.pt}
-COMMON="--policy $POLICY --real-asset --goal-hold --duration $DUR --seed 0"
+COMMON="--policy $POLICY --real-asset --goal-hold --duration $DUR --seed 0 --armature-preset $ARM"
 
 # 지터 재생 파일을 실기 로그에서 만든다(지문 검증이 그 안에 있다).
 python tools/make_tick_replay.py ../realdata/2026-08-0x_real_walk_i3b.csv \
