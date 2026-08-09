@@ -19,7 +19,7 @@ sys.path.insert(0, HERE)
 # 두면 갈라지므로 재사용한다.
 import test_recovery_reentry as _stub  # noqa: F401
 import numpy as np
-from deploy_goal_pose import GoalPoseController
+from deploy_goal_pose import Controller as GoalPoseController
 
 REAL = os.path.join(DEPLOY, "..", "..", "realdata")
 FAILS = []
