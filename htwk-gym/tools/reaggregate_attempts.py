@@ -109,8 +109,13 @@ def main():
             s_cnt = int(round(direct * n_att))
             source = "직접"
         else:
+            # ⛔ 분모에 **타임아웃 절단**도 넣는다(분석 세션 지적, 2026-08-09).
+            # `segments_censored_by_episode_end` 는 에피소드가 끝나서 잘린 시도다 --
+            # 도착하지도 넘어지지도 않았지만 **시도는 했다.** 빼면 분모가 작아져
+            # 성공률이 과대평가된다(I3b 의 경우 시도의 4.6 %).
+            cens = int(dig(r, "segments_censored_by_episode_end") or 0)
             s_cnt = int(round(float(strict) * int(seg)))
-            n_att = int(seg) + falls
+            n_att = int(seg) + falls + cens
             source = "소급"
 
         ck = dig(r, "input_provenance", "checkpoint", "sha256") or ""

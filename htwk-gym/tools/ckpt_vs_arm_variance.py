@@ -69,6 +69,10 @@ def main():
     ap.add_argument("--root", default="logs")
     ap.add_argument("--min-duration", type=float, default=120.0)
     ap.add_argument("--min-ckpts", type=int, default=3)
+    ap.add_argument("--require-protocol", action="store_true",
+                    help="프로토콜 지문이 없는(`?`) 묶음을 아예 뺀다. run 안에서 "
+                         "체크포인트를 비교할 때도 프로토콜이 같아야 한다 -- 채점 시점이 "
+                         "다르면 env_code_sha 도 갈린다")
     args = ap.parse_args()
 
     # (run, protocol) -> {iteration: (성공수, 시도수)}  같은 셀을 여러 번 잰 경우 최신 하나만.
@@ -99,10 +103,17 @@ def main():
             n_att = dig(r, "success_per_attempt", "attempts") or 0
             s_cnt = int(round(direct * n_att))
         else:
-            s_cnt, n_att = int(round(float(strict) * int(seg))), int(seg) + falls
+            cens = int(dig(r, "segments_censored_by_episode_end") or 0)
+            s_cnt, n_att = int(round(float(strict) * int(seg))), int(seg) + falls + cens
         cells[(run, psha)][it] = (s_cnt, n_att, falls)
 
     groups = {k: v for k, v in cells.items() if len(v) >= args.min_ckpts}
+    # ⛔ 프로토콜 축. 오늘 같은 함정에 **세 번** 걸렸다(Q1 4축 / 재집계 31종 / 여기).
+    # 세 번이면 우연이 아니라 도구 결함이다 -- 지문 없는 묶음을 눈에 띄게 표시하고,
+    # `--require-protocol` 이면 아예 뺀다.
+    unknown = [k for k in groups if k[1] == "?"]
+    if args.require_protocol:
+        groups = {k: v for k, v in groups.items() if k[1] != "?"}
     if not groups:
         sys.exit("체크포인트 {}개 이상인 (run, 프로토콜) 묶음이 없다.".format(args.min_ckpts))
 
@@ -110,6 +121,13 @@ def main():
     print("arm 내(체크포인트) 분산   —   도착률/시도, waypoint, >= {:.0f}s".format(args.min_duration))
     print("=" * 96)
     print("⛔ `best.pth` 는 뺐다 — **좋도록 고른 점**이라 넣으면 arm 내 분산이 과대평가된다.")
+    print("⛔ 분모에 **타임아웃 절단**(`segments_censored_by_episode_end`)도 넣었다.")
+    if unknown:
+        print("⚠️ 프로토콜 지문이 없는 묶음 {}개: {}".format(
+            len(unknown), ", ".join(k[0][:28] for k in unknown)))
+        print("   run 안에서 체크포인트를 비교할 때도 프로토콜이 같아야 한다. "
+              "{}".format("**뺐다**(--require-protocol)." if args.require_protocol
+                          else "확인하려면 --require-protocol 로 다시 돌려라."))
     print()
 
     iqrs = []
