@@ -114,6 +114,50 @@ class GoalPose(BaseTask):
             self.dof_vel_limits[i] = dof_props_asset["velocity"][i].item()
             self.torque_limits[i] = dof_props_asset["effort"][i].item()
 
+        # ---- 관절별 토크 한계 오버라이드 (`asset.torque_limits_by_joint`) --------
+        #
+        # ⚠️ 키가 없으면 **완전한 no-op** 이다(`armature_by_joint` 와 같은 규약).
+        #
+        # 왜 필요한가: URDF `effort`(Hip_P 30 / Hip_R 35 / Hip_Y 20 / Knee 40 / Ankle 20)가
+        # 벤더 실측(**68 / 76 / 38.3 / 112 / 38.3**)보다 1.9~2.8배 낮고, 그 값이
+        # `:944` 의 **하드 클램프**가 되어 정책이 쓸 수 있는 토크 그 자체다.
+        # MJC 9점 사다리: 힙·무릎을 URDF 값으로 조이면 낙상 61.8/120 s, 벤더면 **0**.
+        # ⛔ 단 **발목은 반대**다 -- 안전 창 `[15, 20]` 밖(38.3)이면 낙상이 다시 는다.
+        #   ⇒ 힙·무릎만 벤더로 올리고 발목은 창 안에 두는 것이 지금 근거다.
+        #
+        # ⛔⛔ **두 군데를 같이 고쳐야 한다.** `default_dof_drive_mode: 3`(effort)이라
+        # Isaac 이 `dof_props["effort"]` 로 **자체 클램프**한다. 여기 `self.torque_limits`
+        # 만 올리면 우리 클램프는 통과하고 Isaac 이 URDF 값에서 다시 자른다 =
+        # **조용한 no-op.** 그래서 액터 생성 루프(`:220` 부근)에서 `dof_props["effort"]`
+        # 도 같이 세우고 env0 에서 되읽어 확인한다.
+        self._torque_limits_per_dof = None
+        tq_by_joint = asset_cfg.get("torque_limits_by_joint")
+        if tq_by_joint:
+            rules = {k: float(v) for k, v in tq_by_joint.items() if k != "default"}
+            per_dof, unmatched = [], []
+            for j, name in enumerate(self.dof_names):
+                hits = {k: v for k, v in rules.items() if k in name}
+                if len({round(v, 9) for v in hits.values()}) > 1:
+                    raise ValueError(
+                        f"asset.torque_limits_by_joint 규칙이 관절 '{name}' 에 서로 다른 "
+                        f"값을 준다: {hits}. 규칙을 겹치지 않게 써라.")
+                if hits:
+                    per_dof.append(next(iter(hits.values())))
+                else:
+                    # default 가 없으면 **URDF 값을 유지**한다. 조용히 0 이 되면
+                    # 그 관절이 토크를 못 내고, 그것이 가장 나쁜 실패다.
+                    per_dof.append(float(tq_by_joint.get("default",
+                                                         dof_props_asset["effort"][j].item())))
+                    unmatched.append(name)
+            self._torque_limits_per_dof = per_dof
+            for j in range(self.num_dofs):
+                self.torque_limits[j] = per_dof[j]
+            print("[torque_limits] 관절별 토크 한계 적용: "
+                  + ", ".join(f"{n}={v}" for n, v in zip(self.dof_names, per_dof)))
+            if unmatched:
+                print(f"[torque_limits] 규칙에 안 걸려 URDF 값을 유지한 관절 "
+                      f"{len(unmatched)}개: " + ", ".join(unmatched))
+
         self.dof_stiffness = torch.zeros(self.num_envs, self.num_dofs, dtype=torch.float, device=self.device)
         self.dof_damping = torch.zeros(self.num_envs, self.num_dofs, dtype=torch.float, device=self.device)
         self.dof_friction = torch.zeros(self.num_envs, self.num_dofs, dtype=torch.float, device=self.device)
@@ -217,10 +261,17 @@ class GoalPose(BaseTask):
             # 관절별 armature. **액터가 지금 들고 있는 props 에서 출발**하므로 우리가
             # 건드리는 필드 말고는 전부 그대로다(드라이브 모드·강성·감쇠·한계 포함).
             # 키가 없으면 이 블록 자체가 안 돈다.
-            if self._armature_per_dof is not None:
+            if self._armature_per_dof is not None or self._torque_limits_per_dof is not None:
                 dof_props = self.gym.get_actor_dof_properties(env_handle, actor_handle)
-                for j in range(self.num_dofs):
-                    dof_props["armature"][j] = self._armature_per_dof[j]
+                if self._armature_per_dof is not None:
+                    for j in range(self.num_dofs):
+                        dof_props["armature"][j] = self._armature_per_dof[j]
+                if self._torque_limits_per_dof is not None:
+                    # ⛔ 드라이브 모드가 effort(3) 라 **Isaac 이 이 값으로 자체 클램프**한다.
+                    # 여기를 안 세우면 `self.torque_limits` 만 올라가고 실제 토크는
+                    # URDF 값에서 잘린다 = 레버를 켰다고 믿고 안 켠 arm 이 하나 더 생긴다.
+                    for j in range(self.num_dofs):
+                        dof_props["effort"][j] = self._torque_limits_per_dof[j]
                 self.gym.set_actor_dof_properties(env_handle, actor_handle, dof_props)
                 if i == 0:
                     # 되읽어서 실제로 들어갔는지 확인한다. 설정이 조용히 무시되면
@@ -238,13 +289,26 @@ class GoalPose(BaseTask):
                     # 그래서 **요청값을 float32 로 내린 것**과 비교한다. 가드의 의도
                     # (설정이 조용히 무시되면 0.0 이나 기본값이 되돌아온다)는 그대로
                     # 지켜진다 -- 그 경우 차이가 armature 크기만큼 커서 반드시 걸린다.
-                    want = np.asarray(self._armature_per_dof, dtype=np.float32)
-                    bad = [(self.dof_names[j], float(back["armature"][j]), self._armature_per_dof[j])
-                           for j in range(self.num_dofs)
-                           if abs(float(back["armature"][j]) - float(want[j])) > 1e-9]
-                    if bad:
-                        raise RuntimeError(f"armature 설정이 반영되지 않았다: {bad[:4]}")
-                    print("[armature] env0 되읽기 확인 통과")
+                    if self._armature_per_dof is not None:
+                        want = np.asarray(self._armature_per_dof, dtype=np.float32)
+                        bad = [(self.dof_names[j], float(back["armature"][j]), self._armature_per_dof[j])
+                               for j in range(self.num_dofs)
+                               if abs(float(back["armature"][j]) - float(want[j])) > 1e-9]
+                        if bad:
+                            raise RuntimeError(f"armature 설정이 반영되지 않았다: {bad[:4]}")
+                        print("[armature] env0 되읽기 확인 통과")
+                    if self._torque_limits_per_dof is not None:
+                        # 같은 float32 규약. 조용히 무시되면 URDF 값(1.9~2.8배 차이)이
+                        # 돌아오므로 반드시 걸린다.
+                        wt = np.asarray(self._torque_limits_per_dof, dtype=np.float32)
+                        badt = [(self.dof_names[j], float(back["effort"][j]),
+                                 self._torque_limits_per_dof[j])
+                                for j in range(self.num_dofs)
+                                if abs(float(back["effort"][j]) - float(wt[j])) > 1e-9]
+                        if badt:
+                            raise RuntimeError(
+                                f"torque_limits 설정이 반영되지 않았다: {badt[:4]}")
+                        print("[torque_limits] env0 되읽기 확인 통과")
             self.gym.enable_actor_dof_force_sensors(env_handle, actor_handle)
             self.envs.append(env_handle)
             self.actor_handles.append(actor_handle)

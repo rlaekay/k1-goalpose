@@ -1535,3 +1535,38 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ---- NS: 토크 한계를 **벤더값**으로 (2026-08-09, 분석 세션 + MJC 제안) -----------
+#
+# `NQ_armvendor` 가 벤더 물리 보행 축에서 낙상 1.6/30,720 s 로 1위였다(§8-72).
+# 남은 B 블록(물리 자산) 축이 **effort 한계** 하나다:
+#
+#   URDF   Hip_P 30 / Hip_R 35 / Hip_Y 20 / Knee 40 / Ankle 20
+#   벤더   Hip_P 68 / Hip_R 76 / Hip_Y 38.3 / Knee 112 / Ankle 38.3   (1.9~2.8배)
+#
+# 그 값이 `goal_pose.py:115` -> `:944` 의 **하드 클램프**라 정책이 쓸 수 있는 토크
+# 그 자체다. MJC 9점 사다리: 힙·무릎을 URDF 로 조이면 낙상 **61.8**/120 s, 벤더면 **0**.
+#
+# ⛔ 그런데 **발목은 반대**다 -- 안전 창이 **[15, 20]** 이고 양쪽이 절벽이다
+#   (8->58.2 / 12->1.2 / **15·20->0** / 22->4.8 / 25->41.4 / 38.3->49.2).
+#   ⇒ **힙·무릎만 벤더로 올리고 발목은 창 안(20, URDF 값)에 둔다.**
+#      규칙에 발목을 안 적으면 URDF 값이 유지된다(`torque_limits_by_joint` 규약).
+#
+# ⚠️ MJC 는 **이미 학습된 정책에 클램프를 바꿔 끼운 것**이고, 학습 중 클램프가
+#    정책 형성에 미치는 영향은 못 쟀다. `NS` 가 재는 것이 정확히 그것이다.
+_EFFORT_VENDOR = {
+    "asset.torque_limits_by_joint": {
+        "Hip_Pitch": 68.0,
+        "Hip_Roll": 76.0,
+        "Hip_Yaw": 38.3,
+        "Knee_Pitch": 112.0,
+        # ⛔ Ankle_* 는 일부러 **비워 둔다** = URDF 20 유지 = MJC 안전창 [15,20] 안.
+    },
+}
+
+NS_ARMS = {
+    "NS_effort": merge(_N_BASE, _PATH_ON, _ZERO_ON,
+                       {"commands.path.pause_gait_during_dwell": True},
+                       _ARM_VENDOR, _EFFORT_VENDOR),
+}
+N_ARMS.update(NS_ARMS)
