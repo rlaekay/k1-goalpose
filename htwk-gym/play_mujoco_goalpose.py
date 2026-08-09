@@ -309,6 +309,13 @@ def main():
                          "학습 세션 측정: 채점 물리만 armature 로 바꿔도 낙상간격이 "
                          "1.5 s 와 3,740 s 로 갈린다 -- 이 축을 고정하지 않은 대조는 "
                          "그 차이를 통째로 물려받는다.")
+    ap.add_argument("--ankle-armature", type=float, default=None,
+                    help="발목 4관절 armature 만 이 값으로 (프리셋 **뒤**에 적용). "
+                         "발목 roll |dq| 는 이 값이 단독으로 지배한다 -- 실측: "
+                         "0.0 -> p90 88.8 rad/s, 0.0565 -> 4.4, 실기 22.2 는 그 사이다. "
+                         "⚠️ 벤더 0.056506 은 평행기구 래퍼가 armature_ratio 2.0 을 곱한 "
+                         "뒤의 값인데 K1_serial.xml 은 **직렬 근사**다. 직렬 모델에 그 "
+                         "배율을 쓰는 것이 맞는지는 확인된 적이 없다 -- 아니면 0.028253 이다.")
     ap.add_argument("--vendor-gains", action="store_true",
                     help="벤더 관계식으로 다리 kp/kd 를 armature 에서 유도한다"
                          " (kp = J*(2*pi*4)^2, kd = 2*zeta*J*(2*pi*4), zeta 1.5/무릎 1.0)."
@@ -411,6 +418,17 @@ def main():
             raise SystemExit("armature 프리셋: 왼다리 6관절을 못 찾았다 (%d개) -- "
                              "자산의 관절 이름이 바뀌었다" % len(shown))
         print("armature 프리셋 %s: %s" % (args.armature_preset, " | ".join(shown)))
+    if args.ankle_armature is not None:
+        n_ank = 0
+        for j in range(model.njnt):
+            jn = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j) or ""
+            if "Ankle" not in jn:
+                continue
+            model.dof_armature[model.jnt_dofadr[j]] = args.ankle_armature
+            n_ank += 1
+        if n_ank != 4:
+            raise SystemExit("발목 관절 4개를 못 찾았다 (%d개)" % n_ank)
+        print("발목 armature -> %.6f (4관절)" % args.ankle_armature)
     if args.leg_armature is not None:
         n_changed = 0
         for j in range(model.njnt):
