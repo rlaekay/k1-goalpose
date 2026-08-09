@@ -179,6 +179,17 @@ def main():
     ap.add_argument("--imu-bias-deg", type=float, default=0.0,
                     help="중력벡터에 실행 내내 고정된 기울기 바이어스 (도). "
                          "학습의 noise.gravity는 평균 0이라 바이어스를 본 적이 없다")
+    # ---- 자세 편향 (배포 세션 요청: 실기 두 실행을 가른 유일한 양) ---------
+    # 실기 붕괴 roll median **+3.47도** / pitch **-1.86도**, 9걸음 성공은 -1.04 / +0.66.
+    # **두 축 모두 3배**이고, 배포의 `b`~`r` 진입자세 수정이 정확히 이 양을 건드렸다
+    # (tilt median 4.9~13.8 -> 1.4도). 어느 셀도 이것을 모델링하지 않았다.
+    # 중력벡터에 **축을 지정해** 상시 편향을 건다: 정책이 기울기를 0 으로 착각하면
+    # 몸통을 실제로 그만큼 기운 채 유지한다 = 지속적인 자세 편향.
+    # ⚠️ roll/pitch 부호 규약을 실기에서 확인하지 않았으므로 두 부호를 다 돈다.
+    ap.add_argument("--imu-bias-roll-deg", type=float, default=0.0,
+                    help="중력벡터를 몸통 x축(roll) 둘레로 상시 회전 (도)")
+    ap.add_argument("--imu-bias-pitch-deg", type=float, default=0.0,
+                    help="중력벡터를 몸통 y축(pitch) 둘레로 상시 회전 (도)")
     ap.add_argument("--gyro-noise", type=float, default=0.0,
                     help="base_ang_vel 가우시안 잡음 (std, rad/s)")
     ap.add_argument("--dofvel-noise", type=float, default=0.0,
@@ -534,6 +545,11 @@ def main():
     bias_axis = rng.normal(size=3)
     bias_axis /= np.linalg.norm(bias_axis)
     bias_rad = math.radians(args.imu_bias_deg)
+    bias_roll_rad = math.radians(args.imu_bias_roll_deg)
+    bias_pitch_rad = math.radians(args.imu_bias_pitch_deg)
+    if bias_roll_rad or bias_pitch_rad:
+        print("자세 편향: roll %+.2f도 / pitch %+.2f도 (상시)"
+              % (args.imu_bias_roll_deg, args.imu_bias_pitch_deg))
     lag_steps = int(round(args.sense_lag_ms / 1000.0 / dt))
     sense_buf = []          # (proj_g, ang_vel) 물리 스텝마다 append
 
@@ -681,6 +697,10 @@ def main():
             sense_buf.pop(0)
         s_g, s_w = sense_buf[0] if lag_steps > 0 else (proj_g, ang_vel)
         obs_g = tilt(s_g, bias_rad, bias_axis)
+        if bias_roll_rad:
+            obs_g = tilt(obs_g, bias_roll_rad, np.array([1.0, 0.0, 0.0]))
+        if bias_pitch_rad:
+            obs_g = tilt(obs_g, bias_pitch_rad, np.array([0.0, 1.0, 0.0]))
         if args.imu_noise_deg > 0.0:
             n_ax = rng.normal(size=3)
             n_ax /= max(np.linalg.norm(n_ax), 1e-9)
@@ -1058,6 +1078,7 @@ def main():
                 [e["sep_min_1s"] < 0.0 for e in fall_events])), 3),
         }
         res["fall_events"] = fall_events[:40]      # 전수는 크다 -- 앞 40건만
+    res["imu_bias_deg"] = {"roll": args.imu_bias_roll_deg, "pitch": args.imu_bias_pitch_deg}
     res["armature_preset"] = args.armature_preset
     res["vendor_gains"] = bool(args.vendor_gains)
     res["act_lag_ms"] = args.act_lag_ms
