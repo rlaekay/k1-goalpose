@@ -172,7 +172,15 @@ def main():
                          "deploy_actual=**실기 실제 조건**(힙·무릎 벤더 + 발목 20) — "
                          "common.torque_limit 이 전역이 아니라 평행발목 경로에만 걸리기 때문이다.")
     ap.add_argument("--goal-hold", action="store_true",
-                    help="목표를 로컬 2 m 앞에 고정한다(forward_hold). 도착하지 않으므로 계속 걷는다")
+                    help="목표를 **로봇 좌표계** 2 m 앞에 고정한다(forward_hold). 도착하지 않으므로 "
+                         "계속 걷는다. ⛔ heading_err 을 상수 0 으로 넣으므로 **yaw 피드백이 없다** — "
+                         "정책에 좌우 비대칭이 있으면 그대로 적분되어 원을 그린다. 실측: 120 s 에 "
+                         "**3.9~5.6 바퀴**(yaw −0.2 rad/s, 반경 7.5 m). 셀 비교는 조건이 같아 유효하나 "
+                         "**회전율이 셀마다 다르다**(20 ms −2013° 대 24 ms −1400°) ⇒ 조건과 상관된 교락.")
+    ap.add_argument("--goal-straight", action="store_true",
+                    help="⭐ 직진 과제. 목표를 **월드 좌표계에서 처음 향한 방향** 2 m 앞에 두고 "
+                         "heading_err 을 실제로 계산한다 ⇒ yaw 피드백이 살아 있어 직진한다. "
+                         "--goal-hold 의 회전 교락을 없앤 판이다.")
     ap.add_argument("--stand", action="store_true",
                     help="배포의 도착 상태를 그대로 재현한다: 목표 (0,0,0) + gait_frequency 0. "
                          "이 조건은 학습에 있다 -- goal_categories.stand 10 %, 목표 거리 정확히 0, "
