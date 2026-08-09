@@ -636,7 +636,12 @@ def main():
         print("Trunk 지속 외력 %.1f N (%s, 월드축 %d)"
               % (args.body_force_n, args.body_force_dir, _ax))
     FALL_BUF_N = 1200                 # 2.4 s @ dt 0.002
+    FF_WIN = 250                      # 0.5 s -- 낙상 직전에 발이 걸렸는지 보는 창
     fall_buf, fall_events = [], []
+    ff_steps = ff_episodes = 0
+    ff_prev = False
+    ff_depth_min = 0.0
+    ff_recent = []
     stand_tilt, stand_drift = [], []
     px0 = py0 = 0.0          # stand 모드의 기준점: 첫 스텝의 위치
     t = 0.0
@@ -786,6 +791,28 @@ def main():
         # 낙상 판정은 물리 스텝(500 Hz)에서 돌고 **즉시 리셋**된다. 실제로 75회 중
         # 2회만 잡혔다. 방향(측방/전방)은 낙상의 판별 축인데 그 표본으로는 못 센다.
         # 그래서 링버퍼를 두고 사건이 나면 그 자리에서 되짚는다.
+        # ---- 발끼리 실제 충돌 (간격은 대리지표일 뿐이다) --------------------
+        # ⛔ 방향(측방/전방) 분류로는 이 기전을 못 잡는다. **남의 발에 걸리면 앞으로
+        # 고꾸라진다** -- 전방 우세는 발 걸림과 모순이 아니라 그 예상 결과다.
+        # 그래서 두 발 geom 사이의 접촉을 직접 센다.
+        _ff = False
+        _ffdepth = 0.0
+        for _c in range(data.ncon):
+            _b1 = model.geom_bodyid[data.contact[_c].geom1]
+            _b2 = model.geom_bodyid[data.contact[_c].geom2]
+            if (_b1 == foot_bid[0] and _b2 == foot_bid[1]) or \
+               (_b1 == foot_bid[1] and _b2 == foot_bid[0]):
+                _ff = True
+                _ffdepth = min(_ffdepth, float(data.contact[_c].dist))
+        if _ff:
+            ff_steps += 1
+            ff_depth_min = min(ff_depth_min, _ffdepth)
+            if not ff_prev:
+                ff_episodes += 1
+        ff_prev = _ff
+        ff_recent.append(_ff)
+        if len(ff_recent) > FF_WIN:
+            del ff_recent[0]
         _rr = math.atan2(R[2, 1], R[2, 2])
         _pp = math.asin(-max(-1.0, min(1.0, R[2, 0])))
         _fd = data.xpos[foot_bid[0]][:2] - data.xpos[foot_bid[1]][:2]
@@ -811,6 +838,8 @@ def main():
                 "lead_10_to_fall_s": round(t - fall_buf[j10][0], 3),
                 "sep_min_1s": round(min(r[4] for r in fall_buf[-500:]), 4),
                 "lateral": abs(fall_buf[j20][2]) > abs(fall_buf[j20][3]),
+                # ⭐ 낙상 직전 0.5 s 안에 두 발이 실제로 부딪혔는가
+                "foot_foot_before": bool(any(ff_recent)),
             })
         if args.stand:
             # 서 있는 과제에는 도착도 구간도 없다. 재는 것은 두 가지다 --
@@ -970,8 +999,16 @@ def main():
             "final": round(float(lp[-1]), 4),
             "delta": round(float(np.median(lp[-k:]) - np.median(lp[:k])), 4),
         }
+    res["foot_foot"] = {
+        "episodes": ff_episodes,
+        "per_min": round(ff_episodes / max(args.duration / 60.0, 1e-9), 1),
+        "time_share": round(ff_steps / max(nsteps, 1), 5),
+        "max_penetration_m": round(-ff_depth_min, 4),
+    }
     if fall_events:
         lat = [e for e in fall_events if e["lateral"]]
+        res["foot_foot"]["falls_preceded"] = round(float(np.mean(
+            [e["foot_foot_before"] for e in fall_events])), 3)
         res["fall_mode"] = {
             "n": len(fall_events),
             "lateral": len(lat),
