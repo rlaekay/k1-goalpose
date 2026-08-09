@@ -107,7 +107,10 @@ check("T5b-음성 대조(지연 틱의 진짜 운동 통과)", out[0] == 0.072)
 
 def replay(path, qcols):
     rows = list(csv.DictReader(open(path, newline="", encoding="utf-8")))
-    s = make_gate(n=12)
+    # step=0: 절대 상한은 재생에서 끈다. 상한은 dt > 6.7 ms 에서만 걸리는데
+    # 이 로그의 모든 행이 25 ms 라 -- 실기에서는 예외인 지연 콜백이 재생에서는
+    # 전부가 된다. 상한 동작은 T5b 가 합성으로 검사한다.
+    s = make_gate(n=12, step=0.0)
     kept = []
     t = 0.0
     for r in rows:
