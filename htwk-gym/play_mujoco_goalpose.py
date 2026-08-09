@@ -352,6 +352,13 @@ def main():
     ap.add_argument("--corrupt-dq-range", type=float, default=33.0,
                     help="교체 표본 dq 의 균일분포 반폭(rad/s). 실기 |dq| max 32.8. "
                          "0 이면 q 만 오염시킨다(보수적 하한).")
+    # ⚠️ 발목 P/R 을 **분리**한다. 학습 자산(armsdown)이 Ankle_P 20 / Ankle_R 15 로
+    # 다르게 두고 있고, 포화율도 P 17.6 % 대 R 4.0 % 로 4배 갈린다. 하나로 묶으면
+    # 지배적인 P 축이 R 축을 가린다.
+    ap.add_argument("--ankle-torque-p", type=float, default=None,
+                    help="Ankle_Pitch 토크 상한만 덮는다(프리셋 뒤에 적용)")
+    ap.add_argument("--ankle-torque-r", type=float, default=None,
+                    help="Ankle_Roll 토크 상한만 덮는다(프리셋 뒤에 적용)")
     ap.add_argument("--ankle-armature", type=float, default=None,
                     help="발목 4관절 armature 만 이 값으로 (프리셋 **뒤**에 적용). "
                          "발목 roll |dq| 는 이 값이 단독으로 지배한다 -- 실측: "
@@ -516,6 +523,16 @@ def main():
         model.actuator_forcerange[10:22, 0] = -np.array(lim[10:22])
         model.actuator_forcerange[10:22, 1] = np.array(lim[10:22])
         print("토크 상한: %s %s (forcerange 도 함께 상향)" % (args.torque_limits, lim[10:16]))
+    # 발목 P/R 개별 덮어쓰기 -- 프리셋 **뒤**라 어떤 프리셋 위에도 얹힌다.
+    for _v, _idx, _nm in ((args.ankle_torque_p, (14, 20), "Ankle_Pitch"),
+                          (args.ankle_torque_r, (15, 21), "Ankle_Roll")):
+        if _v is None:
+            continue
+        for _i in _idx:
+            lim[_i] = _v
+            model.actuator_forcerange[_i, 0] = -_v
+            model.actuator_forcerange[_i, 1] = _v
+        print("  %s 토크 상한 -> %.1f" % (_nm, _v))
     else:
         print("토크 상한: 벤더 MJCF/배포 %s" % lim[10:16])
 
@@ -1167,6 +1184,8 @@ def main():
         }
         res["fall_events"] = fall_events[:40]      # 전수는 크다 -- 앞 40건만
     res["imu_bias_deg"] = {"roll": args.imu_bias_roll_deg, "pitch": args.imu_bias_pitch_deg}
+    res["ankle_torque"] = {"p": args.ankle_torque_p, "r": args.ankle_torque_r,
+                           "preset": args.torque_limits}
     res["armature_preset"] = args.armature_preset
     res["vendor_gains"] = bool(args.vendor_gains)
     res["act_lag_ms"] = args.act_lag_ms
