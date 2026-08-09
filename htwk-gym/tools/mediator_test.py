@@ -65,7 +65,11 @@ def divergence(d):
         return None
     y, vy = lateral(d)
     y, vy, sup, tt = y[m], vy[m], d["support"][m], t[m]
-    land = np.where((sup[1:] >= 2) & (sup[:-1] < 2))[0] + 1
+    # ⛔ 이 정책은 **뛴다.** 양발지지가 12,000 표본 중 1~4 개뿐이고 비행이 12~19 % 다.
+    # 착지는 "양발 진입" 이 아니라 **비행 -> 접지** 다. 원래 검출(1->2)은 사건이 없었다.
+    # ⚠️ 그리고 이것이 LIP 전제에 걸린다 -- 비행 중에는 CoP 가 없어 측방 발산을
+    # 제어할 수단이 아예 없다. 반스텝을 "지지 구간" 으로 재정의해야 한다.
+    land = np.where((sup[1:] >= 1) & (sup[:-1] < 1))[0] + 1
     if land.size < 6:
         return None
     # 착지 시점의 측방 불안정 모드 |xi| = |y + vy*tau| (반스텝 평균을 뺀 편차)
@@ -84,6 +88,7 @@ def divergence(d):
     out["vy_land_p90"] = float(np.percentile(np.abs(vy[land]), 90))
     out["xi_step_median"] = float(np.median(seg_xi))
     out["half_step_s"] = float(np.median(np.diff(tt[land])))
+    out["flight_share"] = float((sup < 1).mean())
     return out
 
 
@@ -118,7 +123,7 @@ def main():
     root = sys.argv[1] if len(sys.argv) > 1 else "logs/mujoco/mediator"
     print("=" * 96)
     print("① LIP 측방 발산 — 예측: 반스텝 T/2 에 대해 exp((T/2)/%.3f)" % TAU)
-    print("%-16s %8s %10s %11s %12s %11s" % ("셀", "착지수", "반스텝s", "측방진폭m", "|vy|착지p90", "예측대비"))
+    print("%-14s %7s %9s %8s %10s %11s %s" % ("셀", "착지수", "반스텝s", "비행%", "측방진폭m", "|vy|p90", "예측대비"))
     base = None
     for p in sorted(glob.glob(os.path.join(root, "clean_*_series.npz"))):
         d = load(p)
@@ -135,9 +140,9 @@ def main():
             e = np.exp((r["half_step_s"] - base["half_step_s"]) / TAU)
             obs = r["lat_amp_median"] / base["lat_amp_median"]
             pred = "예측 %+.1f%% / 관측 %+.1f%%" % (100 * (e - 1), 100 * (obs - 1))
-        print("%-16s %8d %10.4f %11.5f %12.4f %11s"
+        print("%-14s %7d %9.4f %7.1f%% %10.5f %11.4f %s"
               % (os.path.basename(p)[6:-11], r["n_land"], r["half_step_s"],
-                 r["lat_amp_median"], r["vy_land_p90"], pred))
+                 100 * r["flight_share"], r["lat_amp_median"], r["vy_land_p90"], pred))
     print()
     print("=" * 96)
     print("② 낙상 직전 명령 서명 — 낙상 −0.5~0 s 대 대조 −4~−2 s")
