@@ -39,7 +39,10 @@ set -u
 OUT=logs/mujoco/timedilation
 mkdir -p "$OUT"
 DUR=${DUR:-120}
-COMMON="--real-asset --goal-hold --duration $DUR --seed 0"
+# 배포 계보 그대로. 필터 실험(§8-45/§8-47)과 **같은 체크포인트**라 나란히 놓을 수 있다.
+# `deploy/models/goal_pose_i3b.pt` 는 이것을 export 한 것이고 서버에는 없다.
+POLICY=${POLICY:-logs/K1/K1/Goal_Pose_V7/2026-08-04-09-48-36_I3b_stance10/nn/model_200.pt}
+COMMON="--policy $POLICY --real-asset --goal-hold --duration $DUR --seed 0"
 
 # 지터 재생 파일을 실기 로그에서 만든다(지문 검증이 그 안에 있다).
 python tools/make_tick_replay.py ../realdata/2026-08-0x_real_walk_i3b.csv \
