@@ -604,6 +604,7 @@ def main():
     tau_hist = [[] for _ in range(nj)]
     hiproll_hist = []
     foot_sep = []
+    foot_sep_t = []
     foot_bid = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "%s_foot_link" % s)
                 for s in ("left", "right")]
     if any(b < 0 for b in foot_bid):
@@ -812,6 +813,7 @@ def main():
             _d = data.xpos[foot_bid[0]][:2] - data.xpos[foot_bid[1]][:2]
             _c, _s = math.cos(-yaw), math.sin(-yaw)
             foot_sep.append(float(_s * _d[0] + _c * _d[1]))
+            foot_sep_t.append(t)
             # 실기와 같은 정의: roll(트렁크) + gx(롤 각속도)*tau
             _roll = math.atan2(R[2, 1], R[2, 2])
             cap_rows.append((math.degrees(_roll + ang_vel[0] * CAP_TAU),
@@ -987,6 +989,37 @@ def main():
             "flips_per_s": round(tau_flips[10+k]/max(args.duration,1e-9),1),
         }
     res["torque"] = tq
+    # ⛔ 직립 필터(tilt<15도)로는 부족하다. tilt 5~15도 는 **이미 넘어지는 중의
+    # 허둥댐**이고 거기서 다리가 엉킨다 -- 낙상이 많은 칸일수록 p1 이 내려가는 것이
+    # 낙상의 **결과**일 수 있다. 그래서 낙상 시각에서 떨어진 표본만으로 다시 낸다.
+    if foot_sep and foot_sep_t and fall_events is not None:
+        _ft = np.array([e["t"] for e in fall_events], dtype=float)
+        _ts = np.array(foot_sep_t, dtype=float)
+        _fs_all = np.array(foot_sep, dtype=float)
+        _tilt = (np.array([r[2] for r in cap_rows], dtype=float)
+                 if len(cap_rows) == len(foot_sep) else np.zeros_like(_ts))
+        if _ft.size:
+            _idx = np.searchsorted(_ft, _ts, side="left")
+            _gap = np.where(_idx < _ft.size, _ft[np.minimum(_idx, _ft.size - 1)] - _ts, np.inf)
+            _first = _ts < _ft[0]
+        else:
+            _gap = np.full(_ts.shape, np.inf)
+            _first = np.ones_like(_ts, dtype=bool)
+        res["foot_sep_prefall_m"] = {}
+        for _lab, _m in (("before_first_fall", _first),
+                         ("gap_gt_1s", _gap > 1.0),
+                         ("gap_gt_2s", _gap > 2.0)):
+            _v = _fs_all[_m & (_tilt < UPRIGHT_DEG)]
+            res["foot_sep_prefall_m"][_lab] = ({
+                "p1": round(float(np.percentile(_v, 1)), 4),
+                "median": round(float(np.median(_v)), 4),
+                "share_negative": round(float((_v < 0).mean()), 6),
+                "n": int(_v.size),
+            } if _v.size >= 200 else {"n": int(_v.size), "note": "표본 부족"})
+        # 원시 시계열을 남긴다 -- 같은 질문으로 또 재실행하지 않기 위해서다.
+        if args.out:
+            np.savez_compressed(os.path.splitext(args.out)[0] + "_series.npz",
+                                t=_ts, foot_sep=_fs_all, tilt=_tilt, fall_t=_ft)
     if foot_sep and cap_rows and len(cap_rows) == len(foot_sep):
         # ⛔ 낙상 과도구간이 p1 을 오염시킨다. 낙상 36회 x 0.4 s = 120 s 의 12 % 이고
         # p1 은 **1 퍼센타일**이라 그 1 % 가 통째로 넘어지는 중일 수 있다.
