@@ -291,7 +291,17 @@ def main():
                          "시뮬레이터가 발목만 다른 로봇을 돌렸다. 0 으로 맞추면 Isaac 의 "
                          "발목 roll 분포(평균 7.5-12.8 rad/s, 한계 초과 27-55 %%)가 "
                          "재현되는지가 이 플래그로 갈린다.")
-    ap.add_argument("--armature-preset", choices=["asset", "vendor", "zero"], default="asset",
+    # ---- 배포 세션 요청 셀용 레버 (MJC_TEST_REQUEST_20260809.md §3) --------
+    ap.add_argument("--act-lag-ms", type=float, default=0.0,
+                    help="**액션** 경로의 순수 전달 지연(ms). --sense-lag-ms 는 관측 쪽이라 "
+                         "다른 축이다. 배포 실효 구동 지연 추정 = tick/2 12.2 ms + "
+                         "EMA(fc 6.57 Hz) 위상지연 23.5 ms ~= 35.6 ms. 학습 모델은 0~18 ms 다.")
+    ap.add_argument("--body-force-n", type=float, default=0.0,
+                    help="Trunk 에 거는 지속 외력(N). 실기에서 사용자가 옆에서 잡아준 상태를 "
+                         "흉내낸다 -- 정책은 tilt~0 을 보면서 정체불명의 힘을 받는다.")
+    ap.add_argument("--body-force-dir", choices=["lateral", "forward"], default="lateral",
+                    help="외력 방향(월드 y = 측방 / x = 전방).")
+    ap.add_argument("--armature-preset", choices=["asset", "vendor", "zero", "ankle"], default="asset",
                     help="다리 armature 를 관절별로 정한다. asset=MJCF 그대로"
                          "(발목 0.05, **힙·무릎 0**), vendor=벤더 공식값"
                          "(무릎 0.0956 이 최대), zero=Isaac 과 같은 전 관절 0. "
@@ -386,7 +396,13 @@ def main():
             key = next((k for k in VENDOR_ARMATURE if k in jn), None)
             if key is None:
                 continue
-            v = 0.0 if args.armature_preset == "zero" else VENDOR_ARMATURE[key]
+            if args.armature_preset == "zero":
+                v = 0.0
+            elif args.armature_preset == "ankle":
+                # H3 셀: 발목만 벤더값, 힙·무릎은 0(=학습 조건 그대로).
+                v = VENDOR_ARMATURE[key] if key.startswith("Ankle") else 0.0
+            else:
+                v = VENDOR_ARMATURE[key]
             old = float(model.dof_armature[model.jnt_dofadr[j]])
             model.dof_armature[model.jnt_dofadr[j]] = v
             if jn.startswith("Left"):
@@ -542,6 +558,32 @@ def main():
                 for s in ("left", "right")]
     if any(b < 0 for b in foot_bid):
         raise SystemExit("발 링크를 못 찾았다: left/right_foot_link")
+    # ---- 측방 capture point (MJC_TEST_REQUEST_20260809.md §4 의 판정 축) ----
+    # capture = roll + gx*tau, tau = 0.214 s (LIP 시상수, CoM 높이 0.449 m).
+    # 한계: 단일지지 +-4.4도 = atan(발반폭 0.035 / 0.449), 양발 +-15.2도.
+    # ⚠️ 실기 로그에는 접촉 센서가 없다. 배포 세션이 "단일지지 표본"을 무엇으로
+    # 갈랐는지 문서에 없으므로, 비교 가능하도록 **세 가지 분모를 전부** 낸다.
+    # ⚠️ 그리고 MuJoCo 는 낙상하고 리셋되는데 실기는 잡아준 상태라 낙상이 0 이다.
+    # 낙상 중/직후 표본은 capture 를 자동으로 위반하므로, `upright`(tilt<15도)
+    # 분모를 같이 낸다 -- 그것이 실기가 있던 상태다.
+    CAP_TAU = 0.214
+    CAP_SINGLE_DEG, CAP_DOUBLE_DEG, UPRIGHT_DEG = 4.4, 15.2, 15.0
+    cap_rows = []            # (cap_deg, n_support, tilt_deg)
+    ankroll_dq = []          # |dq| 발목 roll 좌/우
+    hiproll_q = []           # 힙롤 좌/우 (rad)
+    lhip_pitch = []          # L_Hip_Pitch 드리프트용
+
+    def _support_count():
+        """발 링크가 참여한 접촉이 있는 발의 수 (0/1/2)."""
+        hit = [False, False]
+        for c in range(data.ncon):
+            g1, g2 = data.contact[c].geom1, data.contact[c].geom2
+            for g in (g1, g2):
+                b = model.geom_bodyid[g]
+                for k in (0, 1):
+                    if b == foot_bid[k]:
+                        hit[k] = True
+        return int(hit[0]) + int(hit[1])
     dump_fp = None
     if args.dump_csv:
         os.makedirs(os.path.dirname(args.dump_csv) or ".", exist_ok=True)
@@ -563,6 +605,18 @@ def main():
     # 학습 sim에는 이 필터가 없으므로, 이 플래그가 켜진 실행과 꺼진 실행의 차이가
     # 곧 "학습이 모르는 배포 지연"의 비용이다.
     filtered = np.copy(default_q)
+    act_lag_steps = int(round(args.act_lag_ms / 1000.0 / dt))
+    act_buf = []
+    if act_lag_steps > 0:
+        print("액션 전달 지연 %.1f ms (%d 물리 스텝)" % (args.act_lag_ms, act_lag_steps))
+    trunk_bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "Trunk")
+    if args.body_force_n != 0.0:
+        if trunk_bid < 0:
+            raise SystemExit("Trunk 바디를 못 찾았다 -- 외력을 걸 곳이 없다")
+        _ax = 1 if args.body_force_dir == "lateral" else 0
+        data.xfrc_applied[trunk_bid, _ax] = args.body_force_n
+        print("Trunk 지속 외력 %.1f N (%s, 월드축 %d)"
+              % (args.body_force_n, args.body_force_dir, _ax))
     stand_tilt, stand_drift = [], []
     px0 = py0 = 0.0          # stand 모드의 기준점: 첫 스텝의 위치
     t = 0.0
@@ -660,6 +714,14 @@ def main():
             cmd_q = filtered
         else:
             cmd_q = targets
+        # 액션 경로의 순수 전달 지연. 필터 **뒤**에 건다 -- 배포에서도 지연은
+        # 발행 이후(직렬 버스 + 펌웨어)에 생기므로 필터가 먼저다.
+        if act_lag_steps > 0:
+            act_buf.append(np.array(cmd_q, dtype=np.float64))
+            if len(act_buf) > act_lag_steps:
+                cmd_q = act_buf.pop(0)
+            else:
+                cmd_q = np.array(default_q)
         tau = kp * ((cmd_q + joint_bias) - q) - kd * dq
         applied = tau if args.no_torque_clamp else np.clip(tau, -lim, lim)
         # MuJoCo의 actuator forcerange가 여전히 자르므로, 클램프를 정말 풀려면
@@ -676,6 +738,14 @@ def main():
             _d = data.xpos[foot_bid[0]][:2] - data.xpos[foot_bid[1]][:2]
             _c, _s = math.cos(-yaw), math.sin(-yaw)
             foot_sep.append(float(_s * _d[0] + _c * _d[1]))
+            # 실기와 같은 정의: roll(트렁크) + gx(롤 각속도)*tau
+            _roll = math.atan2(R[2, 1], R[2, 2])
+            cap_rows.append((math.degrees(_roll + ang_vel[0] * CAP_TAU),
+                             _support_count(),
+                             math.degrees(math.acos(np.clip(-proj_g[2], -1.0, 1.0)))))
+            ankroll_dq.append((abs(float(dq[15])), abs(float(dq[21]))))
+            hiproll_q.append((float(q[11]), float(q[17])))
+            lhip_pitch.append(float(q[10]))
         for k in range(nj):
             a = float(applied[k])
             tau_hist[k].append(abs(a))
@@ -800,8 +870,59 @@ def main():
             "share_negative": round(float((fs < 0.0).mean()), 6),
             "n": int(fs.size),
         }
+    if cap_rows:
+        cap = np.array([r[0] for r in cap_rows])
+        sup = np.array([r[1] for r in cap_rows])
+        tlt = np.array([r[2] for r in cap_rows])
+        up = tlt < UPRIGHT_DEG          # 실기(잡아준 상태)가 있던 영역
+        single = sup == 1
+
+        def _sh(mask, thr):
+            return (round(float((np.abs(cap[mask]) > thr).mean()), 4)
+                    if mask.sum() else None)
+        res["capture"] = {
+            "tau_s": CAP_TAU,
+            "n": int(cap.size),
+            "abs_max_deg": round(float(np.abs(cap).max()), 2),
+            "p90_abs_deg": round(float(np.percentile(np.abs(cap), 90)), 2),
+            # 판정 축. 분모를 셋 다 낸다 -- 실기 쪽 분모 정의가 문서에 없다.
+            "viol_4p4_single": _sh(single, CAP_SINGLE_DEG),
+            "viol_4p4_single_upright": _sh(single & up, CAP_SINGLE_DEG),
+            "viol_4p4_all": _sh(np.ones_like(up), CAP_SINGLE_DEG),
+            "viol_4p4_all_upright": _sh(up, CAP_SINGLE_DEG),
+            "viol_15p2_all": _sh(np.ones_like(up), CAP_DOUBLE_DEG),
+            "viol_15p2_all_upright": _sh(up, CAP_DOUBLE_DEG),
+            "share_single_support": round(float(single.mean()), 4),
+            "share_flight": round(float((sup == 0).mean()), 4),
+            "share_upright": round(float(up.mean()), 4),
+        }
+    if ankroll_dq:
+        a = np.array(ankroll_dq)
+        res["ankle_roll_dq"] = {
+            "L_p90": round(float(np.percentile(a[:, 0], 90)), 2),
+            "L_max": round(float(a[:, 0].max()), 2),
+            "R_p90": round(float(np.percentile(a[:, 1], 90)), 2),
+            "R_max": round(float(a[:, 1].max()), 2),
+        }
+    if hiproll_q:
+        h = np.array(hiproll_q)
+        res["hip_roll_p2p_rad"] = {
+            "L": round(float(h[:, 0].max() - h[:, 0].min()), 4),
+            "R": round(float(h[:, 1].max() - h[:, 1].min()), 4),
+        }
+    if len(lhip_pitch) >= 8:
+        lp = np.array(lhip_pitch)
+        k = len(lp) // 4
+        res["l_hip_pitch_drift"] = {
+            "first_quarter_median": round(float(np.median(lp[:k])), 4),
+            "last_quarter_median": round(float(np.median(lp[-k:])), 4),
+            "final": round(float(lp[-1]), 4),
+            "delta": round(float(np.median(lp[-k:]) - np.median(lp[:k])), 4),
+        }
     res["armature_preset"] = args.armature_preset
     res["vendor_gains"] = bool(args.vendor_gains)
+    res["act_lag_ms"] = args.act_lag_ms
+    res["body_force_n"] = args.body_force_n
     if hiproll_hist:
         hl = np.array([h[0] for h in hiproll_hist]); hr = np.array([h[1] for h in hiproll_hist])
         res["hip_roll_deg"] = {
