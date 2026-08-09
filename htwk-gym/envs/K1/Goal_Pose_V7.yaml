@@ -119,6 +119,12 @@ asset:
   # 쓴다)이라 기존 arm 은 영향받지 않는다.
   #   예: {default: 0.0, Ankle: 0.05, Shoulder: 0.05, Elbow: 0.05, Head: 0.002}
   armature_by_joint: {}
+  # 관절별 **토크 한계**(N·m). URDF `effort` 를 덮어쓴다. **빈 dict = 끔**(URDF 값을
+  # 그대로 쓴다)이라 기존 arm 은 영향받지 않는다. 규칙에 안 걸린 관절도 URDF 유지.
+  # ⛔ 드라이브 모드가 effort(3) 라 Isaac 이 `dof_props["effort"]` 로 **자체 클램프**한다.
+  #    코드가 `self.torque_limits` 와 그 필드를 **둘 다** 세우고 env0 에서 되읽어 확인한다.
+  #   예: {Hip_Pitch: 68.0, Hip_Yaw: 38.3}   (벤더값. 무릎·힙롤은 구속되지 않아 뺀다)
+  torque_limits_by_joint: {}
   thickness: 0.01
   feet_edge_pos: [[ 0.1215,  0.05, -0.03],
                   [ 0.1215, -0.05, -0.03],
