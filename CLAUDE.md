@@ -135,8 +135,11 @@ Agent/Task 를 띄울 때 **`model: sonnet`** 을 명시한다. 예외 없다. �
 >   3. 낙상은 원시 개수가 아니라 **낙상간격(초)** 으로 읽는다(C14).
 >   4. 정확도 축에는 **생존 편향**이 있다 — 표본탈락(%) 을 같이 본다.
 >   5. `v7_extras`(발 간격 등)는 **마지막 한 프레임 스냅샷**이라 인용하지 마라(C11).
->   6. ⛔ `NC_actfilter` 의 레버(`action_filter_tau`)는 **공통 평가 config 에 없다** —
->      채점은 필터 OFF 로 돈다. "필터를 학습시켰더니 좋아졌다"를 이 표로 말할 수 없다.
+>   6. ⛔ `NC_actfilter` 의 레버(`action_filter_tau`)가 **평가에서 OFF 로 돈다** —
+>      "필터를 학습시켰더니 좋아졌다"를 이 표로 말할 수 없다.
+>      ⚠️ 2026-08-09 정정: ~~"공통 평가 config 에 없다"~~ 는 **틀렸다.** 키는 있고
+>      (`Goal_Pose_V7.yaml:163` `action_filter_tau: [0.0, 0.0]`) 프로토콜 지문에도
+>      들어간다(`eval_goal_pose.py:813`). **명시적으로 0 인 것**이지 부재가 아니다.
 > - ~~🔔 **계보 B 4셀 `model_6000` 재채점 보고**~~ — 2026-08-08 보고 완료(ibatch §8-52·§8-53 로 이어짐). — 사용자가 2026-08-08 01:4x 에
 >   "model_6000 재채점 끝나면 4셀 비교 보고해"라고 요청했다.
 >   작업: `queue/small/gpu0/012-eval_lineageB_final.sh` → 결과 `logs/eval_rounds/lineageB`
@@ -153,8 +156,9 @@ Agent/Task 를 띄울 때 **`model: sonnet`** 을 명시한다. 예외 없다. �
 >      `NC_actfilter`(+액션필터) / `NA_histzero`(+이력+지연+영점, 3레버).
 >      **`N4_hist`(이력 단독)는 보류 중이라 빠져 있다** → 2×2 의 네 번째 칸이 비었다.
 >   3. ⛔ **깨끗한 한 레버 비교는 `NE` 대 `NZ` 하나뿐이다.**
->      - `NC_actfilter`: 레버(`action_filter_tau`)가 **공통 평가 config 에 없다** →
->        필터 OFF 로 채점된다. 이 표로 "필터 학습이 효과 있다"를 말할 수 없다.
+>      - `NC_actfilter`: 레버(`action_filter_tau`)가 **평가에서 `[0.0, 0.0]`**
+>        (`Goal_Pose_V7.yaml:163`) → 필터 OFF 로 채점된다. 이 표로 "필터 학습이
+>        효과 있다"를 말할 수 없다. ⚠️ "config 에 없다" 가 아니라 **0 이다**.
 >      - `NA_histzero`: **대칭손실이 확장 관측(270)을 안 덮는 결함 위에서 완주**했다
 >        (RETRACTIONS). 그 셀은 "이력+영점"이 아니라 "이력 + 깨진 대칭손실"이다.
 >   4. 낙상은 **낙상간격(초)**, 정확도는 **표본탈락(%)** 과 같이 읽는다.
@@ -317,7 +321,8 @@ Agent/Task 를 띄울 때 **`model: sonnet`** 을 명시한다. 예외 없다. �
 >   살아남은 것 중 최강 둘은 아무도 의심하지 않던 것이다:
 >   ① **도착이 죽는 원인은 보행 시계다** — 시계를 얼린 목표(`stand`) 2.3 cm 대
 >   같은 변위 0인데 시계가 도는 목표(`turn`) **47.4 cm**. 그리고 그것을 고치라고 있는
->   `pause_gait_during_dwell` 이 **기본 False 이고 어떤 config 에도 없다** →
+>   `pause_gait_during_dwell` 이 **기본 False** 다(⚠️ 2026-08-09 정정:
+>   ~~"어떤 config 에도 없다"~~ 는 틀렸다 — `Goal_Pose_V7.yaml:277` 에 `false` 로 있다) →
 >   **`ND_dwell`(duty 상향)은 방향이 반대다.**
 >   ② **정확도 보상을 40+ arm 중 한 번도 안 건드렸다**(`goal_reached` 이진 계단,
 >   `heading_near_goal` 스케일 0, `constellation_radius` 1.0 고정).
@@ -500,7 +505,7 @@ bash tools/eval5.sh logs/K1/K1/Goal_Pose_V7/<run> <라벨>
 
 ### 4. ⛔ 정확도 cm 로 체크포인트를 고르지 마라 — **인과적으로 반대다**
 
-`completed = changed & ~done`(eval_goal_pose.py:1808) 때문에 낙상 구간은 기록조차 안 된다.
+`completed = changed & ~done`(`eval_goal_pose.py:1857`) 때문에 낙상 구간은 기록조차 안 된다.
 같은 체크포인트를 채점 물리만 바꾸면 **65 %를 넘어뜨렸더니 정확도가 30 % "좋아졌다"**
 (38.75 cm/낙상 2 → 27.26 cm/낙상 6,145). ⇒ **`도착률/시도(%)`(`success_per_attempt`)로 골라라.**
 
