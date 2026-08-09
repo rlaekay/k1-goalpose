@@ -227,9 +227,21 @@ class GoalPose(BaseTask):
                     # "레버를 켰다고 믿고 안 켠 채 학습한" arm 이 또 하나 생긴다
                     # (NC_actfilter·NZ_zeroiid 가 정확히 그렇게 됐다).
                     back = self.gym.get_actor_dof_properties(env_handle, actor_handle)
+                    # ⚠️ `dof_props["armature"]` 는 **float32** 다. 요청값을 그대로
+                    # 절대오차 1e-9 로 비교하면 **float32 로 표현 불가능한 값이 전부
+                    # 거부된다** -- 2026-08-09 에 `NQ_armvendor`(벤더 공식값
+                    # 0.047813 / 0.095625)가 정확히 이것으로 죽었다. 되읽은 값은
+                    # 0.04781299829483032 로 요청과 1.7e-9 어긋나는데 그것이 **정상**이다
+                    # (float32 상대정밀도 ~6e-8). `NJ_armasset` 의 0.05 는 오차가
+                    # 7.5e-10 이라 우연히 통과했을 뿐이다.
+                    #
+                    # 그래서 **요청값을 float32 로 내린 것**과 비교한다. 가드의 의도
+                    # (설정이 조용히 무시되면 0.0 이나 기본값이 되돌아온다)는 그대로
+                    # 지켜진다 -- 그 경우 차이가 armature 크기만큼 커서 반드시 걸린다.
+                    want = np.asarray(self._armature_per_dof, dtype=np.float32)
                     bad = [(self.dof_names[j], float(back["armature"][j]), self._armature_per_dof[j])
                            for j in range(self.num_dofs)
-                           if abs(float(back["armature"][j]) - self._armature_per_dof[j]) > 1e-9]
+                           if abs(float(back["armature"][j]) - float(want[j])) > 1e-9]
                     if bad:
                         raise RuntimeError(f"armature 설정이 반영되지 않았다: {bad[:4]}")
                     print("[armature] env0 되읽기 확인 통과")
