@@ -105,7 +105,12 @@ def stats_of(v):
         p5=float(np.percentile(a, 5)),
         median=float(np.median(a)),
         neg_share=float((a < 0.0).mean()),
-        below_min_gap=float((a < 0.07).mean()),
+        # ⛔ 이 0.07 을 `rewards.feet_min_gap` 0.07 과 같은 양으로 읽지 마라.
+        # 여기 간격은 **발 body 원점 사이 거리**이고(영자세 +0.1924 m, 실측 확인),
+        # 보상 쪽은 `|feet_y_offset + feet_distance_ref|` 라 기준이 다르다.
+        # 숫자가 우연히 같아서 더 위험하다. 이 열은 `cmd_foot_sep.py` 의 `below7`
+        # 과 같은 정의이므로 MJC 의 실기/MuJoCo 값과는 그대로 비교된다.
+        below_7cm=float((a < 0.07).mean()),
     )
 
 
@@ -190,7 +195,7 @@ def main():
                 continue
             print("   {:<12} p1 {:+.4f}  p5 {:+.4f}  median {:+.4f}  음수 {:5.2f}%  <7cm {:5.2f}%"
                   .format(tag, s["p1"], s["p5"], s["median"],
-                          100 * s["neg_share"], 100 * s["below_min_gap"]))
+                          100 * s["neg_share"], 100 * s["below_7cm"]))
         if r["cmd"] and r["meas"]:
             d = r["cmd"]["p1"] - r["meas"]["p1"]
             print("   => 명령 p1 이 실측보다 {:+.4f} m {} (음수면 **물리가 교차를 가려 준다**)"
