@@ -1040,6 +1040,12 @@ class Controller:
                     self.projected_gravity.copy(), int(self._low_state_seq),
                     float(self._low_state_sample_monotonic))
 
+    # 클래스 기본값. 부분 생성된 객체(테스트 스텁, 초기화 실패 경로)에서도
+    # 토크 박스가 **꺼진 상태**로 안전하게 동작해야 한다.
+    _torque_box = None
+    _torque_box_kp = None
+    _torque_box_kd = None
+
     def _apply_torque_box(self, target):
         """학습의 토크 클램프를 위치명령으로 재현한다. 기본 **꺼짐**.
 
