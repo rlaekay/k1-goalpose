@@ -80,6 +80,9 @@ class GoalPosePolicy:
         self.goal_y_clamp = float(gc["y_m"])
 
         self.gait_frequency = float(c["gait_frequency"])
+        # 시계 팽창 재현 레버. config `policy.gait_clock_scale`, 기본 1.0(no-op).
+        # 0.79 = 구 빌드 실측 팽창(§8-59). 위상 적분의 dt 에만 곱한다.
+        self._clock_scale = float(c.get("gait_clock_scale", 1.0))
         self.gait_process = 0.0
         self._last_time = None
 
@@ -206,6 +209,11 @@ class GoalPosePolicy:
         else:
             dt = min(max(time_now - self._last_time, 0.0), 4.0 * self.policy_interval)
         self._last_time = time_now
+        # ⭐ 시계 가설 검정용 정밀 레버 (§8-70 5차 뒤 30초 시험 설계).
+        # 구 빌드의 팽창(Timer 카운터, 실효 0.79배)은 이 빌드에서 이미 고쳐졌으므로
+        # 부하로 tick 을 밀어도 gait 시계는 안 팽창한다 -- 팽창을 재현하려면
+        # 여기서 명시적으로 dt 를 줄이는 수밖에 없다. 1.0 이면 no-op.
+        dt *= self._clock_scale
         self.gait_process = float(np.fmod(self.gait_process + dt * self.gait_frequency, 1.0))
         return self.gait_process
 

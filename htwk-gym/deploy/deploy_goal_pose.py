@@ -424,7 +424,7 @@ class Controller:
                  parallel_torque=False, rate_fixed_filter=False,
                  filter_tau_s=0.010, policy_path_override=None,
                  test_tilt_abort_deg=None, max_policy_s=0.0,
-                 publish_hz=0.0) -> None:
+                 publish_hz=0.0, gait_clock_scale=1.0) -> None:
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
 
@@ -551,6 +551,12 @@ class Controller:
 
         # Load and contract-check the actor before creating SDK/remote-control
         # services. A missing or wrong model must fail without touching robot I/O.
+        # 시계 팽창 재현 레버(§8-70 30초 시험 B 실행). fresh 빌드는 위상이 벽시계라
+        # 부하로 tick 을 밀어도 시계가 안 팽창한다 -- 검정하려면 명시적으로 건다.
+        if float(gait_clock_scale) != 1.0:
+            self.cfg["policy"]["gait_clock_scale"] = float(gait_clock_scale)
+            self.logger.warning("[clock] gait_clock_scale %.3f -- 시계 팽창을 "
+                                "의도적으로 재현하는 시험 모드다", float(gait_clock_scale))
         self.policy = GoalPosePolicy(cfg=self.cfg)
 
         self.running_policy = True
@@ -2342,6 +2348,10 @@ if __name__ == "__main__":
                         help="After CUSTOM entry, hold and log ankle target-vs-measured "
                              "for this many seconds before the gait prompt. Tells drift "
                              "(no position servo) apart from oscillation (under-damped).")
+    parser.add_argument("--gait-clock-scale", type=float, default=1.0,
+                        help="gait 위상 적분 dt 에 곱하는 배율. 0.79 = 구 빌드의 실측 "
+                             "시계 팽창(§8-59) 재현. 시계 가설 30초 시험의 B 실행 전용. "
+                             "기본 1.0 = no-op.")
     parser.add_argument("--rate-fixed-filter", action="store_true",
                         help="관절 목표 필터를 루프 속도와 무관하게 만든다. 고정 계수 0.2는 "
                              "500 Hz 발행을 가정한 값이라 시정수 10 ms를 의도한 것인데, "
@@ -2402,6 +2412,7 @@ if __name__ == "__main__":
         test_tilt_abort_deg=args.test_tilt_abort_deg,
         max_policy_s=args.max_policy_seconds,
         publish_hz=args.publish_hz,
+        gait_clock_scale=args.gait_clock_scale,
     ) as controller:
         time.sleep(2)  # wait for channels
         print("Initialization complete.")
