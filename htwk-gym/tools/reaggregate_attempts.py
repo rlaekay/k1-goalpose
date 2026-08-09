@@ -66,9 +66,13 @@ def main():
     ap.add_argument("--goal-pattern", default=None,
                     help="예: forward_hold. 생략하면 waypoint(=null)만 본다")
     ap.add_argument("--top", type=int, default=25)
+    ap.add_argument("--protocol", default=None,
+                    help="effective_eval_protocol_sha 앞 8자. 이걸 안 주면 서로 다른 "
+                         "프로토콜이 한 표에 섞인다 -- 게이트 문턱 자체가 프로토콜에 "
+                         "달려 있으므로 그 표로는 순위를 주장할 수 없다")
     args = ap.parse_args()
 
-    rows, skipped = [], {"duration": 0, "pattern": 0, "no_gate": 0}
+    rows, skipped = [], {"duration": 0, "pattern": 0, "no_gate": 0, "protocol": 0}
     for path in glob.glob(os.path.join(args.root, "**", "report.json"), recursive=True):
         try:
             with open(path) as f:
@@ -83,6 +87,11 @@ def main():
         gp = r.get("goal_pattern")
         if (args.goal_pattern or None) != (gp or None):
             skipped["pattern"] += 1
+            continue
+
+        psha = (r.get("effective_eval_protocol_sha") or "")[:8]
+        if args.protocol and psha != args.protocol:
+            skipped["protocol"] += 1
             continue
 
         strict = dig(r, "success_rate_strict")
@@ -118,6 +127,7 @@ def main():
             ci=wilson(s_cnt, n_att),
             source=source,
             armature=str(dig(r, "effective_eval_protocol", "asset", "armature", default="?")),
+            psha=psha or "?",
         ))
 
     if not rows:
@@ -156,8 +166,19 @@ def main():
     print("    `직접` = 리포트가 `success_per_attempt` 를 들고 있는 것(2026-08-09 이후).")
     print("  * `arm=?` 은 채점 물리 지문이 없는 리포트다 -- **물리를 가로질러 비교하지 마라.**")
     print()
-    print("건너뜀: 길이미달 {} / 패턴불일치 {} / 게이트없음 {}".format(
-        skipped["duration"], skipped["pattern"], skipped["no_gate"]))
+    print("건너뜀: 길이미달 {} / 패턴불일치 {} / 게이트없음 {} / 프로토콜불일치 {}".format(
+        skipped["duration"], skipped["pattern"], skipped["no_gate"], skipped["protocol"]))
+    if not args.protocol:
+        shas = {}
+        for r in rows:
+            shas[r["psha"]] = shas.get(r["psha"], 0) + 1
+        print()
+        print("⛔ `--protocol` 을 안 줬다. 이 표에 프로토콜이 {}종 섞여 있다: {}".format(
+            len(shas), ", ".join("{}({}건)".format(k, v) for k, v in
+                                 sorted(shas.items(), key=lambda kv: -kv[1])[:6])))
+        print("   **게이트 문턱(g_pos_med 등) 자체가 프로토콜에 달려 있다.** 섞인 표로")
+        print("   순위를 주장하면 그것이 이 저장소가 반복한 바로 그 실수다.")
+        print("   같은 sha 끼리 다시 돌려라: --protocol <8자>")
     return 0
 
 
