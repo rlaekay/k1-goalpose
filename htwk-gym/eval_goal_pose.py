@@ -898,7 +898,7 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
         k = max(1, min(int(dump_actions_envs), env.num_envs))
         clip = float((env.cfg.get("normalization", {}) or {})["clip_actions"])
         dump_act = {"k": k, "clip": clip,
-                    "actions": [], "dof_pos": [], "done": []}
+                    "actions": [], "dof_pos": [], "done": [], "fell": []}
 
     instrumented = hasattr(env, "goal_start_pos") and hasattr(env, "goal_start_step")
     has_segment_id = hasattr(env, "goal_segment_id")
@@ -1420,6 +1420,14 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
             episode_timeouts = episode_timeouts.to(done.device)
         else:
             episode_timeouts = done & timeouts
+        if dump_act is not None:
+            # ⛔ `done` 만으로는 **낙상과 타임아웃을 못 가른다.** 명령 발간격을
+            # "첫 낙상 이전" 으로 자르려면 낙상 자체가 필요하다 -- `done` 으로 자르면
+            # 에피소드 타임아웃에서도 잘려 표본을 버리고, 도착을 못 하는 arm 일수록
+            # 더 많이 잘린다. 그 필터가 필요한 이유는 tilt 5~15° 구간이 **이미
+            # 넘어지는 중의 허둥댐**이고 거기서 다리가 엉키기 때문이다 -- 그대로 두면
+            # "낙상이 잦은 arm 일수록 발간격이 나빠 보이는 것"이 레버 효과와 교락된다.
+            dump_act["fell"].append(fell[:dump_act["k"]].detach().cpu().numpy())
         n_fell = int(fell.sum().item())
         falls += n_fell
         censored += int((done & episode_timeouts & ~fell).sum().item())
@@ -2057,6 +2065,7 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
             clip_actions=np.float32(dump_act["clip"]),
             dof_pos=np.stack(dump_act["dof_pos"]),        # [T, k, num_dofs]
             done=np.stack(dump_act["done"]),              # [T, k]
+            fell=np.stack(dump_act["fell"]),              # [T, k] 낙상만(타임아웃 제외)
             default_dof_pos=env.default_dof_pos.detach().cpu().numpy().astype(np.float32),
             action_scale=np.asarray(scale, dtype=np.float32),
             dof_names=np.asarray(list(getattr(env, "dof_names", [])), dtype=object),
@@ -2589,8 +2598,24 @@ def summarize(roll, cfg, num_envs, duration_s, dt, checkpoint, config_path, task
         edges = np.arange(len(hist)) * (roll["speed_hist_max"] / len(hist))
         cdf = np.cumsum(hist) / hist.sum()
 
+        # ⛔ 빈 왼쪽 모서리를 그대로 돌려주면 두 가지가 같이 생긴다(2026-08-09):
+        #   ① **양자화** — 빈이 1 cm/s 라 값이 0.01 의 배수로만 나온다. 균등 ±0.005 의
+        #      SD 는 0.0029 m/s = 1.43 m/s 에서 **0.20 %** 이고, 이 축의 실제 시드
+        #      산포가 0.33 % 라 **노이즈 바닥의 절반이 계측 인공물**이 된다. 축별
+        #      노이즈 바닥 표를 이 값으로 만들면 조밀한 축일수록 반올림이 지배한다.
+        #   ② **치우침** — 왼쪽 모서리라 항상 반 빈(0.005 m/s) 낮게 나온다.
+        # 빈 안에서 선형보간하면 둘 다 없어진다. 메모리도 계약도 안 바뀐다.
+        # ⚠️ 옛 리포트보다 약 +0.005 m/s 나온다. **모든 arm 에 공통인 치우침 보정**이라
+        #    순위·차이는 안 바뀌지만, 옛 값과 새 값을 **한 표에 섞지 마라.**
         def _hpct(p):
-            return float(edges[int(np.searchsorted(cdf, p / 100.0))]) if p / 100.0 <= cdf[-1] else float(edges[-1])
+            q = p / 100.0
+            if q > cdf[-1]:
+                return float(edges[-1])
+            i = int(np.searchsorted(cdf, q))
+            lo_c = cdf[i - 1] if i > 0 else 0.0
+            width = roll["speed_hist_max"] / len(hist)
+            frac = (q - lo_c) / (cdf[i] - lo_c) if cdf[i] > lo_c else 0.5
+            return float(edges[i] + width * min(max(frac, 0.0), 1.0))
 
         occupied = np.nonzero(hist)[0]
         peaks = roll.get("peak_speed", np.array([]))

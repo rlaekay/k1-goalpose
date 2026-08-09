@@ -95,6 +95,27 @@ def live_mask(done, guard_steps):
     return keep
 
 
+def before_first_fall(fell, guard_steps):
+    """각 env 의 **첫 낙상 이전** 구간만 남기는 마스크 [T, k].
+
+    왜 필요한가(분석 세션, 2026-08-09): 직립 필터(tilt<15°)로는 부족하다.
+    **tilt 5~15° 는 이미 넘어지는 중의 허둥댐이고 거기서 다리가 엉킨다.**
+    그대로 두면 **낙상이 잦은 arm 일수록 발간격이 나빠 보이는 것이 낙상의 결과**이고,
+    레버 효과와 낙상률이 교락된다. `N1` 대 `N3` 은 낙상률이 다를 것이 예상되므로
+    (그게 종점 4다) 이 교락이 주 종점에 직격한다.
+
+    ⛔ `done` 이 아니라 `fell` 로 자른다. `done` 은 **에피소드 타임아웃도 포함**해서,
+    그걸로 자르면 도착을 못 하는 arm 일수록 더 많이 잘린다 = 새 편향을 만든다.
+    """
+    fell = np.asarray(fell, dtype=bool)
+    T, k = fell.shape
+    idx = np.where(fell.any(axis=0), fell.argmax(axis=0), T)   # 낙상 없으면 T(=전부)
+    keep = np.arange(T)[:, None] < idx[None, :]
+    if guard_steps > 0:                     # 최초 스폰 직후도 정책이 지령한 자세가 아니다
+        keep[:guard_steps] = False
+    return keep
+
+
 def stats_of(v):
     a = np.asarray(v, dtype=float)
     if a.size == 0:
@@ -141,13 +162,23 @@ def process(path, model, data, guard_steps):
         raise SystemExit("done {} 과 actions {} 의 모양이 안 맞는다".format(
             keep.shape, q_cmd.shape[:2]))
 
-    sep_cmd, sep_meas = [], []
-    ci, mi = q_cmd[keep], q_meas[keep]
-    for j in range(ci.shape[0]):
-        sep_cmd.append(CFS.foot_sep(model, data, ci[j], 22))
-        sep_meas.append(CFS.foot_sep(model, data, mi[j], 22))
-    return dict(cmd=stats_of(sep_cmd), meas=stats_of(sep_meas),
-                kept=int(keep.sum()), total=int(keep.size))
+    # 두 판을 **나란히** 낸다. 방향이 같으면 레버 효과가 낙상과 독립이라 결론 확정이고,
+    # 크게 달라지면 전 구간 판은 낙상의 그림자였다는 뜻이다(분석 세션 판정 규약).
+    views = {"all": keep}
+    if "fell" in z.files:
+        views["pre_fall"] = before_first_fall(z["fell"], guard_steps)
+    else:
+        print("  ⚠️ npz 에 `fell` 이 없다(옛 덤프) -- **첫낙상 이전 판을 못 낸다.** "
+              "주 종점이 낙상률과 교락된 채로 남는다. 새 덤프로 다시 뽑아야 한다.")
+
+    def sep_pair(mask):
+        ci, mi = q_cmd[mask], q_meas[mask]
+        sc = [CFS.foot_sep(model, data, ci[j], 22) for j in range(ci.shape[0])]
+        sm = [CFS.foot_sep(model, data, mi[j], 22) for j in range(mi.shape[0])]
+        return dict(cmd=stats_of(sc), meas=stats_of(sm),
+                    kept=int(mask.sum()), total=int(mask.size))
+
+    return {name: sep_pair(m) for name, m in views.items()}
 
 
 def main():
@@ -187,19 +218,25 @@ def main():
         r = process(p, model, data, guard)
         rows[p] = r
         label = os.path.basename(os.path.dirname(p)) or os.path.basename(p)
-        print("{}   표본 {:,}/{:,} 스텝·env (리셋 guard {} 스텝 제외)".format(
-            label, r["kept"], r["total"], guard))
-        for tag, s in (("명령 target", r["cmd"]), ("실측 q", r["meas"])):
-            if s is None:
-                print("   {:<12} 표본 없음".format(tag))
+        print(label)
+        for view, vlabel in (("all", "전 구간"), ("pre_fall", "**첫낙상 이전**")):
+            v = r.get(view)
+            if v is None:
                 continue
-            print("   {:<12} p1 {:+.4f}  p5 {:+.4f}  median {:+.4f}  음수 {:5.2f}%  <7cm {:5.2f}%"
-                  .format(tag, s["p1"], s["p5"], s["median"],
+            print("  [{}]  표본 {:,}/{:,} 스텝·env (guard {} 스텝 제외)".format(
+                vlabel, v["kept"], v["total"], guard))
+            for tag, s in (("명령 target", v["cmd"]), ("실측 q", v["meas"])):
+                if s is None:
+                    print("     {:<12} 표본 없음".format(tag))
+                    continue
+                print("     {:<12} p1 {:+.4f}  p5 {:+.4f}  median {:+.4f}  "
+                      "**음수 {:5.2f}%**  <7cm {:5.2f}%".format(
+                          tag, s["p1"], s["p5"], s["median"],
                           100 * s["neg_share"], 100 * s["below_7cm"]))
-        if r["cmd"] and r["meas"]:
-            d = r["cmd"]["p1"] - r["meas"]["p1"]
-            print("   => 명령 p1 이 실측보다 {:+.4f} m {} (음수면 **물리가 교차를 가려 준다**)"
-                  .format(d, "깊다" if d < 0 else "얕다"))
+            if v["cmd"] and v["meas"]:
+                d = v["cmd"]["p1"] - v["meas"]["p1"]
+                print("     => 명령 p1 이 실측보다 {:+.4f} m {} (음수면 **물리가 교차를 가려 준다**)"
+                      .format(d, "깊다" if d < 0 else "얕다"))
         print()
 
     if args.json:
@@ -209,6 +246,14 @@ def main():
         print("시드별 값 -> {}".format(args.json))
         print("다음: tools/stat_compare.py 로 **시드 단위** Wilcoxon 을 걸어라. "
               "한 롤아웃 안의 스텝을 n 으로 쓰면 없는 검정력을 만든다.")
+        print()
+        print("⛔ 판정 규약(분석 세션): **두 판을 나란히 읽는다.**")
+        print("   * 전 구간과 첫낙상 이전에서 방향이 **같다** ⇒ 레버 효과가 낙상과 독립. 확정.")
+        print("   * 방향/크기가 **크게 다르다**  ⇒ 전 구간 판은 낙상의 그림자였다.")
+        print("     **첫낙상 이전 판이 정답**이다 -- tilt 5~15° 는 이미 넘어지는 중이고")
+        print("     거기서 다리가 엉키므로, 낙상이 잦은 arm 일수록 발간격이 나빠 보인다.")
+        print("⛔ `p1` 은 **역치량이 아니다**(MJC 사전등록 기각: p1 +0.017 인데 3시드 전부 낙상).")
+        print("   주 종점은 **음수체류율**이고 p1 은 '레버가 마진을 얼마나 움직였나' 로만 읽어라.")
     return 0
 
 

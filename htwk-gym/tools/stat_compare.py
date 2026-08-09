@@ -172,9 +172,29 @@ def paired_shift(a, b):
         p = st.wilcoxon(a, b, zero_method="zsplit", alternative="two-sided").pvalue
     else:
         p = float("nan")
-    return dict(n=len(a), p=p, hl=hl, mean_a=float(np.mean(a)), mean_b=float(np.mean(b)),
-                sd_a=float(np.std(a, ddof=1)) if len(a) > 1 else float("nan"),
-                sd_b=float(np.std(b, ddof=1)) if len(b) > 1 else float("nan"))
+    # ⭐ **축별 노이즈 바닥을 그 자리에서 낸다** (2026-08-09, C53 재발 방지).
+    # 한 숫자(위치오차 축의 4.38 %)를 모든 지표에 쓴 것이 C53 의 원인이다 --
+    # 조밀한 축에서는 진짜 차이를 노이즈로 지우고(속도 4 % 를 "같다"로 통과시켰다)
+    # 성긴 축에서는 노이즈를 발견으로 만든다. 5시드가 이미 있으니 계산은 공짜다.
+    mean_a, mean_b = float(np.mean(a)), float(np.mean(b))
+    sd_a = float(np.std(a, ddof=1)) if len(a) > 1 else float("nan")
+    sd_b = float(np.std(b, ddof=1)) if len(b) > 1 else float("nan")
+    pooled = float(np.sqrt((sd_a ** 2 + sd_b ** 2) / 2.0))
+    scale = (abs(mean_a) + abs(mean_b)) / 2.0
+    rel_sd = (100.0 * pooled / scale) if scale > 0 else float("nan")
+    se_diff = pooled * np.sqrt(2.0 / len(a)) if len(a) else float("nan")
+    line2se = (200.0 * se_diff / scale) if scale > 0 else float("nan")
+    obs = (100.0 * abs(mean_a - mean_b) / scale) if scale > 0 else float("nan")
+    # 양자화 경고: 값이 전부 어떤 눈금의 배수면 SD 가 반올림에 지배될 수 있다.
+    quant = float("nan")
+    vals = np.concatenate([a, b])
+    for step in (0.01, 0.1, 1.0):
+        if np.allclose(vals / step, np.round(vals / step), atol=1e-9):
+            quant = step
+            break
+    return dict(n=len(a), p=p, hl=hl, mean_a=mean_a, mean_b=mean_b,
+                sd_a=sd_a, sd_b=sd_b, rel_sd=rel_sd, line2se=line2se,
+                obs_rel=obs, quant=quant, scale=scale)
 
 
 def fisher_rate(s1, n1, s2, n2):
@@ -276,13 +296,28 @@ def main():
             vb = [float("nan") if v is None else float(v) for v in vb]
             mult = 100.0 if "cm" in name else 1.0
             res = paired_shift(va, vb) if len(va) == len(vb) else paired_shift(va, vb)
+            note = "n={}".format(res["n"])
+            # ⛔ `None == None` 은 True 라 NaN 검사 관용구(v == v)가 None 을 통과시킨다.
+            # `paired_shift` 의 조기 반환(시드 2개 미만)에는 이 키들이 아예 없다.
+            def _f(key):
+                v = res.get(key)
+                return float("nan") if v is None else float(v)
+            rel, l2, ob = _f("rel_sd"), _f("line2se"), _f("obs_rel")
+            if rel == rel and l2 == l2:
+                verdict = ("차>판별선" if (ob == ob and ob > l2) else "차<판별선")
+                note += "  [축 노이즈 시드SD {:.2f}% · 판별선(2SE) {:.2f}% · 관측차 {:.2f}% ⇒ {}]".format(
+                    rel, l2, ob, verdict)
+            q, sc = _f("quant"), _f("scale")
+            if q == q and sc == sc and sc > 0:
+                qrel = 100.0 * (q / (12 ** 0.5)) / sc
+                note += "  ⚠️눈금 {:g} 배수(양자화가 SD 에 {:.2f}%p 기여)".format(q, qrel)
             rows.append((name,
                          "{:.4g} ± {:.2g}".format(res.get("mean_a", float('nan')) * mult,
                                                   res.get("sd_a", float('nan')) * mult),
                          "{:.4g} ± {:.2g}".format(res.get("mean_b", float('nan')) * mult,
                                                   res.get("sd_b", float('nan')) * mult),
                          "HL 이동 {:+.3g}".format(res["hl"] * mult),
-                         res["p"], "n={}".format(res["n"])))
+                         res["p"], note))
             pvals.append(res["p"])
 
     adj = holm(pvals)
