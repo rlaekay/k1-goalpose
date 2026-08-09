@@ -41,7 +41,7 @@ def main():
     model = mujoco.MjModel.from_xml_path(MJCF)
     data = mujoco.MjData(model)
     default = np.array(cfg["common"]["default_qpos"], dtype=float)
-    scale = float(cfg["common"]["action_scale"])
+    scale = float(cfg["policy"]["control"]["action_scale"])
 
     cmd, meas, legspd, jump = [], [], [], []
     for i, r in enumerate(rows):

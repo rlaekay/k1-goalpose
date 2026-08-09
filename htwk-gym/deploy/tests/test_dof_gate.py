@@ -9,6 +9,7 @@
 import csv
 import os
 import sys
+import threading
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEPLOY = os.path.dirname(HERE)
@@ -140,6 +141,70 @@ for label, fn in (("서기 184 s", "2026-08-09_t_stand_i3b.csv"),
     check("T7 [%s] 거부가 발목 roll 에 국소적" % label,
           rej_other <= rej_roll,
           "발목 %d / 다른10채널 %d" % (rej_roll, rej_other))
+
+
+# Wall-clock scheduling regression (2026-08-09): `_low_state_handler` used the
+# main thread's `next_inference_time` as its own sampling gate.  The main thread
+# advanced that deadline before the callback could observe it, so a nominal
+# 50 Hz policy consumed only 22 distinct q snapshots in 50 ticks and sometimes
+# held q/dq/tau for 218 ms.  A future deadline must never suppress LowState.
+print("T8 LowState producer는 next_inference_time과 무관하게 최신 상태를 갱신한다")
+
+
+class _Motor:
+    def __init__(self, q, dq, tau):
+        self.q = q
+        self.dq = dq
+        self.tau_est = tau
+
+
+class _Imu:
+    rpy = [0.0, 0.0, 0.0]
+    gyro = [0.1, 0.2, 0.3]
+
+
+class _LowState:
+    imu_state = _Imu()
+
+    def __init__(self, q):
+        self.motor_state_serial = [_Motor(q + i * 0.01, 2.0, 3.0)
+                                   for i in range(22)]
+
+
+c = GoalPoseController.__new__(GoalPoseController)
+c._verify_joint_layout = lambda msg: None
+c._gate_joint_sample = lambda q: list(q)
+c._request_recovery = lambda why: None
+c._last_low_state_monotonic = 0.0
+c._latest_rpy = np.zeros(3, dtype=np.float32)
+c._latest_tilt = 0.0
+c._test_tilt_abort_rad = 0.0
+c._policy_authorized = True
+c.running_policy = True
+c.running = True
+c.cfg = {"safety": {"fall_tilt_limit_rad": 1.0}}
+c.next_inference_time = 1e100       # the old bug suppressed this callback
+c._state_lock = threading.Lock()
+c.dof_pos_latest = np.zeros(22, dtype=np.float32)
+c.projected_gravity = np.zeros(3, dtype=np.float32)
+c.base_ang_vel = np.zeros(3, dtype=np.float32)
+c.dof_pos = np.zeros(22, dtype=np.float32)
+c.dof_vel = np.zeros(22, dtype=np.float32)
+c.dof_tau = np.zeros(22, dtype=np.float32)
+c._dof_gate_consec = np.zeros(22, dtype=np.int32)
+c._low_state_seq = 0
+c._low_state_sample_monotonic = 0.0
+GoalPoseController._low_state_handler(c, _LowState(0.5))
+snap = GoalPoseController._snapshot_policy_state(c)
+check("T8", c._low_state_seq == 1 and np.allclose(snap[0][0], 0.5)
+      and np.allclose(snap[1][0], 2.0) and np.allclose(snap[2][0], 3.0),
+      "seq=%d q0=%.2f dq0=%.2f tau0=%.2f" %
+      (c._low_state_seq, snap[0][0], snap[1][0], snap[2][0]))
+
+print("T9 정책 snapshot은 다음 콜백이 와도 원자적으로 고정된다")
+GoalPoseController._low_state_handler(c, _LowState(1.0))
+check("T9", np.allclose(snap[0][0], 0.5) and np.allclose(c.dof_pos[0], 1.0),
+      "snapshot q0=%.2f latest q0=%.2f" % (snap[0][0], c.dof_pos[0]))
 
 print("\n%s  (실패 %d)"
       % ("전부 통과" if not FAILS else "실패: " + ", ".join(FAILS), len(FAILS)))

@@ -422,7 +422,9 @@ class Controller:
                  hold_prepare=False, prepare_settle_log_s=1.0,
                  log_timing=None, abort_file=None,
                  parallel_torque=False, rate_fixed_filter=False,
-                 filter_tau_s=0.010) -> None:
+                 filter_tau_s=0.010, policy_path_override=None,
+                 test_tilt_abort_deg=None, max_policy_s=0.0,
+                 publish_hz=0.0) -> None:
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
 
@@ -463,6 +465,19 @@ class Controller:
 
         with open(cfg_file, "r", encoding="utf-8") as f:
             self.cfg = yaml.load(f.read(), Loader=yaml.FullLoader)
+        if policy_path_override:
+            # Keep one frozen deploy contract while testing actor checkpoints.
+            # A separate CLI override makes the selected binary explicit in the
+            # terminal/log and avoids overwriting the proven I3b rollback file.
+            self.cfg["policy"]["policy_path"] = str(policy_path_override)
+            self.logger.info("[policy] CLI override: %s", policy_path_override)
+        self._test_tilt_abort_rad = (math.radians(float(test_tilt_abort_deg))
+                                     if test_tilt_abort_deg is not None else 0.0)
+        if self._test_tilt_abort_rad > 0.0:
+            self.logger.info("[safety] candidate-test tilt abort: %.1f deg",
+                             test_tilt_abort_deg)
+        self._max_policy_s = max(0.0, float(max_policy_s))
+        self._policy_test_t0 = 0.0
 
         # 관측 지연 계측. policy_debug에도 low_state_age_sec가 실리지만
         # _publish_policy_debug의 첫 줄이 goal_source_mode != "ros"면 즉시 반환이라
@@ -474,6 +489,13 @@ class Controller:
         self._parallel_torque = bool(parallel_torque)
         self._pub_last = 0.0
         self._pub_dt = []
+        requested_publish_hz = float(publish_hz)
+        self._publish_interval_s = (
+            1.0 / requested_publish_hz if requested_publish_hz > 0.0
+            else float(self.cfg["common"]["dt"]))
+        self.logger.info(
+            "[timing] LowCmd target rate %.1f Hz",
+            1.0 / self._publish_interval_s)
         self._rate_fixed_filter = bool(rate_fixed_filter)
         # 설계 의도: 500 Hz에서 계수 0.2 = 시정수 10 ms.
         self._filter_tau_s = float(filter_tau_s)
@@ -504,7 +526,8 @@ class Controller:
                     log_timing)
             self._timing_fp = open(log_timing, "w", buffering=1, encoding="utf-8")
             ls = int(self.cfg["policy"].get("leg_dof_start", 10))
-            cols = (["t_s", "low_state_age_s", "tick_dt_s", "tilt_deg",
+            cols = (["t_s", "low_state_age_s", "policy_state_age_s",
+                     "low_state_seq", "tick_dt_s", "tilt_deg",
                      "roll", "pitch", "gx", "gy", "gz",
                      "walking", "gait_freq", "gait_process", "pub_hz",
                      "goal_x", "goal_y", "heading_err"]
@@ -544,6 +567,10 @@ class Controller:
         # 구간이고, 실제로 펌웨어 관절 보호(빨간불)가 걸린 구간이다
         # (HANDOFF_DEPLOY_ENTRY_20260807.md §3).
         self.publish_lock = threading.Lock()
+        # LowState arrives on an SDK callback thread while inference runs on
+        # the main thread.  Keep one coherent sensor snapshot for each policy
+        # tick; otherwise numpy arrays can be read halfway through a callback.
+        self._state_lock = threading.Lock()
         self._cleanup_lock = threading.Lock()
         self._cleaned_up = False
         self._custom_mode_started = False
@@ -596,8 +623,14 @@ class Controller:
 
     def _init_timer(self):
         self.timer = Timer(TimerConfig(time_step=self.cfg["common"]["dt"]))
-        self.next_publish_time = self.timer.get_time()
-        self.next_inference_time = self.timer.get_time()
+        # LowState is only about 360 Hz on the real E0. Timer advances by a
+        # fixed 2 ms per callback, so it slowed the nominal 50 Hz policy to
+        # 35.8 Hz and the commanded 2 Hz gait clock to about 1.46 Hz. Use
+        # elapsed wall time for scheduling; LowState supplies observations,
+        # not time.
+        now = time.monotonic()
+        self.next_publish_time = now
+        self.next_inference_time = now
 
     def _init_low_state_values(self):
         # Joint count comes from the config, NOT from B1JointCnt.
@@ -621,6 +654,8 @@ class Controller:
         # tau_est는 원래 안 받았다. 덜덜 떠는 것이 토크 포화인지 진동인지
         # 가르려면 이게 있어야 한다.
         self.dof_tau = np.zeros(n, dtype=np.float32)
+        self._low_state_seq = 0
+        self._low_state_sample_monotonic = 0.0
 
         # ⭐ motor_state_serial 발목 roll 이 **물리적으로 불가능한 표본**을 섞어 보낸다
         # (ibatch §8-69). 서기 로그 6,330행에서 다리가 멈춰 있을 때 도약률 0.02 %
@@ -893,6 +928,19 @@ class Controller:
         g_body = rotate_vector_inverse_rpy(roll, pitch, yaw, np.array([0.0, 0.0, -1.0]))
         tilt = float(np.arccos(np.clip(-g_body[2], -1.0, 1.0)))
         self._latest_tilt = tilt
+        # Candidate tests need a much earlier stop than the normal 45-degree
+        # fall/get-up path. Do not request recovery here: at 12 degrees the
+        # robot may still be standing, and invoking GetUp would add another
+        # uncontrolled variable. `running=False` reaches the normal context
+        # cleanup, which switches to DAMPING.
+        if (self._test_tilt_abort_rad > 0.0 and self._policy_authorized
+                and self.running_policy
+                and tilt > self._test_tilt_abort_rad):
+            self.logger.error(
+                "[test-tilt-abort] %.1f deg > %.1f deg; stopping through DAMPING cleanup",
+                np.degrees(tilt), np.degrees(self._test_tilt_abort_rad))
+            self.running = False
+            return
         safety = self.cfg.get("safety", {})
         rpy_limit = float(safety.get("fall_tilt_limit_rad",
                                      safety.get("roll_pitch_limit_rad", 1.0)))
@@ -906,19 +954,25 @@ class Controller:
                 "tilt=%.0fdeg > %.0fdeg (roll=%.0f pitch=%.0f)"
                 % (np.degrees(tilt), np.degrees(rpy_limit),
                    np.degrees(roll), np.degrees(pitch)))
-        self.timer.tick_timer_if_sim()
-        time_now = self.timer.get_time()
+        time_now = time.monotonic()
         q_raw = self._gate_joint_sample(
             [motor.q for motor in low_state_msg.motor_state_serial])
-        for i, q in enumerate(q_raw):
-            self.dof_pos_latest[i] = q
-        if time_now >= self.next_inference_time:
-            self.projected_gravity[:] = rotate_vector_inverse_rpy(
-                low_state_msg.imu_state.rpy[0],
-                low_state_msg.imu_state.rpy[1],
-                low_state_msg.imu_state.rpy[2],
-                np.array([0.0, 0.0, -1.0]),
-            )
+        gravity = rotate_vector_inverse_rpy(
+            low_state_msg.imu_state.rpy[0],
+            low_state_msg.imu_state.rpy[1],
+            low_state_msg.imu_state.rpy[2],
+            np.array([0.0, 0.0, -1.0]),
+        )
+        # Do NOT gate this update on next_inference_time.  That timestamp is
+        # advanced by the main thread before the next callback usually runs.
+        # Sharing it here made the callback and inference race: the 50 Hz loop
+        # looked healthy while q/dq/tau were held for as long as 218 ms on the
+        # robot (only 22 distinct joint snapshots in 50 walk inferences).
+        # LowState is the producer; it must always publish its latest sample.
+        with self._state_lock:
+            for i, q in enumerate(q_raw):
+                self.dof_pos_latest[i] = q
+            self.projected_gravity[:] = gravity
             self.base_ang_vel[:] = low_state_msg.imu_state.gyro
             for i, motor in enumerate(low_state_msg.motor_state_serial):
                 # q 는 위에서 이미 통과시킨 값을 쓴다. dq 는 SDK 가 **같은
@@ -928,6 +982,16 @@ class Controller:
                 if self._dof_gate_consec[i] == 0:
                     self.dof_vel[i] = motor.dq
                 self.dof_tau[i] = motor.tau_est
+            self._low_state_seq += 1
+            self._low_state_sample_monotonic = time_now
+
+    def _snapshot_policy_state(self):
+        """Atomically copy the exact LowState sample consumed by one inference."""
+        with self._state_lock:
+            return (self.dof_pos.copy(), self.dof_vel.copy(),
+                    self.dof_tau.copy(), self.base_ang_vel.copy(),
+                    self.projected_gravity.copy(), int(self._low_state_seq),
+                    float(self._low_state_sample_monotonic))
 
     def _gate_joint_sample(self, q_in):
         """물리적으로 불가능한 관절 표본을 버리고 직전 값을 유지한다.
@@ -972,12 +1036,16 @@ class Controller:
                 self.publish_runner.join(timeout=1.0)
 
             # Ctrl-C/SystemExit also comes through __exit__. Always leave CUSTOM
-            # mode before closing the command channel once we entered it.
+            # mode before closing the command channel once we entered it. A
+            # clean bounded-test timeout returns to PREPARE; faults retain the
+            # fail-safe DAMPING default.
             if self._custom_mode_started and hasattr(self, "client"):
                 try:
-                    self.client.ChangeMode(RobotMode.kDamping)
+                    target_mode = getattr(
+                        self, "_cleanup_target_mode", RobotMode.kDamping)
+                    self.client.ChangeMode(target_mode)
                 except Exception as exc:
-                    self.logger.error("Failed to request DAMPING during cleanup: %s", exc)
+                    self.logger.error("Failed to change mode during cleanup: %s", exc)
 
             if self.fall_monitor is not None:
                 self.fall_monitor.close()
@@ -1765,8 +1833,9 @@ class Controller:
             self._policy_gains_active = True
             self._send_cmd(self.low_cmd)
         self._log_joint_deviation("at %s (vs rl pose)" % reason, rl_q)
-        self.next_inference_time = self.timer.get_time()
-        self.next_publish_time = self.timer.get_time()
+        now = time.monotonic()
+        self.next_inference_time = now
+        self.next_publish_time = now
 
     def start_rl_gait_conditionally(self):
         print(f"{self.remoteControlService.get_rl_gait_operation_hint()}")
@@ -1802,6 +1871,7 @@ class Controller:
         # 이 문이 열린 뒤에야 복구 재진입도 정책을 다시 켠다.
         self._policy_authorized = True
         self._start_policy_control(reason="RL-gait start")
+        self._policy_test_t0 = time.monotonic()
         if self.goal_source_mode == "stdin":
             self.goal_source.start_stdin_reader(self.logger)
         # The publisher already started at CUSTOM entry; do not start a second one.
@@ -1819,11 +1889,36 @@ class Controller:
             self.running = False
             return
 
-        time_now = self.timer.get_time()
+        if (self._max_policy_s > 0.0 and self._policy_test_t0 > 0.0
+                and time.monotonic() - self._policy_test_t0 >= self._max_policy_s):
+            self.logger.warning(
+                "[test-timeout] policy ran %.2f s (limit %.2f s); returning to PREPARE",
+                time.monotonic() - self._policy_test_t0, self._max_policy_s)
+            # A normal test timeout is not a fault. DAMPING at an arbitrary
+            # gait phase makes an upright robot go limp: the first bounded NP
+            # walk ended at only 3.96 deg tilt, then appeared to dive during
+            # cleanup. Hand control back to the vendor standing controller.
+            # Tilt/fall/non-finite paths keep the DAMPING default.
+            self._cleanup_target_mode = RobotMode.kPrepare
+            self.running = False
+            return
+
+        time_now = time.monotonic()
         if time_now < self.next_inference_time:
-            time.sleep(0.001)
+            # Sleeping in 1 ms polling slices woke the Python main thread about
+            # twenty times per policy interval. On the robot that contended
+            # with the SDK callback/publisher threads under the GIL and a
+            # nominal 50 Hz loop measured only 38.5 Hz. Sleep once to the
+            # actual deadline; 20 ms is already the policy's response budget.
+            time.sleep(self.next_inference_time - time_now)
             return
         self.next_inference_time += self.policy.get_policy_interval()
+        # A late inference must not be followed by one or more immediate
+        # catch-up inferences over the same sensor sample.  The command is a
+        # held target; replaying missed policy ticks only duplicates stale
+        # observations and steals time from the LowState callback.
+        if self.next_inference_time < time_now:
+            self.next_inference_time = time_now + self.policy.get_policy_interval()
 
         # The SDK's own fall state is the slower, authoritative channel; the IMU
         # watchdog in _low_state_handler is the fast one. Either can start
@@ -1862,15 +1957,19 @@ class Controller:
         goal_rel_x, goal_rel_y, heading_error = goal
         self._last_goal = goal
         self._update_arrival_gait(goal_rel_x, goal_rel_y, heading_error)
+        (policy_dof_pos, policy_dof_vel, policy_dof_tau,
+         policy_base_ang_vel, policy_projected_gravity,
+         policy_state_seq, policy_state_t) = self._snapshot_policy_state()
         dof_target = self.policy.inference(
             time_now=time_now,
-            dof_pos=self.dof_pos,
-            dof_vel=self.dof_vel,
-            base_ang_vel=self.base_ang_vel,
-            projected_gravity=self.projected_gravity,
+            dof_pos=policy_dof_pos,
+            dof_vel=policy_dof_vel,
+            base_ang_vel=policy_base_ang_vel,
+            projected_gravity=policy_projected_gravity,
             goal_rel_x=goal_rel_x,
             goal_rel_y=goal_rel_y,
             heading_error=heading_error,
+            dof_tau=policy_dof_tau,
         )
 
         # Safety watchdog: never publish a non-finite target.
@@ -1880,10 +1979,14 @@ class Controller:
             return
         self.dof_target[:] = dof_target
         self._publish_policy_debug(low_state_age, goal_status)
-        self._log_timing_row(low_state_age, goal_rel_x, goal_rel_y, heading_error)
-        time.sleep(0.001)
+        self._log_timing_row(
+            low_state_age, goal_rel_x, goal_rel_y, heading_error,
+            policy_dof_pos, policy_dof_vel, policy_dof_tau,
+            policy_base_ang_vel, policy_state_seq, policy_state_t)
 
-    def _log_timing_row(self, low_state_age, gx, gy, herr):
+    def _log_timing_row(self, low_state_age, gx, gy, herr,
+                        policy_dof_pos, policy_dof_vel, policy_dof_tau,
+                        policy_base_ang_vel, policy_state_seq, policy_state_t):
         """관측 지연 한 줄. MuJoCo 스윕(§8-40)에서 이 값만 여유가 0이었다 --
         10 ms 무사, 20 ms에서 흔들리고, 30-35 ms면 2-3 걸음마다 넘어진다.
         실기가 그 구간에 있는지가 질문이고, 걷지 않아도 답이 나온다."""
@@ -1894,19 +1997,21 @@ class Controller:
         self._timing_last_tick = now
         ls = int(self.cfg["policy"].get("leg_dof_start", 10))
         try:
-            head = [now - self._timing_t0, low_state_age, dt_tick,
+            state_age = max(0.0, now - policy_state_t) if policy_state_t else float("inf")
+            head = [now - self._timing_t0, low_state_age, state_age,
+                    policy_state_seq, dt_tick,
                     float(np.degrees(self._latest_tilt)),
                     float(self._latest_rpy[0]), float(self._latest_rpy[1]),
-                    float(self.base_ang_vel[0]), float(self.base_ang_vel[1]),
-                    float(self.base_ang_vel[2]),
+                    float(policy_base_ang_vel[0]), float(policy_base_ang_vel[1]),
+                    float(policy_base_ang_vel[2]),
                     float(self._walking), float(self.policy.gait_frequency),
                     float(self.policy.gait_process),
                     (1.0 / (sum(self._pub_dt) / len(self._pub_dt)))
                     if self._pub_dt else 0.0,
                     gx, gy, herr]
-            body = (list(self.dof_pos[ls:ls + 12])
-                    + list(self.dof_vel[ls:ls + 12])
-                    + list(self.dof_tau[ls:ls + 12])
+            body = (list(policy_dof_pos[ls:ls + 12])
+                    + list(policy_dof_vel[ls:ls + 12])
+                    + list(policy_dof_tau[ls:ls + 12])
                     + list(self.policy.actions[:12]))
             self._timing_fp.write(
                 ",".join("%.5g" % float(v) for v in head + body) + "\n")
@@ -2006,15 +2111,23 @@ class Controller:
 
     def _publish_loop(self):
         while self.running:
-            time_now = self.timer.get_time()
+            time_now = time.monotonic()
             if time_now < self.next_publish_time:
-                time.sleep(0.001)
+                # One deadline sleep avoids hundreds of 1 ms GIL wakeups per
+                # second. The SDK Write path measured about 185 Hz maximum on
+                # this robot; asking for 500 Hz only starves the 50 Hz policy.
+                time.sleep(self.next_publish_time - time_now)
                 continue
-            self.next_publish_time += self.cfg["common"]["dt"]
+            self.next_publish_time += self._publish_interval_s
+            # Do not replay missed motor frames in a burst. LowCmd is a held
+            # position target; a late duplicate has no information and only
+            # consumes the GIL needed by policy inference.
+            if self.next_publish_time < time_now:
+                self.next_publish_time = time_now + self._publish_interval_s
 
             # ⛔ 이 필터의 계수(0.8/0.2)는 **500 Hz 발행을 가정**하고 고른 값이다.
-            # 이 루프는 파이썬이고 time.sleep(0.001)이라 실제 발행률이 그보다
-            # 훨씬 낮을 수 있다. 낮으면 차단주파수가 같이 내려가 보행 자체를 깎는다:
+            # 이 루프는 파이썬이고 예전의 1 ms polling에서도 실제 발행률은
+            # 훨씬 낮았다. 낮으면 차단주파수가 같이 내려가 보행 자체를 깎는다:
             #   500 Hz -> fc 17.8 Hz, 2 Hz 보행 감쇠 0.99
             #   100 Hz -> fc  3.6 Hz,               0.87
             #    50 Hz -> fc  1.8 Hz,               0.66
@@ -2035,7 +2148,6 @@ class Controller:
             # 관절마다 다른 시점의 목표가 섞여 나간다. sleep 은 락 **밖**이다.
             with self.publish_lock:
                 self._publish_one_frame(_dt)
-            time.sleep(0.001)
 
     def _publish_one_frame(self, _dt):
         """저역통과 한 스텝 + `low_cmd` 채우기 + 발행.
@@ -2129,6 +2241,17 @@ if __name__ == "__main__":
                              "fixed/stdin = manual constant goal.")
     parser.add_argument("--goal", type=str, default=None,
                         help='Initial robot-local goal "x,y,theta" (m,m,rad). Overrides config.')
+    parser.add_argument("--policy-path", type=str, default=None,
+                        help="Override policy.policy_path without changing the frozen deploy "
+                             "contract. Use this to A/B named checkpoint exports while keeping "
+                             "the proven I3b model available for immediate rollback.")
+    parser.add_argument("--test-tilt-abort-deg", type=float, default=None,
+                        help="Stop through DAMPING cleanup at this tilt during a short "
+                             "candidate test, without entering the fall/get-up sequence. "
+                             "Default disables this extra test gate.")
+    parser.add_argument("--max-policy-seconds", type=float, default=0.0,
+                        help="Return to PREPARE after this many seconds of policy control. "
+                             "0 disables the test timeout.")
     parser.add_argument("--goal-topic", type=str, default=None,
                         help="Override deploy_goal.topic for ROS mission mode.")
     parser.add_argument("--debug-topic", type=str, default=None,
@@ -2151,6 +2274,10 @@ if __name__ == "__main__":
                              "계산해 시정수를 고정한다. 기본 꺼짐 -- 실기에서 A/B 하라.")
     parser.add_argument("--filter-tau-ms", type=float, default=10.0,
                         help="--rate-fixed-filter 의 목표 시정수(ms). 기본 10 = 설계 의도.")
+    parser.add_argument("--publish-hz", type=float, default=0.0,
+                        help="LowCmd 목표 발행률. 0은 기존 common.dt(500 Hz) 요청. "
+                             "실기 SDK 최대가 약 185 Hz라 100 Hz로 제한하면 불필요한 "
+                             "Write/GIL 경쟁을 줄일 수 있다.")
     parser.add_argument("--parallel-torque", action="store_true",
                         help="발목 4관절(mech.parallel_mech_indexes)을 base_walk와 같은 "
                              "방식으로 보낸다: kp=0 + 관절공간 토크 피드포워드. "
@@ -2195,6 +2322,10 @@ if __name__ == "__main__":
         parallel_torque=args.parallel_torque,
         rate_fixed_filter=args.rate_fixed_filter,
         filter_tau_s=args.filter_tau_ms / 1000.0,
+        policy_path_override=args.policy_path,
+        test_tilt_abort_deg=args.test_tilt_abort_deg,
+        max_policy_s=args.max_policy_seconds,
+        publish_hz=args.publish_hz,
     ) as controller:
         time.sleep(2)  # wait for channels
         print("Initialization complete.")

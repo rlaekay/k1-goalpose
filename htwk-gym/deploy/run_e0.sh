@@ -9,6 +9,11 @@
 #   ./run_e0.sh                 # fixed goal (0,0,0), bring-up
 #   ./run_e0.sh ros             # mission mode, goal from Brain
 #   ./run_e0.sh fixed 0.2,0,0   # fixed goal, 0.2 m forward
+#   ./run_e0.sh fixed 0.2,0,0 --policy-path ./models/goal_pose_np.pt
+#                               # candidate actor; E0 config/gains stay frozen
+#   ./run_e0.sh fixed 0.2,0,0 --policy-path ./models/goal_pose_np.pt \
+#       --max-policy-seconds 1.5 --test-tilt-abort-deg 12 --log-timing /tmp/np_02.csv
+#                               # bounded first ground test
 #
 # Anything after those two is passed through to deploy_goal_pose.py, so the
 # diagnostic runs do not need the long command either:

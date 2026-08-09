@@ -93,6 +93,7 @@ def make_ctl(parallel_torque=False):
     c._parallel_torque = parallel_torque
     c._rate_fixed_filter = False
     c._filter_tau_s = 0.010
+    c._publish_interval_s = c.cfg["common"]["dt"]
     c._pub_last = 0.0; c._pub_dt = []
     c._custom_mode_started = False
     c._custom_mode_entered_monotonic = 0.0
@@ -107,7 +108,11 @@ def make_ctl(parallel_torque=False):
     c.dof_pos_latest = np.zeros(JN, dtype=np.float32)
     c.policy = types.SimpleNamespace(leg_start=10, num_act=12)
     c.timer = D.Timer(D.TimerConfig(time_step=0.002))
-    c.next_publish_time = c.timer.get_time()
+    # Production scheduling is wall-clock based.  Leaving this on the old
+    # simulated Timer makes `_publish_loop` see a huge missed deadline and the
+    # test stub die for a missing `_publish_interval_s`, which tests the stub
+    # rather than first-entry publisher startup.
+    c.next_publish_time = time.monotonic()
     c.client = types.SimpleNamespace(ChangeMode=lambda m: 0)
     c._last_low_state_monotonic = time.monotonic()
 
@@ -129,17 +134,16 @@ def make_ctl(parallel_torque=False):
 
 
 def run_publish_thread(c, hz=500.0, seconds=None, stop_evt=None):
-    """LowState 콜백이 하는 일(카운터 tick)까지 흉내내어 발행 스레드를 돌린다."""
+    """Production의 wall-clock 발행 스레드를 흉내낸다."""
     def ticker():
-        while not stop_evt.is_set():
-            c.timer.tick_timer_if_sim()
-            time.sleep(1.0 / hz)
+        stop_evt.wait()
     def pub():
+        c.next_publish_time = time.monotonic()
         while not stop_evt.is_set():
-            now = c.timer.get_time()
+            now = time.monotonic()
             if now < c.next_publish_time:
                 time.sleep(0.0005); continue
-            c.next_publish_time += c.cfg["common"]["dt"]
+            c.next_publish_time += 1.0 / hz
             _dt = 1.0 / hz
             with c.publish_lock:
                 c._in_critical[0] += 1

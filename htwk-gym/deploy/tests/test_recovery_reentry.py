@@ -401,6 +401,89 @@ check("T18 `_publish_cmd` 가 예외를 잡아 `_publish_error` 에 남긴다",
       and any(isinstance(a, ast.Attribute) and a.attr == "_publish_error"
               for a in ast.walk(_pub)))
 
+# ---- T19: 실기 정책/보행 시계가 LowState 콜백 개수에 묶이지 않는다 ---------
+# Timer 는 콜백 하나마다 고정 2 ms 를 더한다. 실기 LowState 가 360 Hz이면 이를
+# 시간으로 쓴 50 Hz 정책은 36 Hz, 2 Hz gait 는 1.44 Hz가 된다. 네 스케줄 지점
+# 모두 wall clock 을 쓰고 Timer.get_time() 이 남아 있지 않아야 한다.
+_tree = ast.parse(_src)
+_wall_clock_fns = {}
+for node in ast.walk(_tree):
+    if isinstance(node, ast.FunctionDef) and node.name in {
+            "_init_timer", "_low_state_handler", "_start_policy_control",
+            "run", "_publish_loop"}:
+        segment = ast.get_source_segment(_src, node) or ""
+        _wall_clock_fns[node.name] = (
+            "time.monotonic()" in segment and "self.timer.get_time()" not in segment)
+check("T19 스케줄·gait clock 이 모두 wall clock 을 쓴다",
+      len(_wall_clock_fns) == 5 and all(_wall_clock_fns.values()),
+      "함수=%s" % _wall_clock_fns)
+
+# ---- T20~T21: 정상 시험 종료는 PREPARE, fault 기본값은 DAMPING -----------
+c3 = D.Controller.__new__(D.Controller)
+c3.logger = __import__("logging").getLogger("test-timeout")
+c3.running = True
+c3._max_policy_s = 1.0
+c3._policy_test_t0 = 10.0
+c3.in_recovery = lambda: False
+c3._abort_requested = lambda _where: False
+_real_monotonic = D.time.monotonic
+D.time.monotonic = lambda: 11.01
+try:
+    c3.run()
+finally:
+    D.time.monotonic = _real_monotonic
+check("T20 정상 제한시간 종료는 PREPARE 를 선택한다",
+      c3.running is False
+      and getattr(c3, "_cleanup_target_mode", None) == D.RobotMode.kPrepare)
+
+def _cleanup_probe(target_marker=None):
+    c = D.Controller.__new__(D.Controller)
+    c._cleanup_lock = threading.Lock(); c._cleaned_up = False; c.running = True
+    c.publish_runner = None; c._custom_mode_started = True
+    calls = []
+    c.client = types.SimpleNamespace(ChangeMode=lambda mode: calls.append(mode))
+    c.fall_monitor = None; c.mode_monitor = None
+    c.goal_source = types.SimpleNamespace()
+    c.remoteControlService = types.SimpleNamespace(close=lambda: None)
+    c._timing_fp = None
+    if target_marker is not None:
+        c._cleanup_target_mode = target_marker
+    c.cleanup()
+    return calls
+
+_prep_calls = _cleanup_probe(D.RobotMode.kPrepare)
+_fault_calls = _cleanup_probe()
+check("T21 cleanup 은 정상 timeout=PREPARE, fault 기본값=DAMPING 을 보존한다",
+      _prep_calls == [D.RobotMode.kPrepare]
+      and _fault_calls == [D.RobotMode.kDamping],
+      "prepare=%s fault=%s" % (_prep_calls, _fault_calls))
+
+# ---- T22: 정책 deadline 을 1 ms polling 으로 기다리지 않는다 ---------------
+_run_node = next((n for n in ast.walk(_tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "run"), None)
+_run_src = ast.get_source_segment(_src, _run_node) if _run_node else ""
+check("T22 정책 대기는 deadline sleep 이고 추론 뒤 고정 1 ms sleep 이 없다",
+      "time.sleep(self.next_inference_time - time_now)" in _run_src
+      and "time.sleep(0.001)" not in _run_src)
+
+# ---- T23: LowCmd 발행률을 제한할 때 polling/catch-up burst가 없다 -----------
+_publish_loop_node = next((n for n in ast.walk(_tree)
+                           if isinstance(n, ast.FunctionDef)
+                           and n.name == "_publish_loop"), None)
+_publish_loop_src = (ast.get_source_segment(_src, _publish_loop_node)
+                     if _publish_loop_node else "")
+_publish_has_fixed_1ms = bool(_publish_loop_node and any(
+    isinstance(n, ast.Call)
+    and isinstance(n.func, ast.Attribute) and n.func.attr == "sleep"
+    and n.args and isinstance(n.args[0], ast.Constant) and n.args[0].value == 0.001
+    for n in ast.walk(_publish_loop_node)))
+check("T23 LowCmd 는 설정 주기 deadline sleep + missed-frame skip 을 쓴다",
+      "time.sleep(self.next_publish_time - time_now)" in _publish_loop_src
+      and "self._publish_interval_s" in _publish_loop_src
+      and "self.next_publish_time = time_now + self._publish_interval_s"
+      in _publish_loop_src
+      and not _publish_has_fixed_1ms)
+
 print()
 if FAILED:
     print("실패 %d: %s" % (len(FAILED), ", ".join(FAILED)))

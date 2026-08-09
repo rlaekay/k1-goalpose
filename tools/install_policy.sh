@@ -233,7 +233,7 @@ if [ "${EXPORT_ONLY}" -eq 1 ]; then
 fi
 
 # --------------------------------------------------------- 4. copy to robot --
-DEST_DIR="${ROBOT_WS}/deploy/models"
+DEST_DIR="${ROBOT_WS}/models"
 DEST="${DEST_DIR}/${POLICY_NAME}.pt"
 info "4/5 copying to robot ${ROBOT}:${DEST}"
 run_robot "mkdir -p '${DEST_DIR}'"
@@ -253,16 +253,16 @@ fi
 # a stale YAML. These are plain Python/YAML -- no build step on the robot.
 info "      shipping deploy wrapper + config (pure Python, no build needed)"
 if [ "${DRY_RUN}" -eq 0 ]; then
-  run_robot "mkdir -p '${ROBOT_WS}/deploy/configs' '${ROBOT_WS}/deploy/utils'"
+  run_robot "mkdir -p '${ROBOT_WS}/configs' '${ROBOT_WS}/utils'"
   scp -P "${ROBOT_PORT}" \
       "${REPO_ROOT}/htwk-gym/deploy/deploy_goal_pose.py" \
-      "${ROBOT}:${ROBOT_WS}/deploy/"
+      "${ROBOT}:${ROBOT_WS}/"
   scp -P "${ROBOT_PORT}" \
       "${REPO_ROOT}/htwk-gym/deploy/configs/${DEPLOY_CONFIG}" \
-      "${ROBOT}:${ROBOT_WS}/deploy/configs/"
+      "${ROBOT}:${ROBOT_WS}/configs/"
   scp -P "${ROBOT_PORT}" \
       "${REPO_ROOT}"/htwk-gym/deploy/utils/*.py \
-      "${ROBOT}:${ROBOT_WS}/deploy/utils/"
+      "${ROBOT}:${ROBOT_WS}/utils/"
 fi
 
 # -------------------------------------------------------- 5. verify integrity --
@@ -275,7 +275,7 @@ if [ "${DRY_RUN}" -eq 0 ]; then
   [ "${SERVER_SHA}" = "${ROBOT_SHA}" ] || die "sha256 mismatch after copy"
 
   info "      robot-side load smoke test"
-  run_robot "cd '${ROBOT_WS}/deploy' && python3 - <<'PY'
+  run_robot "cd '${ROBOT_WS}' && python3 - <<'PY'
 import torch
 m = torch.jit.load('models/${POLICY_NAME}.pt', map_location='cpu').eval()
 with torch.inference_mode():
@@ -293,7 +293,7 @@ cat <<EOF
 
 Next, on the robot (terminal C):
 
-  cd ${ROBOT_WS}/deploy
+  cd ${ROBOT_WS}
   source /opt/ros/humble/setup.bash
   python3 deploy_goal_pose.py --config ${DEPLOY_CONFIG} --goal-source ros --net 127.0.0.1
 
