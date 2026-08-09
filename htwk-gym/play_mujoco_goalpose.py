@@ -635,6 +635,8 @@ def main():
         data.xfrc_applied[trunk_bid, _ax] = args.body_force_n
         print("Trunk 지속 외력 %.1f N (%s, 월드축 %d)"
               % (args.body_force_n, args.body_force_dir, _ax))
+    FALL_BUF_N = 1200                 # 2.4 s @ dt 0.002
+    fall_buf, fall_events = [], []
     stand_tilt, stand_drift = [], []
     px0 = py0 = 0.0          # stand 모드의 기준점: 첫 스텝의 위치
     t = 0.0
@@ -779,6 +781,37 @@ def main():
         tilt_rad = math.acos(np.clip(-proj_g[2], -1.0, 1.0))
         tilt_rad_prev = tilt_rad
         fallen = tilt_rad > fall_tilt
+        # ---- 낙상 사건 기록 (물리 스텝 해상도) ------------------------------
+        # ⛔ --dump-csv 로는 이것을 못 잰다: 덤프는 정책 tick(50 Hz)에만 쓰는데
+        # 낙상 판정은 물리 스텝(500 Hz)에서 돌고 **즉시 리셋**된다. 실제로 75회 중
+        # 2회만 잡혔다. 방향(측방/전방)은 낙상의 판별 축인데 그 표본으로는 못 센다.
+        # 그래서 링버퍼를 두고 사건이 나면 그 자리에서 되짚는다.
+        _rr = math.atan2(R[2, 1], R[2, 2])
+        _pp = math.asin(-max(-1.0, min(1.0, R[2, 0])))
+        _fd = data.xpos[foot_bid[0]][:2] - data.xpos[foot_bid[1]][:2]
+        _cc, _ss = math.cos(-yaw), math.sin(-yaw)
+        fall_buf.append((t, math.degrees(tilt_rad), math.degrees(_rr),
+                         math.degrees(_pp), float(_ss * _fd[0] + _cc * _fd[1])))
+        if len(fall_buf) > FALL_BUF_N:
+            del fall_buf[0]
+        if fallen and len(fall_buf) > 2:
+            def _back(thr):
+                """뒤에서 앞으로 가며 tilt 가 thr 아래였던 마지막 표본."""
+                for j in range(len(fall_buf) - 1, -1, -1):
+                    if fall_buf[j][1] < thr:
+                        return j
+                return 0
+            j20, j10 = _back(20.0), _back(10.0)
+            fall_events.append({
+                "t": round(t, 3),
+                # 20도를 넘은 시점의 자세. 이때 어느 축이 앞서 있는지가 방향이다.
+                "roll20": round(fall_buf[j20][2], 2),
+                "pitch20": round(fall_buf[j20][3], 2),
+                "sep20": round(fall_buf[j20][4], 4),
+                "lead_10_to_fall_s": round(t - fall_buf[j10][0], 3),
+                "sep_min_1s": round(min(r[4] for r in fall_buf[-500:]), 4),
+                "lateral": abs(fall_buf[j20][2]) > abs(fall_buf[j20][3]),
+            })
         if args.stand:
             # 서 있는 과제에는 도착도 구간도 없다. 재는 것은 두 가지다 --
             # 넘어지는가, 그리고 제자리에 있는가(표류).
@@ -937,6 +970,24 @@ def main():
             "final": round(float(lp[-1]), 4),
             "delta": round(float(np.median(lp[-k:]) - np.median(lp[:k])), 4),
         }
+    if fall_events:
+        lat = [e for e in fall_events if e["lateral"]]
+        res["fall_mode"] = {
+            "n": len(fall_events),
+            "lateral": len(lat),
+            "sagittal": len(fall_events) - len(lat),
+            "lateral_share": round(len(lat) / len(fall_events), 3),
+            "roll20_median": round(float(np.median([e["roll20"] for e in fall_events])), 2),
+            "pitch20_median": round(float(np.median([e["pitch20"] for e in fall_events])), 2),
+            "abs_roll20_median": round(float(np.median([abs(e["roll20"]) for e in fall_events])), 2),
+            "abs_pitch20_median": round(float(np.median([abs(e["pitch20"]) for e in fall_events])), 2),
+            "lead_10_to_fall_median_s": round(float(np.median(
+                [e["lead_10_to_fall_s"] for e in fall_events])), 3),
+            "sep20_median": round(float(np.median([e["sep20"] for e in fall_events])), 4),
+            "sep_crossed_before_fall": round(float(np.mean(
+                [e["sep_min_1s"] < 0.0 for e in fall_events])), 3),
+        }
+        res["fall_events"] = fall_events[:40]      # 전수는 크다 -- 앞 40건만
     res["armature_preset"] = args.armature_preset
     res["vendor_gains"] = bool(args.vendor_gains)
     res["act_lag_ms"] = args.act_lag_ms
