@@ -605,6 +605,7 @@ def main():
     hiproll_hist = []
     foot_sep = []
     foot_sep_t = []
+    state_rows = []   # 사후 검정용 원시 상태 (매개자 검정 · 명령 서명 비교)
     foot_bid = [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "%s_foot_link" % s)
                 for s in ("left", "right")]
     if any(b < 0 for b in foot_bid):
@@ -814,6 +815,14 @@ def main():
             _c, _s = math.cos(-yaw), math.sin(-yaw)
             foot_sep.append(float(_s * _d[0] + _c * _d[1]))
             foot_sep_t.append(t)
+            # ⭐ 사후 검정에 필요한 것을 **한 번에** 담는다. 오늘 같은 셀을 다섯 번
+            # 재실행했다 -- 매번 "그 열이 없다" 였다. base 자세·속도·지지·명령·실측을
+            # 다 남기면 LIP 측방 발산 매개 검정도 명령 서명 비교도 재실행 없이 된다.
+            state_rows.append(
+                [t, float(data.qpos[0]), float(data.qpos[1]), yaw,
+                 float(data.qvel[0]), float(data.qvel[1]), float(_support_count())]
+                + [float(v) for v in q[10:22]]
+                + [float(v) for v in targets[10:22]])
             # 실기와 같은 정의: roll(트렁크) + gx(롤 각속도)*tau
             _roll = math.atan2(R[2, 1], R[2, 2])
             cap_rows.append((math.degrees(_roll + ang_vel[0] * CAP_TAU),
@@ -1018,8 +1027,14 @@ def main():
             } if _v.size >= 200 else {"n": int(_v.size), "note": "표본 부족"})
         # 원시 시계열을 남긴다 -- 같은 질문으로 또 재실행하지 않기 위해서다.
         if args.out:
-            np.savez_compressed(os.path.splitext(args.out)[0] + "_series.npz",
-                                t=_ts, foot_sep=_fs_all, tilt=_tilt, fall_t=_ft)
+            _sr = np.array(state_rows, dtype=np.float32) if state_rows else np.zeros((0, 31), np.float32)
+            np.savez_compressed(
+                os.path.splitext(args.out)[0] + "_series.npz",
+                t=_ts, foot_sep=_fs_all, tilt=_tilt, fall_t=_ft, state=_sr,
+                state_cols=np.array(
+                    ["t", "px", "py", "yaw", "vx", "vy", "support"]
+                    + ["q%d" % i for i in range(12)]
+                    + ["cmd%d" % i for i in range(12)]))
     if foot_sep and cap_rows and len(cap_rows) == len(foot_sep):
         # ⛔ 낙상 과도구간이 p1 을 오염시킨다. 낙상 36회 x 0.4 s = 120 s 의 12 % 이고
         # p1 은 **1 퍼센타일**이라 그 1 % 가 통째로 넘어지는 중일 수 있다.
