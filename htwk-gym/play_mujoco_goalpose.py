@@ -355,6 +355,10 @@ def main():
     # ⚠️ 발목 P/R 을 **분리**한다. 학습 자산(armsdown)이 Ankle_P 20 / Ankle_R 15 로
     # 다르게 두고 있고, 포화율도 P 17.6 % 대 R 4.0 % 로 4배 갈린다. 하나로 묶으면
     # 지배적인 P 축이 R 축을 가린다.
+    ap.add_argument("--hipknee-scale", type=float, default=None,
+                    help="힙·무릎 8관절 토크 상한을 이 배수로(프리셋 뒤). 발목과 반대로 "
+                         "**열수록 좋다**가 측정됐다(URDF 30-40 -> 61.8 낙상, 벤더 68-112 -> 0). "
+                         "벤더 위쪽에 절벽이 있는지는 안 봤다 -- NS_effort 설계에 필요하다.")
     ap.add_argument("--ankle-torque-p", type=float, default=None,
                     help="Ankle_Pitch 토크 상한만 덮는다(프리셋 뒤에 적용)")
     ap.add_argument("--ankle-torque-r", type=float, default=None,
@@ -523,6 +527,12 @@ def main():
         model.actuator_forcerange[10:22, 0] = -np.array(lim[10:22])
         model.actuator_forcerange[10:22, 1] = np.array(lim[10:22])
         print("토크 상한: %s %s (forcerange 도 함께 상향)" % (args.torque_limits, lim[10:16]))
+    if args.hipknee_scale is not None:
+        for _i in (10, 11, 12, 13, 16, 17, 18, 19):     # HipP,HipR,HipY,Knee x2
+            lim[_i] *= args.hipknee_scale
+            model.actuator_forcerange[_i, 0] = -lim[_i]
+            model.actuator_forcerange[_i, 1] = lim[_i]
+        print("  힙·무릎 토크 상한 x%.2f -> %s" % (args.hipknee_scale, np.round(lim[10:14], 1)))
     # 발목 P/R 개별 덮어쓰기 -- 프리셋 **뒤**라 어떤 프리셋 위에도 얹힌다.
     for _v, _idx, _nm in ((args.ankle_torque_p, (14, 20), "Ankle_Pitch"),
                           (args.ankle_torque_r, (15, 21), "Ankle_Roll")):
@@ -1185,6 +1195,7 @@ def main():
         res["fall_events"] = fall_events[:40]      # 전수는 크다 -- 앞 40건만
     res["imu_bias_deg"] = {"roll": args.imu_bias_roll_deg, "pitch": args.imu_bias_pitch_deg}
     res["ankle_torque"] = {"p": args.ankle_torque_p, "r": args.ankle_torque_r,
+                           "hipknee_scale": args.hipknee_scale,
                            "preset": args.torque_limits}
     res["armature_preset"] = args.armature_preset
     res["vendor_gains"] = bool(args.vendor_gains)
