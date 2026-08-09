@@ -56,14 +56,40 @@ def load(p):
     return d
 
 
-def lat_series(d):
-    """첫 낙상 이전 · 직립 표본의 측방 위치(몸통 yaw 프레임)."""
+def lat_series(d, cad):
+    """보행 측방 흔들림만 남긴 신호.
+
+    ⛔ 첫 시도는 무효였다: yaw 로 회전만 시키고 **로봇의 이동 경로를 안 뺐다.**
+    `--goal-hold` 는 목표가 계속 앞서가므로 로봇이 120 s 내내 걸어 다니고, 그
+    궤적 방황이 신호를 지배해 "측방 진폭" 이 **4.9~5.4 m** 로 나왔다(지배 주파수도
+    0.22 Hz = 궤적 시간규모, 순열 p=1.000 = 주기성 없음).
+    ⇒ **한 보행주기 이동평균을 빼서** 궤적을 제거하고 주기 내 흔들림만 남긴다.
+
+    ⛔ 그리고 "첫 낙상 이전" 은 표본을 너무 버린다 -- 25.35 에서 5시드 중 3개가
+    낙상해 창이 몇 초로 줄었다(n=3). **낙상에서 2 s 이상 떨어진 표본**으로 바꾼다.
+    """
     t = d["t"]
-    end = d["_fall_t"][0] if d["_fall_t"].size else t[-1] + 1.0
-    m = (t < end) & (d["_tilt"] < 15.0)
+    ft = d["_fall_t"]
+    if ft.size:
+        idx = np.searchsorted(ft, t, side="left")
+        gap = np.where(idx < ft.size, ft[np.minimum(idx, ft.size - 1)] - t, np.inf)
+        # 낙상 직후도 뺀다(리셋 과도)
+        pgap = t - np.where(idx > 0, ft[np.maximum(idx - 1, 0)], -np.inf)
+        keep = (gap > 2.0) & (pgap > 2.0)
+    else:
+        keep = np.ones(t.size, bool)
+    m = keep & (d["_tilt"] < 15.0)
     c, s = np.cos(-d["yaw"][m]), np.sin(-d["yaw"][m])
     y = s * d["px"][m] + c * d["py"][m]
-    return t[m], y, d["_sep"][m]
+    tt = t[m]
+    # 한 보행주기 이동평균 제거 (표본 간격 ~10 ms)
+    dt = np.median(np.diff(tt)) if tt.size > 1 else 0.01
+    w = max(3, int(round((1.0 / cad) / max(dt, 1e-6))) | 1)
+    ker = np.ones(w) / w
+    base = np.convolve(y, ker, mode="same")
+    edge = w // 2
+    sl = slice(edge, -edge if edge else None)
+    return tt[sl], (y - base)[sl], d["_sep"][m][sl]
 
 
 def detrend_cadence(t, y, cad, nharm=4):
@@ -97,8 +123,8 @@ def analyse(paths, cad, rng):
         d = load(p)
         if d is None:
             continue
-        t, y, sep = lat_series(d)
-        if t.size < 2000:
+        t, y, sep = lat_series(d, cad)
+        if t.size < 1500:
             continue
         r = detrend_cadence(t, y, cad)
         amps.append(float(np.std(r)))
