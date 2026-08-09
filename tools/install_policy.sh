@@ -134,7 +134,7 @@ else
 fi
 
 # ------------------------------------------------------- 2. verify the actor --
-info "2/5 verifying exported actor is (1,54) -> (1,12) and finite"
+info "2/5 verifying exported actor is (1,N_obs) -> (1,12) and finite"
 run_server "set -e
   cd '${SERVER_REPO}/htwk-gym'
   '${SERVER_PY}' - <<'PY'
