@@ -896,7 +896,9 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
     dump_act = None
     if dump_actions:
         k = max(1, min(int(dump_actions_envs), env.num_envs))
-        dump_act = {"k": k, "actions": [], "dof_pos": [], "done": []}
+        clip = float((env.cfg.get("normalization", {}) or {})["clip_actions"])
+        dump_act = {"k": k, "clip": clip,
+                    "actions": [], "dof_pos": [], "done": []}
 
     instrumented = hasattr(env, "goal_start_pos") and hasattr(env, "goal_start_step")
     has_segment_id = hasattr(env, "goal_segment_id")
@@ -1386,8 +1388,18 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
                 )
         if dump_act is not None:
             k = dump_act["k"]
+            # ⛔ Clip HERE, not in the reader.  step() clips to
+            # normalization.clip_actions before it builds the target
+            # (goal_pose.py:931 -> :926) and v7 sets that to **1.0**, which is
+            # the same order as the raw policy output -- so the clip binds all
+            # the time.  Dumping the pre-clip action and reconstructing
+            # `default + scale * action` downstream would inflate the commanded
+            # excursion, which is the exact quantity this dump exists to
+            # measure.  The clip constant travels in the npz as well so the
+            # reader can verify rather than trust.
             dump_act["actions"].append(
-                act[:k].detach().cpu().numpy().astype(np.float32))
+                torch.clip(act[:k], -dump_act["clip"], dump_act["clip"])
+                .detach().cpu().numpy().astype(np.float32))
             dump_act["dof_pos"].append(
                 env.dof_pos[:k].detach().cpu().numpy().astype(np.float32))
 
@@ -2041,7 +2053,8 @@ def rollout(env, model, total_steps, device, stochastic=False, record_video=Fals
         scale = (env.cfg.get("control", {}) or {})["action_scale"]
         np.savez_compressed(
             dump_actions,
-            actions=np.stack(dump_act["actions"]),        # [T, k, num_actions]
+            actions=np.stack(dump_act["actions"]),        # [T, k, num_actions] 클립 **적용됨**
+            clip_actions=np.float32(dump_act["clip"]),
             dof_pos=np.stack(dump_act["dof_pos"]),        # [T, k, num_dofs]
             done=np.stack(dump_act["done"]),              # [T, k]
             default_dof_pos=env.default_dof_pos.detach().cpu().numpy().astype(np.float32),

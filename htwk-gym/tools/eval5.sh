@@ -48,15 +48,20 @@ cp "$CFG" "$OUT/protocol.cfg.yaml"
 echo "체크포인트: $(readlink -f "$CKPT")"
 
 run_one () {          # $1 = seed, $2 = axis(accuracy|walk)
-    local seed="$1" axis="$2" dest="$OUT/seed${1}.${2}" pattern=""
+    local seed="$1" axis="$2" dest="$OUT/seed${1}.${2}" pattern="" dump=""
     [ "$axis" = "walk" ] && pattern="--goal_pattern forward_hold"
+    # ⛔ 덤프 경로는 **런마다** 달라야 한다. `$EXTRA` 에 --dump_actions 를 넣으면
+    # 시드 10개가 같은 파일을 덮어써서 마지막 하나만 남는다 -- 그러면 5-시드
+    # 프로토콜이 명령 축에서만 조용히 1-시드로 무너진다.
+    [ -n "$DUMP_ACTIONS" ] && dump="--dump_actions $dest/actions.npz --dump_actions_envs ${DUMP_ACTIONS_ENVS:-16}"
     if [ -f "$dest/report.json" ]; then
         echo "  건너뜀(이미 있음): $dest"; return 0
     fi
+    mkdir -p "$dest"
     set +e
     python -u eval_goal_pose.py --task K1/Goal_Pose_V7 --config "$CFG" \
         --checkpoint "$CKPT" --terrain plane --duration_s 120 --seed "$seed" $pattern \
-        $EXTRA --sim_device cuda:$GPU_INDEX --rl_device cuda:$GPU_INDEX \
+        $dump $EXTRA --sim_device cuda:$GPU_INDEX --rl_device cuda:$GPU_INDEX \
         --out "$dest" > "$dest.log" 2>&1
     local rc=$?
     set -e
