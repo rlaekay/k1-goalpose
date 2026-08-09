@@ -3393,6 +3393,20 @@ def render_report(r):
              _pf(g["falls"]["pass"])],
         ])
     md.append("")
+    # ⛔⛔ AUDIT_FINAL §7 #14. 이 표의 위 세 줄은 **완주한 구간만** 분모로 쓴다
+    # (`completed = changed & ~done` -- 낙상한 구간은 기록조차 안 된다). 아래쪽
+    # "낙상 안전성 -- survivor bias 보정" 절은 그 보정을 **낙상률에만** 적용하고
+    # 정확도에는 적용하지 않는다. 침묵하면 독자가 이 표를 보정된 값으로 읽는다.
+    _spa = r.get("success_per_attempt") or {}
+    if _spa.get("strict") is not None:
+        md.append("⛔ **위 세 줄(위치·heading)은 생존 편향 보정이 적용되지 않았다** — "
+                  "낙상한 시도는 분모에서 빠진다. 같은 정책을 채점 물리만 바꿔 "
+                  "65 % 넘어뜨리면 정확도가 **30 % 좋아진다**(38.75 → 27.26 cm). "
+                  "판정에는 아래 **도착률/시도**를 써라: **{:.1%}** "
+                  "(성공 {:.0f} / 시도 {})".format(
+                      _spa["strict"], _spa["strict"] * (_spa.get("attempts") or 0),
+                      _spa.get("attempts")))
+        md.append("")
     if r["authoritative_gate_evaluation"]:
         if r.get("hbatch_gates"):
             md.append("**legacy MASTERPLAN 참고 판정: {} (H 채택은 full-suite cross-arm gate에서 별도 판정)**"

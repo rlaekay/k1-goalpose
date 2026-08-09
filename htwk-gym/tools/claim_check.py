@@ -46,6 +46,8 @@ CONDITIONS = [
     # **첫 번째 실수로 적어 둔 바로 그것**(best vs final)을 도구가 못 잡고 있었다.
     # iteration 이 다르면 "arm 차이" 와 "학습량 차이" 가 교락된다. 그래서 PROTOCOL 이다.
     ("ckpt_iter",         lambda r: _ckpt_iter(r)),
+    # 이름·링크가 아니라 **내용**으로 같은 체크포인트인지 본다(AUDIT_FINAL §7 #13).
+    ("ckpt_sha256",       lambda r: _ckpt_sha(r)),
     ("goal_pattern",      lambda r: r.get("goal_pattern") or "(waypoint)"),
     ("duration_s",        lambda r: r.get("duration_s")),
     ("num_envs",          lambda r: r.get("num_envs")),
@@ -100,6 +102,7 @@ def _resolve_ckpt(r):
     if not ck:
         return "?", None, False
     base = os.path.basename(ck)
+
     try:
         if os.path.islink(ck) or os.path.exists(ck):
             real = os.path.basename(os.path.realpath(ck))
@@ -135,6 +138,25 @@ def _ckpt_iter(r):
         run = (r.get("checkpoint") or "/?/").split("/nn/")[0].split("/")[-1]
         return "?{}@{}".format(base, run[:18])
     return name or "?"
+
+
+def _ckpt_sha(r):
+    """채점 당시 실제로 읽은 가중치의 **불변** sha256 (AUDIT_FINAL §7 #13).
+
+    ⛔ 왜 별도 조건인가: `_resolve_ckpt` 의 심볼릭 링크 해석은 **지금 이 순간**의
+    링크를 따라간다. `best.pth` 는 채점할 때마다 다시 만들어지므로 "채점 당시
+    무엇이었나" 와 "지금 무엇을 가리키나" 가 다를 수 있다. 리포트 안에는 그때 읽은
+    파일의 sha256 이 들어 있는데(`input_provenance.checkpoint.sha256`) 도구가 그것을
+    안 읽고 이름·링크만 봤다.
+
+    sha 가 같으면 **이름이 뭐든 같은 가중치**이고, 다르면 **이름이 같아도 다른 가중치**다.
+    없으면 `(기록없음)` -- 리포트 124건 중 15건에 `input_provenance` 자체가 없다.
+    """
+    prov = r.get("input_provenance") or {}
+    if not isinstance(prov, dict):
+        return "(기록없음)"
+    sha = (prov.get("checkpoint") or {}).get("sha256") or ""
+    return sha[:12] if sha else "(기록없음)"
 
 
 def _protocol_block(r, name):
