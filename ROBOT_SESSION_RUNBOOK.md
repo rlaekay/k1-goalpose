@@ -29,16 +29,29 @@
 
 ## 1. 재설치 — 현 HEAD 를 로봇에
 
-로봇의 배포본은 **발목 게이트·토크 박스·시계 레버 이전 빌드**(`d883ed17…`)다.
+⛔ **로봇에는 git 이 없고, `install_policy.sh` 는 정책(.pt)·config·검증도구만 옮긴다.**
+`deploy_goal_pose.py` 와 `utils/` 를 옮기는 경로가 스크립트에도 문서에도 없어서,
+2026-08-10 실행 직전에 **로봇이 구 빌드(`d883ed17…`)로 서 있는 것이 발견됐다.**
+→ `tools/sync_deploy_code.sh` 를 만들었다(백업 + 양쪽 해시 대조 + 파이썬 캐시 비움,
+로봇에서 프로세스는 하나도 안 띄운다).
 
 ```bash
-cd ~/RoboCup/k1-goalpose && bash tools/install_policy.sh
+bash tools/sync_deploy_code.sh --dry-run   # 무엇이 다른지만 본다
+bash tools/sync_deploy_code.sh             # 옮긴다
 ```
 
-**확인**: 설치 후 로봇 파일의 SHA-256 을 기록한다(시험 기록에 남긴다).
+**기록**: 스크립트가 마지막에 찍는 `deploy_goal_pose.py` 의 SHA-256 을 시험 기록에 남긴다.
+
+### 정책 설치는 별도다
+
+`I3b` 는 이미 로봇에 있다(`models/goal_pose_i3b.pt`). **A′ 를 돌리려면 `NQ` 를 설치한다:**
 ```bash
-ssh booster@robot 'shasum -a 256 ~/Workspace/deploy/deploy_goal_pose.py'
+bash tools/install_policy.sh \
+  --checkpoint logs/K1/K1/Goal_Pose_V7/2026-08-09-09-57-04_NQ_armvendor/nn/model_6000.pth \
+  --name goal_pose_nq
 ```
+⚠️ 이 스크립트는 **체크포인트의 동결 config 와 배포 YAML 을 대조**해서 어긋나면 거부한다.
+거부되면 `--force` 로 밀지 말고 **무엇이 다른지 먼저 보라** — 그 대조가 존재하는 이유다.
 
 ---
 
