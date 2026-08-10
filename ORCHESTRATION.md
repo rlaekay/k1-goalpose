@@ -92,10 +92,12 @@ effort **구속 안 됨**(발목 pitch 만 물리고 20 이 이미 최적). **`N
 | **R3** | ⭐ **G2 리허설**: `NQ` TorchScript × **배포 코드경로**(EMA·게이트·arrival·박스·tick 재생) MuJoCo 30초 + 도착 10초 | **로봇 없이 살 수 있는 유일한 G2 증거.** 낙상 ⇒ 스택×정책 상호작용을 로봇 전에 발견. 완주 ⇒ 로봇 세션이 순수 G3. ⚠️ 통과 ≠ G2 통과(실기 축은 남는다) |
 | ⛔ | 새 학습 arm | R1 결과 전에는 다음 레버를 고를 근거가 없다 |
 
-⚠️ **`NS` 비교에 코드 축 하나가 열려 있다**: `NQ_s2`=59724fd7(원 `NQ` 와 동일 ✅),
-`NS`=a030e4d2 — 사이 4커밋 115줄(`torque_limits_by_joint` 2 + **`feet_cross` abs 제거** 2).
-가중치 `-0.` 이라 no-op 이어야 하지만 **보상 함수가 가중치 0 에도 호출되는 경로인지** 확인
-필요. Teacher 의 `train_env_sha` no-op 검증 대기.
+✅ **`NS` 코드 축 닫힘**(Teacher, 2026-08-10 10:xx): 4커밋 전부 no-op **증명**.
+`feet_cross` 는 `_prepare_reward_function` 이 **scale 0 인 키를 pop** 하므로(`-0. == 0` True)
+**함수가 등록되지도 호출되지도 않는다** — 곱해서 0 이 아니라 경로가 안 돈다.
+`torque_limits_by_joint` 는 `NQ_s2` yaml 에 키 자체가 없고 `if tq_by_joint:` 가드다.
+⇒ **`NS`↔`NQ_s2` 비교 성립.** 채점 2건(`180`/`181`) **벤더 물리로 실행 중** —
+⭐ `181` 은 **채점 config 에도 effort 레버를 싣는 가드** 포함(`NC_actfilter` 실패 형태 차단).
 
 ---
 
