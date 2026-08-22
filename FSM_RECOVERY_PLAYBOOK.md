@@ -53,7 +53,7 @@ stateDiagram-v2
 | 신호 | 토픽/원천 | 율 | 역할 | 실패 시 |
 |---|---|---|---|---|
 | **로봇 모드** | `/robot_states` (`RobotStatesMsg.current_mode`) | 미측정, **5.0s stale 컷**만 강제 | CUSTOM 진입 전 "지금 정말 서 있나(PREPARE)" 확인 | import 실패 시 **fail-open**(경고 후 진입) — 대신 §3 의 물리 신호 가드가 지킨다 |
-| **낙상 상태** | `/fall_down` (typed) **+** `/fall_down_recovery_state` (raw 3바이트) **동시 구독** | 실측 **~1 Hz** | HAS_FALLEN 확정, `is_recovery_available`(GetUp 가능 여부 — 이게 False 면 GetUp 호출은 그냥 실패함) | 발행자 하나가 죽어도 다른 쪽이 살아 있게 이중화. 둘 다 죽으면 IMU 단독(blind) 분기 |
+| **낙상 상태** | `/fall_down` (typed) **+** `/fall_down_recovery_state` (raw 3바이트) **동시 구독** | 실측 **~1 Hz** (⛔ custom 낙상에서는 **HAS_FALLEN 이 아예 안 온다** — §4 damping) | HAS_FALLEN 확정, `is_recovery_available`(GetUp 가능 여부 — 이게 False 면 GetUp 호출은 그냥 실패함) | 발행자 하나가 죽어도 다른 쪽이 살아 있게 이중화. 둘 다 죽으면 IMU 단독(blind) 분기 |
 | **IMU tilt** | LowState `imu_state.rpy` → 중력을 몸통좌표로 회전 → `tilt = arccos(−g_z)` | 명목 500 Hz, 실측 ~360~380 Hz (코드 주석에 두 값 공존) | **낙상 트리거 fast path** + get-up 완료의 "직립" 조건 | 폴백 없음 (무조건 계산됨) |
 | **다리 관절속도** | LowState `motor_state_serial[].dq` (위생 게이트 통과분) | 콜백과 동일 | get-up 완료의 "동작 끝남" 신호 | 게이트가 비정상 표본을 직전값 유지로 대체 |
 
@@ -174,9 +174,38 @@ phase 는 문자열 하나(`none/stopping/damping/getup/reenter`), 전이는 전
 
 ### damping
 **1.5s** (`damping_settle_s`) 기다린 뒤:
-- 이미 `IS_READY` 면 GetUp **생략**하고 getup phase 로 (이때 8s 하한도 생략 — 아래)
+- `IS_READY` **이고 tilt < 20°** 면 정말 서 있는 것이다 → GetUp **생략**하고 getup
+  phase 로 (이때 8s 하한도 생략 — 아래)
 - 아니면 `GetUp`(API 2008) 호출. 단 `is_recovery_available == False` 가
   **10.0s** (`recovery_wait_timeout_s`) 지속되면 포기(사람 개입 필요).
+- ⛔ 단 **누웠는데 IS_READY** 인 경우(아래)는 `is_recovery_available` 게이트도
+  건너뛰고 곧바로 GetUp 을 쏜다.
+
+> ⛔⛔ **`IS_READY` 만 보고 GetUp 을 생략하면 안 된다** (2026-08-23 추가, 코드 수정 완료).
+>
+> **custom 플래너로 넘어지면 펌웨어가 `HAS_FALLEN` 을 아예 보고하지 않는다.**
+> INHA-Player 팀 실측(2026-08-22): **tilt 86° 로 누운 채 `rs=IS_READY` /
+> `planner=WALKING` 이 끝까지 유지**됐다.
+>
+> 이 지문 위에서 구 코드(tilt 교차검증 없음)는 이렇게 죽는다:
+> `damping`(IS_READY 니까 GetUp 생략) → `getup` 의 `upright(20°)` 이 영원히 거짓 →
+> **20s 타임아웃까지 GetUp 을 한 발도 안 쏘고** `running=False`.
+> ⇒ **2026-08-07 사고(IS_READY 오독)와 정확히 같은 부류**이고, 그때는 "너무 일찍
+> 들어갔다", 이번엔 "아예 안 쐈다"로 방향만 반대다.
+>
+> ⚠️ **구멍이 둘이었다.** tilt 교차검증만 넣으면 아래로 떨어지는데 거기
+> `is_recovery_available` 게이트가 또 막는다 — 펌웨어가 "낙상 아님"으로 보고 있으니
+> 그 플래그는 **정의상 False** 라 10s 뒤 종료로 끝나고 GetUp 은 역시 안 나간다.
+> ⇒ 그 경우만 게이트도 우회한다. **GetUp 은 펌웨어가 못 하면 실패를 돌려줄 뿐 해가
+> 없다**; 실패 판정은 getup 의 20s 타임아웃이 맡는다.
+>
+> 회귀 테스트 `deploy/tests/test_recovery_damping_gate.py` **10검사**. 음성 대조 확인:
+> tilt 검증을 되돌리면 5개, 게이트 우회를 되돌리면 3개가 실패한다(두 수정이 서로 다른
+> 검사에 걸린다 = 둘 다 필요).
+>
+> ⇒ **일반 규칙: 저속 상태 플래그로 "안 해도 된다"를 판정하지 마라.** 플래그가 stale
+> 이거나(§4 getup) 아예 안 오는(여기) 창이 있고, 그때 생략은 복구를 통째로 건너뛴다.
+> 고속 물리 신호(tilt)로 교차검증하는 것이 두 경우 모두의 답이다.
 
 ### getup — **완료 판정이 이 FSM 의 심장이다**
 
@@ -302,8 +331,8 @@ SIGINT/SIGTERM 전부 무효 → SIGKILL → **우아한 종료(kDamping 요청)
 
 ## 7. 검증 방법 — 숫자만큼 중요한 것
 
-1. **회귀 테스트 29검사** (`deploy/tests/test_recovery_reentry.py` 23 +
-   `test_reentry_race.py` 6). 실기 없이 스텁 SDK 로 FSM 전체를 구동한다. 대표 불변식:
+1. **회귀 테스트 39검사** (`test_recovery_reentry.py` 23 + `test_reentry_race.py` 6 +
+   `test_recovery_damping_gate.py` 10). 실기 없이 스텁 SDK 로 FSM 전체를 구동한다. 대표 불변식:
    - 재진입 후 게인 == 정책 게인 (T1-T3)
    - 재진입 자세 전이가 "도착 ∧ 프레임간 점프 < 총이동의 50%" **둘 다** (T6 —
      한쪽만 검사하면 "아예 안 움직임"이 통과해 버린다. 실제로 그렇게 뚫린 적 있음)

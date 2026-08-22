@@ -1792,16 +1792,48 @@ class Controller:
                 # (2026-08-07: "get-up never became available (state=IS_READY)").
                 # GetUp 을 건너뛰고 완료 판정으로 바로 넘어간다 -- 거기서 다리가
                 # 조용해질 때까지 기다리므로 이르게 진입하지 않는다.
-                if state == FallState.IS_READY:
+                #
+                # ⛔⛔ 단 **IS_READY 만 보고 생략하면 안 된다** (2026-08-23 추가).
+                # custom 플래너로 넘어지면 펌웨어가 HAS_FALLEN 을 아예 보고하지
+                # 않는다 -- INHA-Player 팀 실측(2026-08-22): tilt 86도로 누운 채
+                # rs=IS_READY / planner=WALKING 이 끝까지 유지됐다.
+                # 그 상태에서 여기를 그냥 통과하면 GetUp 을 **한 발도 안 쏘고**
+                # getup 으로 넘어가는데, 거기 upright(20도) 조건이 영원히 거짓이라
+                # 20 s 타임아웃까지 아무 일도 없이 running=False 로 끝난다.
+                # ⇒ 2026-08-07 사고(IS_READY 오독)와 **같은 부류**다.
+                #
+                # 그래서 getup 완료 판정이 stale IS_READY 때문에 거는 것과 같은
+                # tilt 교차검증을 여기에도 건다. tilt 는 LowState(500 Hz) 산출이라
+                # stale 창이 없다. 판정선도 같은 키를 쓴다(따로 만들지 않는다).
+                upright_lim = float(rec.get("getup_upright_tilt_rad", 0.35))
+                really_upright = (np.isfinite(self._latest_tilt)
+                                  and self._latest_tilt < upright_lim)
+                if state == FallState.IS_READY and really_upright:
                     self.logger.warning(
-                        "[recovery] state=IS_READY -- 이미 서 있다. GetUp 을 건너뛰고 "
-                        "관절 정지 확인으로 넘어간다")
+                        "[recovery] state=IS_READY + tilt %.0f도 -- 정말 서 있다. "
+                        "GetUp 을 건너뛰고 관절 정지 확인으로 넘어간다",
+                        np.degrees(self._latest_tilt))
                     self._recovery_phase = "getup"
                     self._recovery_t0 = time.monotonic()
                     self._legs_quiet_since = 0.0
                     self._getup_called = False
                     return
-                if not recov_ok:
+                # 누워 있는데 IS_READY 다 = 위의 custom 낙상 지문.
+                # ⛔ 이때는 `is_recovery_available` 게이트도 같이 건너뛴다.
+                # 펌웨어가 "낙상 아님"으로 보고 있으므로 그 플래그는 정의상 False 다
+                # -- 그것을 발사 조건으로 쓰면 10 s 뒤 종료로 끝나고 GetUp 은 역시
+                # 한 발도 안 나간다(= 고치려던 구멍이 그대로 남는다).
+                # GetUp 은 펌웨어가 못 하는 상황이면 실패를 돌려줄 뿐 해가 없다.
+                # 실패 판정은 아래 getup 단계의 20 s 타임아웃이 맡는다.
+                fallen_but_ready = (state == FallState.IS_READY
+                                    and not really_upright)
+                if fallen_but_ready:
+                    self.logger.warning(
+                        "[recovery] state=IS_READY 인데 tilt %.0f도 (>%.0f도) -- "
+                        "custom 낙상에서 펌웨어가 HAS_FALLEN 을 안 내는 경우다. "
+                        "IS_READY 와 available 게이트를 무시하고 GetUp 을 쏜다",
+                        np.degrees(self._latest_tilt), np.degrees(upright_lim))
+                if not recov_ok and not fallen_but_ready:
                     if elapsed > float(rec.get("recovery_wait_timeout_s", 10.0)):
                         self.logger.error(
                             "[recovery] get-up never became available (state=%s); stopping.",
